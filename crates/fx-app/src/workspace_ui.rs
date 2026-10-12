@@ -87,6 +87,7 @@ fn apply_settings(
     state: &Entity<AppState>,
     ui: &Entity<WorkspaceUi>,
     draft: SettingsDraft,
+    baseline: SettingsDraft,
     cx: &mut App,
 ) {
     let saved = fx_store::PersistedPreferences {
@@ -96,10 +97,13 @@ fn apply_settings(
         text_size: draft.text_size.label().to_ascii_lowercase(),
     };
     match state.read(cx).store.save_preferences(&saved) {
-        Err(error) => state.update(cx, |state, cx| {
-            state.last_error = Some(format!("Could not save settings: {error}"));
-            cx.notify();
-        }),
+        Err(error) => {
+            global::set(baseline.apply_to(&global::current()));
+            state.update(cx, |state, cx| {
+                state.last_error = Some(format!("Could not save settings: {error}"));
+                cx.notify();
+            });
+        }
         Ok(()) => global::set(draft.apply_to(&global::current())),
     }
     // Confirm settles the sheet before its callback. Remove it even on a
@@ -120,11 +124,12 @@ pub fn open_settings(state: Entity<AppState>, window: &mut Window, cx: &mut App)
     let apply_ui = ui.clone();
     let dismiss_ui = ui.clone();
     let refresh_ui = ui.clone();
+    let baseline = SettingsDraft::from_theme(&global::current());
     let sheet = SettingsSheet::open(
         window,
         cx,
         Box::new(move |draft, window, cx| {
-            apply_settings(&state, &apply_ui, draft, cx);
+            apply_settings(&state, &apply_ui, draft, baseline, cx);
             window.blur();
         }),
         Box::new(move |window, cx| {
@@ -955,7 +960,8 @@ mod tests {
             ui.update(cx, |ui, _| ui.settings = Some(sheet));
             let before = global::current();
             let draft = SettingsDraft::from_theme(&before.with_accent(before.accent_color.next()));
-            apply_settings(&state, &ui, draft, cx);
+            global::set(draft.apply_to(&before));
+            apply_settings(&state, &ui, draft, SettingsDraft::from_theme(&before), cx);
             assert!(ui.read(cx).settings.is_none());
             assert!(
                 state

@@ -7,8 +7,9 @@
 //!
 //! Two invariants are load-bearing and are tested here:
 //!
-//! - **Messages are bounded.** An unbounded transcript is a memory leak and a
-//!   layout stall. The oldest are dropped once the cap is exceeded.
+//! - **Live tails are bounded.** Fresh streamed conversations retain a bounded
+//!   tail. Restored provider history has reader byte limits instead and remains
+//!   complete when a new turn is appended.
 //! - **Cancelling is terminal.** Once a turn is cancelling, only `idle` or
 //!   `failed` may replace that phase, so a late completion cannot report success
 //!   for work the user already stopped.
@@ -214,6 +215,9 @@ pub struct Conversation {
     pub id: Uuid,
     pub agent_id: Uuid,
     messages: VecDeque<ConversationMessage>,
+    /// Provider history is already bounded by the reader's byte limits. Keep
+    /// all of it, including after a new locally streamed turn is appended.
+    retain_full_history: bool,
     /// Incremented on every message change, so a view can tell "same length,
     /// different content" apart.
     message_revision: u64,
@@ -269,6 +273,9 @@ impl Conversation {
 
     /// Drop the oldest messages past the retention cap.
     fn trim(&mut self) {
+        if self.retain_full_history {
+            return;
+        }
         while self.messages.len() > MAX_RETAINED_MESSAGES {
             self.messages.pop_front();
         }
@@ -284,6 +291,13 @@ impl Conversation {
         self.trim();
         self.message_revision += 1;
         self.touch();
+    }
+
+    /// Restore complete provider or disk history without the live-tail cap.
+    /// Drafts, usage, and session identity remain untouched.
+    pub fn replace_full_history(&mut self, messages: Vec<ConversationMessage>) {
+        self.retain_full_history = true;
+        self.replace_messages(messages);
     }
 
     /// The most recent message with a body of text, for the sidebar preview.
@@ -835,6 +849,25 @@ mod tests {
             !texts.iter().any(|t| t == "m0"),
             "the oldest message survived"
         );
+    }
+
+    #[test]
+    fn full_native_history_survives_continuation_and_retains_unsent_work() {
+        let mut conversation = Conversation::new(Uuid::nil());
+        conversation.hold_unsent(UnsentPrompt {
+            text: "Do not lose this".into(),
+            attachment_count: 0,
+            session_id: None,
+        });
+        conversation.replace_full_history(
+            (0..900)
+                .map(|index| user_message(&format!("m{index}")))
+                .collect(),
+        );
+        conversation.append(assistant_message("New turn"));
+        assert_eq!(conversation.message_count(), 901);
+        assert_eq!(conversation.messages().next().unwrap().text_content(), "m0");
+        assert_eq!(conversation.unsent().unwrap().text, "Do not lose this");
     }
 
     #[test]

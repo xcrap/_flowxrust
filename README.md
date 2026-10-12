@@ -18,6 +18,10 @@ not complete.** The remaining work is listed below.
 - Codex and Claude turns using the user's installed command-line tools, with
   streaming output, cancellation, provider session continuation and independent
   running turns in different threads.
+- Opening a project discovers its Codex and Claude threads, including archived
+  threads. Selecting one loads its native history; the active project index and
+  selected conversation stay synchronized with external changes. Cached history
+  survives provider failures, and drafts and running turns are protected.
 - Thread-level provider, model, effort and access configuration. The
   provider is fixed after a conversation begins, so an existing session is not
   accidentally resumed through another provider. Model choices and supported
@@ -32,8 +36,9 @@ not complete.** The remaining work is listed below.
   unsent prompts. Drafts clear after provider acceptance; a failed submission
   remains retryable. Recovery copies are bounded on read, and unreadable or
   unopened conversations are preserved.
-- Reachable settings with saved appearance preferences and provider runtime
-  checks that report failures.
+- Settings preview base tone, accent, text size and appearance immediately across
+  the window. Done saves the choices; Cancel restores the previous appearance.
+  Provider runtime checks report failures.
 - Read-only Changes and Files tabs: repository status, staged/unstaged text
   diffs, file previews and refresh. Reads are bounded, and preview paths are
   checked against the project root.
@@ -91,8 +96,22 @@ symlinks and respects macOS quarantine. Starting FlowX does not bypass the
 provider's authentication or quarantine checks.
 
 Debug and release builds use separate application-support directories. The
-Rust application does not automatically import the Swift application's data or
-every existing provider-native conversation.
+Rust application discovers provider threads for projects you open: Codex through
+its local app-server API, and Claude through workspace-matched local session logs
+and desktop session archives. The active project index refreshes about every five
+seconds and selected history about every two seconds, subject to provider latency.
+Use **Refresh provider threads** in the project menu to retry immediately.
+
+Threads retain their provider session IDs and settings when resumed. Claude
+sessions still open in another process are protected against concurrent writes
+when the installed CLI supports activity detection. Local rename/archive/delete
+choices remain local; deleting an imported row suppresses rediscovery without
+deleting the provider's transcript. Successful complete listings hide externally
+removed threads while preserving their cache and any draft for recovery.
+
+History reads are bounded at 128 MiB per conversation; oversized or incomplete
+reads report an error and preserve cached history. FlowX does not migrate the
+Swift application's project layout, settings or unsent drafts automatically.
 
 For an isolated manual test, override the data directory when running the binary
 from the shell:
@@ -113,7 +132,7 @@ support location. `RUST_LOG` controls diagnostic logging.
 | Embedded browser | Choose and implement the WebKit bridge or an alternative preview approach, then restore browser split behavior. |
 | Images | Attachment import, decoding, resizing/conversion, storage, provider submission, previews and cache lifecycle. |
 | Transcript | Full Markdown and code presentation, text selection/copy behavior, and remaining Swift transcript interactions. |
-| Native history | Discover and import existing Codex/Claude conversations, load their history, synchronize external changes and migrate Swift application data. |
+| Swift data migration | Import the Swift application’s project layout, settings and unsent drafts. Provider-native history is discovered independently. |
 | Thread management | Synchronize local rename/archive/delete actions with provider-native lifecycle APIs and complete remaining sidebar parity. |
 | Composer | Complete attachment controls, follow-up queueing and steering behavior. |
 | Git workspace | Build on the read-only inspector with the remaining diff navigation and editing workflows, staging, commit and push UI. |

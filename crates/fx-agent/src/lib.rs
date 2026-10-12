@@ -9,6 +9,7 @@
 pub mod claude;
 pub mod codex;
 pub mod conversation;
+pub mod native;
 pub mod provider;
 
 pub use conversation::{Conversation, DeltaPolicy, Phase};

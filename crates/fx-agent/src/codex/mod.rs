@@ -3,6 +3,7 @@
 #[cfg(test)]
 mod fake_server;
 pub mod framing;
+pub mod native;
 pub mod protocol;
 pub mod provider;
 pub mod session;

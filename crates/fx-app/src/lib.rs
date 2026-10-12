@@ -11,9 +11,11 @@
 //! either would have to hand it back out again.
 
 pub mod approvals;
+mod claude_session_lease;
 pub mod composer;
 mod configuration;
 pub mod inspector;
+mod native_sync;
 pub mod project_picker;
 pub mod provider_catalog;
 pub mod session;
@@ -75,6 +77,7 @@ pub struct FlowX {
     draft_values: std::collections::HashMap<uuid::Uuid, String>,
     draft_subscriptions: std::collections::HashMap<uuid::Uuid, gpui::Subscription>,
     poller: Option<gpui::Task<()>>,
+    native_poller: Option<gpui::Task<()>>,
     polling: bool,
     autosave: Option<gpui::Task<()>>,
     focus: Option<gpui::FocusHandle>,
@@ -90,6 +93,7 @@ impl FlowX {
             draft_values: Default::default(),
             draft_subscriptions: Default::default(),
             poller: None,
+            native_poller: None,
             polling: false,
             autosave: None,
             focus: None,
@@ -99,6 +103,29 @@ impl FlowX {
     }
 
     fn observe_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            state.poll_native_sync(cx);
+        });
+        if self.native_poller.is_none() && self.state.read(cx).native_sync_enabled() {
+            self.native_poller = Some(cx.spawn(async move |this, cx| {
+                loop {
+                    gpui::Timer::after(std::time::Duration::from_millis(500)).await;
+                    if this
+                        .update(cx, |this, cx| {
+                            let changed = this
+                                .state
+                                .update(cx, |state, cx| state.poll_native_sync(cx));
+                            if changed {
+                                cx.notify();
+                            }
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }));
+        }
         let ui = workspace_ui::handle(cx);
         if self.subscriptions.is_empty() {
             self.subscriptions
@@ -575,6 +602,19 @@ fn center_column(
     // read inside a render.
     let conversation = state.update(cx, |state, _| state.active_conversation());
     let has_thread = conversation.is_some();
+    let loading_history = state
+        .read(cx)
+        .snapshot
+        .active_agent_id
+        .is_some_and(|id| state.read(cx).native_history_loading(id))
+        && conversation.as_ref().is_some_and(|conversation| {
+            conversation
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .messages()
+                .len()
+                == 0
+        });
 
     div()
         .flex_1()
@@ -590,7 +630,25 @@ fn center_column(
                 div().fx_caption().child(SharedString::from(error)),
             )
         }))
-        .child(if has_thread {
+        .child(if loading_history {
+            div()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .p(px_len(Spacing::XXL))
+                .child(fx_design::components::empty_state(
+                    Icon::ARROW_CLOCKWISE.render(
+                        fx_design::theme::IconSize::Large,
+                        Colors::fg_tertiary(&theme),
+                        &theme,
+                    ),
+                    "Loading conversation history…",
+                    "Reading the saved conversation from its provider.",
+                ))
+                .into_any_element()
+        } else if has_thread {
             match conversation.as_deref() {
                 // The guard is taken for the render only; nothing under it awaits,
                 // so it cannot deadlock against the runner that also wants it.
@@ -780,6 +838,8 @@ fn start_turn(
     // which is also what repaints the window when a turn finishes.
     let updates = state.read(cx).update_sender_for(agent.id);
     let agent_id = agent.id;
+    let agent =
+        configuration::with_native_defaults(agent, state.read(cx).native_defaults(agent_id));
     let runner = session::TurnRunner::start(
         cx,
         conversation,
@@ -987,6 +1047,17 @@ pub fn dispatch_menu_choice(owner: &str, chosen: &str, window: &mut Window, cx: 
             }),
             _ => {}
         }
+        return;
+    }
+    if chosen == "refresh-threads"
+        && let Some(project_id) = owner
+            .strip_prefix("project:")
+            .and_then(|id| id.parse().ok())
+    {
+        handle.0.update(cx, |state, cx| {
+            state.request_native_refresh(project_id);
+            cx.notify();
+        });
         return;
     }
     handle.0.update(cx, |state, cx| {

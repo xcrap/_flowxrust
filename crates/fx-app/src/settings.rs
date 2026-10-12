@@ -11,18 +11,9 @@
 //! below is asserted without one.
 //!
 //! [`SettingsSheet`] owns only what a view needs: the draft, the rows, a focus
-//! handle, and three callbacks. It applies nothing itself. That is why a
-//! half-applied draft cannot happen here — the sheet has no theme to write to —
-//! and why the same sheet can be opened from a menu row or a test without either
-//! knowing about the other.
-//!
-//! # Why a draft rather than writing the theme as one goes
-//!
-//! `fx-design`'s theme is a thread-local, so a segmented control that called
-//! `global::set` would repaint the entire window on every click, mid-gesture,
-//! including the control being clicked. Modelling the edits as a value also puts
-//! "did anything actually change" in a method rather than in a comparison the
-//! caller has to remember to make.
+//! handle, and three callbacks. Appearance choices preview immediately across
+//! the window. The baseline stays separate from that preview: Reset and Cancel
+//! restore it, while Done asks the caller to persist the draft.
 
 use std::path::{Path, PathBuf};
 
@@ -422,9 +413,7 @@ const SHEET_ID: &str = "settings.sheet";
 
 /// The settings sheet, mounted over the window by its caller.
 ///
-/// Applying is a callback, not a call to `fx-design`'s `global::set`: the sheet
-/// is a view, and a view that wrote a thread-local would repaint every window
-/// element mid-click. The caller owns the theme, and therefore owns persistence
+/// The sheet owns a reversible appearance preview. The caller owns persistence
 /// and the decision to unmount.
 pub struct SettingsSheet {
     /// The settings as they were when the sheet opened.
@@ -541,23 +530,33 @@ impl SettingsSheet {
 
     pub fn set_tone(&mut self, tone: BaseTone) {
         self.draft.base_tone = tone;
+        self.preview();
     }
 
     pub fn set_appearance(&mut self, appearance: AppearanceMode) {
         self.draft.appearance = appearance;
+        self.preview();
     }
 
     pub fn set_accent(&mut self, accent: AccentColor) {
         self.draft.accent = accent;
+        self.preview();
     }
 
     pub fn set_text_size(&mut self, text_size: TextSizePreset) {
         self.draft.text_size = text_size;
+        self.preview();
     }
 
-    /// Put the draft back to how the sheet found it. Applies nothing.
+    fn preview(&self) {
+        global::set(self.draft.apply_to(&global::current()));
+    }
+
+    /// Restore the opening appearance without persisting the draft.
     fn reset(&mut self, cx: &mut Context<Self>) {
         self.draft = self.baseline;
+        self.preview();
+        cx.refresh_windows();
         cx.notify();
     }
 
@@ -570,12 +569,14 @@ impl SettingsSheet {
         (self.on_apply)(self.draft, window, cx);
     }
 
-    /// Back out, applying nothing.
+    /// Back out and restore the appearance present when the sheet opened.
     fn dismiss(&mut self, window: &mut Window, cx: &mut App) {
         if self.settled {
             return;
         }
         self.settled = true;
+        global::set(self.baseline.apply_to(&global::current()));
+        cx.refresh_windows();
         (self.on_dismiss)(window, cx);
     }
 
@@ -1013,6 +1014,7 @@ fn choice_row<T: Clone + PartialEq + 'static>(
                 let this = for_select.clone();
                 this.update(cx, |sheet, cx| {
                     select(sheet, value.clone());
+                    cx.refresh_windows();
                     cx.notify();
                 });
             },
@@ -1582,6 +1584,7 @@ mod tests {
     }
 
     struct Mounted {
+        _theme_guard: ThemeGuard,
         test: TestAppContext,
         window: AnyWindowHandle,
         sheet: Entity<SettingsSheet>,
@@ -1666,6 +1669,7 @@ mod tests {
     }
 
     fn mount() -> Mounted {
+        let theme_guard = ThemeGuard::install(global::current());
         let mut test = TestAppContext::single();
         let applied: Rc<RefCell<Vec<SettingsDraft>>> = Rc::default();
         let dismissed: Rc<RefCell<usize>> = Rc::default();
@@ -1702,6 +1706,7 @@ mod tests {
             .expect("the window is still alive");
 
         Mounted {
+            _theme_guard: theme_guard,
             window: window.into(),
             test,
             sheet,
@@ -1721,18 +1726,16 @@ mod tests {
     }
 
     #[test]
-    fn choosing_a_setting_marks_the_draft_dirty_without_touching_the_theme() {
-        // The whole reason for the draft: a click must not repaint the window
-        // through the thread-local before the reader has said Done.
+    fn choosing_a_setting_previews_the_theme_without_persisting_the_draft() {
         let theme = Theme::default();
         let _guard = ThemeGuard::install(theme);
 
         let mut mounted = mount();
-        mounted.choose(|sheet| sheet.set_accent(AccentColor::Rose));
+        mounted.choose(|sheet| sheet.set_tone(BaseTone::Stone));
 
         assert!(mounted.read(|sheet| sheet.is_dirty()));
         assert!(mounted.read(|sheet| sheet.can_reset()));
-        assert_eq!(global::current(), theme, "the theme moved under the sheet");
+        assert_eq!(global::current(), theme.with_tone(BaseTone::Stone));
         assert!(mounted.applied().is_empty());
     }
 
@@ -1816,9 +1819,7 @@ mod tests {
     }
 
     #[test]
-    fn abandoning_the_sheet_changes_nothing() {
-        // A half-applied draft is the bug this sheet is shaped to avoid: the
-        // edits are a value, and only Done hands it over.
+    fn abandoning_the_sheet_restores_the_previewed_appearance() {
         let theme = Theme::new(
             AppearanceMode::Dark,
             BaseTone::Slate,
@@ -1843,6 +1844,20 @@ mod tests {
             theme,
             "the theme moved without Done being pressed"
         );
+    }
+
+    #[test]
+    fn cancelling_a_preview_preserves_a_new_system_appearance() {
+        let theme = Theme::default().with_appearance(AppearanceMode::System);
+        let _guard = ThemeGuard::install(theme);
+        let mut mounted = mount();
+        mounted.choose(|sheet| sheet.set_tone(BaseTone::Stone));
+        global::set_system_appearance(!theme.system_appearance);
+        mounted.press("escape");
+        let mut expected = theme;
+        expected.system_appearance = !theme.system_appearance;
+        assert_eq!(global::current(), expected);
+        assert!(mounted.applied().is_empty());
     }
 
     #[test]

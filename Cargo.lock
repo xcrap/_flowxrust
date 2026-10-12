@@ -2115,6 +2115,7 @@ name = "fx-agent"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "chrono",
  "fx-core",
  "serde",
@@ -2136,6 +2137,7 @@ dependencies = [
  "fx-design",
  "fx-store",
  "gpui",
+ "libc",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",

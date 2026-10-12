@@ -573,6 +573,12 @@ impl Transport {
         self.events.recv().await
     }
 
+    /// Move the notification stream to a metadata connection's drain task.
+    /// Normal turn sessions keep using `next_event` as their sole consumer.
+    pub(crate) fn take_events(&mut self) -> mpsc::Receiver<ServerEvent> {
+        std::mem::replace(&mut self.events, mpsc::channel(1).1)
+    }
+
     /// Whether the process has exited.
     pub async fn exit_reason(&self) -> Option<Exit> {
         self.shared.exited.lock().await.clone()

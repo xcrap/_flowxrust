@@ -1,6 +1,6 @@
 //! Thread-scoped configuration menus. An existing provider session keeps its provider.
 
-use fx_core::{Agent, AgentAccess, DEFAULT_CODEX_MODEL_ID};
+use fx_core::{Agent, AgentAccess, DEFAULT_CODEX_MODEL_ID, NativeDefaults};
 use fx_design::components::{MenuItem, MenuModel, MenuSection, MenuTrigger, menu_trigger};
 use fx_design::styled::px_len;
 use fx_design::theme::Spacing;
@@ -8,6 +8,24 @@ use gpui::prelude::*;
 use gpui::{AnyElement, App, Entity, SharedString, div};
 
 use crate::AppState;
+
+/// Resolve inherited provider settings for display or a turn without turning
+/// them into persisted user overrides.
+pub(crate) fn with_native_defaults(mut agent: Agent, native: NativeDefaults) -> Agent {
+    let imported = native.provider_id.is_some();
+    let configuration = &mut agent.configuration;
+    configuration.provider_id = configuration.provider_id.take().or(native.provider_id);
+    configuration.model_id = configuration.model_id.take().or(native.model_id);
+    configuration.effort = configuration.effort.take().or(native.effort);
+    configuration.agent_access = configuration
+        .agent_access
+        .or(native.agent_access)
+        .or(imported.then_some(AgentAccess::Supervised));
+    configuration.context_window_size = configuration
+        .context_window_size
+        .or(native.context_window_size);
+    agent
+}
 
 fn provider(agent: &Agent) -> &str {
     agent
@@ -54,6 +72,9 @@ fn efforts(agent: &Agent) -> Vec<String> {
 }
 
 fn provider_is_locked(state: &mut AppState, id: uuid::Uuid) -> bool {
+    if state.native_defaults(id).provider_id.is_some() {
+        return true;
+    }
     let Some(project_id) = state.snapshot.projects.iter().find_map(|record| {
         record
             .agents
@@ -73,6 +94,7 @@ pub fn bar(state: &Entity<AppState>, cx: &mut App) -> AnyElement {
     let Some(agent) = state.read(cx).active_agent() else {
         return div().into_any_element();
     };
+    let agent = with_native_defaults(agent.clone(), state.read(cx).native_defaults(agent.id));
     let locked = state.update(cx, |state, _| provider_is_locked(state, agent.id));
     let busy = state.read(cx).runners.contains_key(&agent.id);
     let layer = state.read(cx).menu_layer.clone();
@@ -218,6 +240,7 @@ pub fn apply(state: &Entity<AppState>, owner: &str, chosen: &str, cx: &mut App) 
         if field == "provider" && provider_is_locked(state, id) {
             return;
         }
+        let native = state.native_defaults(id);
         let Some(agent) = state
             .snapshot
             .projects
@@ -227,9 +250,10 @@ pub fn apply(state: &Entity<AppState>, owner: &str, chosen: &str, cx: &mut App) 
         else {
             return;
         };
+        let effective = with_native_defaults(agent.clone(), native.clone());
         match field {
             "model" if chosen == "__refresh-models" => {
-                crate::provider_catalog::refresh_now(provider(agent));
+                crate::provider_catalog::refresh_now(provider(&effective));
                 cx.notify();
                 return;
             }
@@ -242,22 +266,19 @@ pub fn apply(state: &Entity<AppState>, owner: &str, chosen: &str, cx: &mut App) 
                 agent.configuration.context_window_size = None;
                 agent.configuration.effort = None;
             }
-            "model" if models(agent).iter().any(|(id, _)| id == chosen) => {
-                agent.configuration.model_id = (chosen != "default").then(|| chosen.into());
+            "model" if models(&effective).iter().any(|(id, _)| id == chosen) => {
+                agent.configuration.model_id = Some(chosen.into());
                 agent.configuration.context_window_size =
-                    crate::provider_catalog::model(provider(agent), chosen)
+                    crate::provider_catalog::model(provider(&effective), chosen)
                         .map(|model| model.context_window)
                         .filter(|size| *size > 0);
-                if agent
-                    .configuration
-                    .effort
-                    .as_ref()
-                    .is_some_and(|e| !efforts(agent).contains(e))
-                {
+                if agent.configuration.effort.as_ref().is_some_and(|e| {
+                    !efforts(&with_native_defaults(agent.clone(), native)).contains(e)
+                }) {
                     agent.configuration.effort = None;
                 }
             }
-            "effort" if efforts(agent).iter().any(|id| id == chosen) => {
+            "effort" if efforts(&effective).iter().any(|id| id == chosen) => {
                 agent.configuration.effort = Some(chosen.into())
             }
             "access" => {
@@ -281,6 +302,53 @@ mod tests {
     use super::*;
     use fx_core::{ConversationMessage, MessageRole, Project};
     use fx_store::{AppPaths, PersistedApp, PersistedProject, Store};
+
+    #[test]
+    fn imported_settings_are_inherited_without_becoming_user_overrides() {
+        let agent = Agent::new("Imported");
+        let native = NativeDefaults {
+            provider_id: Some("claude".into()),
+            model_id: Some("native-model".into()),
+            effort: Some("high".into()),
+            agent_access: Some(AgentAccess::AcceptEdits),
+            context_window_size: Some(200_000),
+        };
+        let effective = with_native_defaults(agent.clone(), native.clone());
+        assert_eq!(provider(&effective), "claude");
+        assert_eq!(effective.configuration.model_id, native.model_id);
+        assert_eq!(effective.configuration.effort, native.effort);
+        assert_eq!(
+            effective.configuration.agent_access,
+            Some(AgentAccess::AcceptEdits)
+        );
+        assert!(agent.configuration.model_id.is_none());
+        assert!(agent.configuration.agent_access.is_none());
+
+        let mut overridden = agent;
+        overridden.configuration.model_id = Some("default".into());
+        overridden.configuration.agent_access = Some(AgentAccess::Supervised);
+        let effective = with_native_defaults(overridden, native);
+        assert_eq!(effective.configuration.model_id.as_deref(), Some("default"));
+        assert_eq!(
+            effective.configuration.agent_access,
+            Some(AgentAccess::Supervised)
+        );
+    }
+
+    #[test]
+    fn unknown_native_access_does_not_become_full_access() {
+        let effective = with_native_defaults(
+            Agent::new("Imported"),
+            NativeDefaults {
+                provider_id: Some("codex".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            effective.configuration.agent_access,
+            Some(AgentAccess::Supervised)
+        );
+    }
 
     #[test]
     fn menu_choices_target_their_thread_and_survive_restart() {

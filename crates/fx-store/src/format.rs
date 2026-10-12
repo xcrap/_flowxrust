@@ -16,8 +16,6 @@ use uuid::Uuid;
 pub const MAX_PROJECTS_BYTES: u64 = 16 * 1024 * 1024;
 /// Largest conversation file that will be read, in bytes.
 pub const MAX_CONVERSATION_BYTES: u64 = 32 * 1024 * 1024;
-/// Most threads recorded in one project.
-pub const MAX_AGENT_ORDER: usize = 512;
 /// Most dormant provider presentations remembered per project.
 pub const MAX_DORMANT_PRESENTATIONS: usize = 32;
 
@@ -129,6 +127,16 @@ pub struct PersistedProject {
     pub workspaces: Vec<PersistedWorkspace>,
     #[serde(default)]
     pub native_bindings: Vec<PersistedBinding>,
+    /// Local deletion hides a provider thread without deleting its external record.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suppressed_native_threads: Vec<PersistedNativeIdentity>,
+    /// User choices take precedence over future provider metadata refreshes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub thread_overrides: Vec<PersistedThreadOverride>,
+    /// Provider-deleted threads keep their local cache and presentation for a
+    /// later reappearance, but no longer clutter the normal sidebar.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_native_agent_ids: Vec<Uuid>,
     #[serde(rename = "nativePresentationIds", default)]
     pub native_presentation_ids: Vec<PersistedPresentation>,
 }
@@ -217,6 +225,28 @@ pub struct PersistedBinding {
     pub agent_access: Option<AgentAccess>,
     #[serde(rename = "isArchived", default)]
     pub is_archived: bool,
+    #[serde(default)]
+    pub revision: String,
+    #[serde(default)]
+    pub context_window_size: Option<u64>,
+    /// Do not replace a locally completed turn until native history contains it.
+    #[serde(default)]
+    pub local_history_pending: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedNativeIdentity {
+    pub provider_id: String,
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedThreadOverride {
+    pub agent_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived: Option<bool>,
 }
 
 /// A remembered presentation for a provider thread that is not loaded.
@@ -251,13 +281,8 @@ impl PersistedApp {
             {
                 record.last_selected_agent_id = None;
             }
-            // Workspace layout is recorded on the wrapper, so it is normalized
-            // even for a record whose domain project failed to decode.
-            if let Some(project) = record.project.as_mut()
-                && project.agent_order.len() > MAX_AGENT_ORDER
-            {
-                project.agent_order.truncate(MAX_AGENT_ORDER);
-            }
+            // Native indexes can contain thousands of threads. File byte limits
+            // bound input; normalization must never silently discard history.
             for workspace in &mut record.workspaces {
                 workspace.split_ratio = workspace.split_ratio.clamp(0.2, 0.8);
                 workspace.terminal_height = workspace.terminal_height.clamp(120.0, 500.0);
@@ -645,13 +670,11 @@ mod tests {
     }
 
     #[test]
-    fn an_oversized_order_list_is_truncated() {
+    fn native_order_lists_keep_every_thread() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().to_string_lossy().into_owned();
         let mut project = Project::new(&path);
-        project.agent_order = (0..MAX_AGENT_ORDER + 50)
-            .map(|i| Uuid::from_u128(i as u128))
-            .collect();
+        project.agent_order = (0..2_000).map(|i| Uuid::from_u128(i as u128)).collect();
 
         let mut app = PersistedApp {
             projects: vec![PersistedProject {
@@ -663,7 +686,7 @@ mod tests {
         app.normalize();
         assert_eq!(
             app.projects[0].project.as_ref().unwrap().agent_order.len(),
-            MAX_AGENT_ORDER
+            2_000
         );
     }
 

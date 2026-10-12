@@ -164,20 +164,64 @@ fn body(state: Entity<AppState>, cx: &mut App) -> AnyElement {
                 cx,
             ));
         if record.is_expanded {
+            let native_status = state.read(cx).native_status(id);
+            let loading = native_status.syncing && record.agents.is_empty();
+            if loading || !native_status.warnings.is_empty() {
+                let detail = native_status.warnings.join("\n");
+                let label = if detail.is_empty() {
+                    "Loading provider threads…"
+                } else {
+                    "Thread sync needs attention"
+                };
+                let retry_state = state.clone();
+                group = group.child(
+                    div()
+                        .id(SharedString::from(format!("native-sync-status:{id}")))
+                        .flex()
+                        .items_center()
+                        .gap(px_len(Spacing::XXS))
+                        .pl(px_len(Spacing::XXL))
+                        .pr(px_len(Spacing::XXS))
+                        .py(px_len(Spacing::XXS))
+                        .fx_caption()
+                        .text_color(Colors::fg_secondary(&theme))
+                        .child(div().flex_1().min_w_0().child(label))
+                        .when(!detail.is_empty(), |row| {
+                            row.tooltip(move |window, cx| {
+                                fx_design::components::tooltip(detail.clone(), window, cx)
+                            })
+                            .child(icon_button(
+                                IconButtonProps::new(Icon::ARROW_CLOCKWISE, "Retry thread sync")
+                                    .tiny()
+                                    .ghost()
+                                    .enabled(!native_status.syncing),
+                                move |_, _, cx| {
+                                    retry_state.update(cx, |state, cx| {
+                                        state.request_native_refresh(id);
+                                        cx.notify();
+                                    });
+                                },
+                            ))
+                        }),
+                );
+            }
             let (archived, agents): (Vec<_>, Vec<_>) = project
                 .agent_order
                 .iter()
+                .filter(|id| !record.missing_native_agent_ids.contains(id))
                 .filter_map(|id| record.agents.iter().find(|agent| agent.id == *id))
                 .cloned()
                 .partition(|agent| record.archived_agent_ids.contains(&agent.id));
-            group = group.child(threads(
-                &state,
-                id,
-                agents,
-                snapshot.active_agent_id,
-                false,
-                cx,
-            ));
+            if !loading && (!agents.is_empty() || archived.is_empty()) {
+                group = group.child(threads(
+                    &state,
+                    id,
+                    agents,
+                    snapshot.active_agent_id,
+                    false,
+                    cx,
+                ));
+            }
             if !archived.is_empty() {
                 group = group
                     .child(
@@ -515,6 +559,7 @@ fn project_menu(name: &str, busy: bool) -> MenuModel {
             "actions",
             vec![
                 MenuItem::new("new-thread", "New thread"),
+                MenuItem::new("refresh-threads", "Refresh provider threads"),
                 MenuItem::new("reveal", "Reveal in Finder").subtitle(name),
             ],
         ),

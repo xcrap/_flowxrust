@@ -514,6 +514,33 @@ impl Job {
             }
         };
         let resume = lock(&self.conversation).session_id().map(str::to_owned);
+        // Share Swift's reservation directory and keep the lease alive for the
+        // whole turn. A native transcript may still have an external writer.
+        let _session_lease = if let Some(id) = resume.as_deref() {
+            let Some(home) = runtime.environment.get("HOME") else {
+                return self.fail(
+                    TURN_FAILED,
+                    "Cannot locate the Claude session reservation directory.",
+                );
+            };
+            let directory = std::path::Path::new(home)
+                .join("Library/Application Support/FlowX/ProviderSessionLocks/Claude");
+            let lease =
+                match crate::claude_session_lease::ClaudeSessionLease::acquire(&directory, id) {
+                    Ok(lease) => lease,
+                    Err(error) => return self.fail(TURN_FAILED, error),
+                };
+            let inactive = tokio::select! {
+                result = fx_agent::claude::native::ensure_session_inactive(&runtime, &spec.arguments, id) => result,
+                _ = interrupts.recv() => return self.cancel_before_start(),
+            };
+            if let Err(error) = inactive {
+                return self.fail(TURN_FAILED, error.to_string());
+            }
+            Some(lease)
+        } else {
+            None
+        };
         let request = ClaudeTurnRequest {
             model: (!self.model.is_empty()).then(|| self.model.clone()),
             effort: self.effort.clone(),
@@ -1342,6 +1369,12 @@ mod tests {
             let log = dir.path().join("received.jsonl");
             std::fs::write(&script, r#"
 import json, sys
+from pathlib import Path
+if sys.argv[1:] == ["agents", "--json"]:
+    marker = Path(__file__).with_name("active-session")
+    active = marker.read_text() if marker.exists() else None
+    print(json.dumps([{"sessionId":active,"status":"idle"}] if active else []))
+    sys.exit(0)
 
 def send(value):
     print(json.dumps(value), flush=True)
@@ -1349,14 +1382,14 @@ def record(value):
     with open("received.jsonl", "a") as log: log.write(json.dumps(value) + "\n")
 def finish(text):
     send({"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":text}}})
-    send({"type":"result","subtype":"end_turn","session_id":"native-claude","usage":{"input_tokens":5,"output_tokens":2}})
+    send({"type":"result","subtype":"end_turn","session_id":"11111111-2222-4333-8444-555555555555","usage":{"input_tokens":5,"output_tokens":2}})
 record({"args":sys.argv[1:]})
 for line in sys.stdin:
     message=json.loads(line)
     record(message)
     if message.get("type")=="user":
         prompt=message["message"]["content"][0]["text"]
-        send({"type":"system","subtype":"init","session_id":"native-claude"})
+        send({"type":"system","subtype":"init","session_id":"11111111-2222-4333-8444-555555555555"})
         if prompt=="hang": continue
         if prompt in ("tool", "questions"):
             tool="Bash" if prompt=="tool" else "AskUserQuestion"
@@ -1453,7 +1486,10 @@ for line in sys.stdin:
         );
         assert!(updates.contains(&SessionUpdate::Accepted));
         assert!(updates.contains(&SessionUpdate::Changed));
-        assert_eq!(lock(&conversation).session_id(), Some("native-claude"));
+        assert_eq!(
+            lock(&conversation).session_id(),
+            Some("11111111-2222-4333-8444-555555555555")
+        );
         let (_runner, second) = server.start(&conversation, "second", AgentAccess::Supervised);
         second.wait_for_end(TURN_BUDGET);
         assert_eq!(rows(&conversation), vec!["text: first", "text: second"]);
@@ -1478,7 +1514,35 @@ for line in sys.stdin:
                 .as_array()
                 .unwrap()
                 .windows(2)
-                .any(|window| window[0] == "--resume" && window[1] == "native-claude")
+                .any(|window| window[0] == "--resume"
+                    && window[1] == "11111111-2222-4333-8444-555555555555")
+        );
+    }
+
+    #[test]
+    fn claude_refuses_an_external_writer_before_sending_the_prompt() {
+        let Some(server) = ClaudeFixture::new() else {
+            return;
+        };
+        std::fs::write(
+            server.dir.path().join("active-session"),
+            "99999999-2222-4333-8444-555555555555",
+        )
+        .unwrap();
+        let conversation = conversation();
+        lock(&conversation).set_session_id("99999999-2222-4333-8444-555555555555");
+        let (_runner, recorder) =
+            server.start(&conversation, "keep this draft", AgentAccess::Supervised);
+        let updates = recorder.wait_for_end(TURN_BUDGET);
+        assert!(updates.iter().any(|update| matches!(update, SessionUpdate::Failed { reason } if reason.contains("still open"))), "{updates:?}");
+        assert!(!updates.contains(&SessionUpdate::Accepted));
+        assert!(
+            !server.log.exists(),
+            "the resumed provider must never receive a prompt"
+        );
+        assert_eq!(
+            lock(&conversation).session_id(),
+            Some("99999999-2222-4333-8444-555555555555")
         );
     }
 

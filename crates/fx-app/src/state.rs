@@ -72,6 +72,7 @@ pub struct AppState {
     restored_drafts: HashMap<Uuid, String>,
     accepted_drafts: HashMap<Uuid, String>,
     saved_conversations: HashMap<Uuid, Vec<u8>>,
+    saved_conversation_versions: HashMap<Uuid, (u64, String)>,
     restored_costs: HashMap<Uuid, f64>,
     last_checkpoint: Instant,
     pending_interactions: HashMap<Uuid, VecDeque<fx_agent::ProviderEvent>>,
@@ -89,6 +90,7 @@ pub struct AppState {
     /// The last save or load failure, kept so the UI can say so.
     pub last_error: Option<String>,
     pub paths: AppPaths,
+    native_sync: crate::native_sync::NativeSync,
 }
 
 impl AppState {
@@ -170,6 +172,7 @@ impl AppState {
             restored_drafts: HashMap::new(),
             accepted_drafts: HashMap::new(),
             saved_conversations: HashMap::new(),
+            saved_conversation_versions: HashMap::new(),
             restored_costs: HashMap::new(),
             last_checkpoint: Instant::now(),
             pending_interactions: HashMap::new(),
@@ -177,6 +180,7 @@ impl AppState {
             sidebar_visible,
             last_error,
             paths,
+            native_sync: Default::default(),
         }
     }
 
@@ -283,7 +287,10 @@ impl AppState {
         project
             .agent_order
             .iter()
-            .filter(|id| !record.archived_agent_ids.contains(id))
+            .filter(|id| {
+                !record.archived_agent_ids.contains(id)
+                    && !record.missing_native_agent_ids.contains(id)
+            })
             .filter_map(|id| by_id.get(id).map(|a| (*a).clone()))
             .collect()
     }
@@ -323,6 +330,7 @@ impl AppState {
         };
         self.snapshot.active_project_id = Some(id);
         self.snapshot.active_agent_id = visible_agent(record, record.last_selected_agent_id);
+        self.request_native_refresh(id);
     }
 
     pub fn select_agent(&mut self, id: Uuid) {
@@ -340,6 +348,7 @@ impl AppState {
         self.snapshot.active_project_id = Some(project.id);
         self.snapshot.active_agent_id = Some(id);
         record.last_selected_agent_id = Some(id);
+        self.native_sync.history_due.remove(&id);
     }
 
     pub fn thread(&self, agent_id: Uuid) -> Option<&Agent> {
@@ -394,6 +403,14 @@ impl AppState {
     fn commit_thread_change(&mut self, mut next: PersistedApp, action: &str) -> bool {
         next.sidebar_visible = self.sidebar_visible;
         next.normalize();
+        if serde_json::to_vec(&next)
+            .is_ok_and(|bytes| bytes.len() as u64 > fx_store::format::MAX_PROJECTS_BYTES)
+        {
+            self.last_error = Some(format!(
+                "Could not {action}: native thread metadata exceeds the workspace file size limit. The previous workspace has been preserved."
+            ));
+            return false;
+        }
         if let Err(error) = self.store.save_app(&next) {
             let rollback = self.store.save_app(&self.snapshot);
             self.last_error = Some(match rollback {
@@ -421,6 +438,7 @@ impl AppState {
         for record in &mut next.projects {
             if let Some(agent) = record.agents.iter_mut().find(|agent| agent.id == agent_id) {
                 agent.title = title.to_string();
+                local_override(record, agent_id).title = Some(title.to_string());
                 for binding in &mut record.native_bindings {
                     if binding.agent_id == agent_id {
                         binding.title = title.to_string();
@@ -436,14 +454,12 @@ impl AppState {
         if !self.thread_can_change(agent_id) {
             return false;
         }
-        if self.is_thread_archived(agent_id) == archived {
-            return true;
-        }
         let mut next = self.snapshot.clone();
         for record in &mut next.projects {
             if !record.agents.iter().any(|agent| agent.id == agent_id) {
                 continue;
             }
+            local_override(record, agent_id).archived = Some(archived);
             if archived {
                 record.archived_agent_ids.push(agent_id);
                 if record.last_selected_agent_id == Some(agent_id) {
@@ -482,12 +498,31 @@ impl AppState {
         let Some(project_id) = self.project_for_agent(agent_id) else {
             return false;
         };
+        // Older Rust-created threads may have a session only in their cache.
+        self.bind_local_session(agent_id);
         let mut next = self.snapshot.clone();
         for record in &mut next.projects {
             if !record.agents.iter().any(|agent| agent.id == agent_id) {
                 continue;
             }
             record.agents.retain(|agent| agent.id != agent_id);
+            for binding in record
+                .native_bindings
+                .iter()
+                .filter(|binding| binding.agent_id == agent_id)
+            {
+                let identity = fx_store::format::PersistedNativeIdentity {
+                    provider_id: binding.provider_id.clone(),
+                    session_id: binding.session_id.clone(),
+                };
+                if !record.suppressed_native_threads.contains(&identity) {
+                    record.suppressed_native_threads.push(identity);
+                }
+            }
+            record
+                .thread_overrides
+                .retain(|entry| entry.agent_id != agent_id);
+            record.missing_native_agent_ids.retain(|id| *id != agent_id);
             record.archived_agent_ids.retain(|id| *id != agent_id);
             if let Some(project) = &mut record.project {
                 project.agent_order.retain(|id| *id != agent_id);
@@ -520,8 +555,14 @@ impl AppState {
         self.restored_drafts.remove(&agent_id);
         self.accepted_drafts.remove(&agent_id);
         self.saved_conversations.remove(&agent_id);
+        self.saved_conversation_versions.remove(&agent_id);
         self.restored_costs.remove(&agent_id);
         self.pending_interactions.remove(&agent_id);
+        self.native_sync.invalidate(project_id);
+        self.native_sync.history_due.remove(&agent_id);
+        self.native_sync.history_warnings.remove(&agent_id);
+        self.native_sync.completed_turns.remove(&agent_id);
+        self.native_sync.loaded_revisions.remove(&agent_id);
         if let Err(error) = self.store.delete_thread_files(project_id, agent_id) {
             self.last_error = Some(format!(
                 "The thread was removed, but its saved files could not all be deleted: {error}"
@@ -607,6 +648,22 @@ impl AppState {
                 conversation.set_error("The saved conversation could not be read. Its files have been preserved; start a new thread to continue.");
             }
         }
+        if conversation.session_id().is_none()
+            && let Some(binding) = self
+                .snapshot
+                .projects
+                .iter()
+                .filter(|record| {
+                    record
+                        .project
+                        .as_ref()
+                        .is_some_and(|project| project.id == project_id)
+                })
+                .flat_map(|record| &record.native_bindings)
+                .find(|binding| binding.agent_id == agent_id)
+        {
+            conversation.set_session_id(binding.session_id.clone());
+        }
         let conversation = Arc::new(Mutex::new(conversation));
         self.conversations.insert(agent_id, conversation.clone());
         conversation
@@ -665,6 +722,7 @@ impl AppState {
         // A new project has no threads, so a carried-over agent selection would
         // name an agent that does not exist.
         self.snapshot.active_agent_id = None;
+        self.request_native_refresh(project.id);
         self.save();
     }
 
@@ -682,6 +740,7 @@ impl AppState {
             return;
         }
         self.save_conversations();
+        self.native_sync.invalidate(project_id);
         self.snapshot
             .projects
             .retain(|record| !record.project.as_ref().is_some_and(|p| p.id == project_id));
@@ -755,6 +814,7 @@ impl AppState {
             });
         }
         self.capture_drafts(cx);
+        self.native_sync.invalidate(project_id);
         self.save();
         self.save_conversations();
         true
@@ -840,6 +900,11 @@ impl AppState {
                         .unwrap_or_else(|error| error.into_inner())
                         .set_session_id(thread_id);
                 }
+                if let Some(agent_id) = agent_id {
+                    self.bind_local_session(agent_id);
+                    self.mark_native_local_turn(agent_id);
+                    self.save();
+                }
             }
             SessionUpdate::Accepted => {
                 if let Some(agent_id) = agent_id
@@ -877,6 +942,7 @@ impl AppState {
             }
             SessionUpdate::Finished { outcome } => {
                 if let Some(agent_id) = agent_id {
+                    self.mark_native_local_turn(agent_id);
                     self.runners.remove(&agent_id);
                     self.pending_interactions.remove(&agent_id);
                 }
@@ -890,6 +956,7 @@ impl AppState {
             }
             SessionUpdate::Failed { reason } => {
                 if let Some(agent_id) = agent_id {
+                    self.mark_native_local_turn(agent_id);
                     self.runners.remove(&agent_id);
                     self.pending_interactions.remove(&agent_id);
                 }
@@ -984,6 +1051,12 @@ impl AppState {
         }
         self.snapshot.sidebar_visible = self.sidebar_visible;
         self.snapshot.normalize();
+        if serde_json::to_vec(&self.snapshot)
+            .is_ok_and(|bytes| bytes.len() as u64 > fx_store::format::MAX_PROJECTS_BYTES)
+        {
+            self.last_error = Some("The workspace exceeds its metadata file size limit and could not be saved. The previous saved workspace has been preserved.".into());
+            return;
+        }
         match self.store.save_app(&self.snapshot) {
             Ok(()) => {}
             Err(error) => {
@@ -1014,21 +1087,27 @@ impl AppState {
             let Some(project_id) = self.project_for_agent(agent_id) else {
                 continue;
             };
-            let mut persisted = persisted_from(
-                &conversation
+            let draft = self
+                .restored_drafts
+                .get(&agent_id)
+                .cloned()
+                .unwrap_or_default();
+            let (mut persisted, version) = {
+                let conversation = conversation
                     .lock()
-                    .unwrap_or_else(|error| error.into_inner()),
-            );
+                    .unwrap_or_else(|error| error.into_inner());
+                let version = (conversation.revision(), draft.clone());
+                if self.saved_conversation_versions.get(&agent_id) == Some(&version) {
+                    continue;
+                }
+                (persisted_from(&conversation), version)
+            };
             persisted.total_cost_usd = self
                 .restored_costs
                 .get(&agent_id)
                 .copied()
                 .unwrap_or_default();
-            persisted.draft_text = self
-                .restored_drafts
-                .get(&agent_id)
-                .cloned()
-                .unwrap_or_default();
+            persisted.draft_text = draft;
             if self
                 .accepted_drafts
                 .get(&agent_id)
@@ -1036,10 +1115,40 @@ impl AppState {
             {
                 persisted.draft_text.clear();
             }
-            let Ok(bytes) = serde_json::to_vec(&persisted) else {
+            let Ok(mut bytes) = serde_json::to_vec(&persisted) else {
                 continue;
             };
+            if bytes.len() as u64 > fx_store::format::MAX_CONVERSATION_BYTES {
+                // A full native transcript can exceed the cache limit. Its
+                // draft is local-only and must still survive quitting.
+                match self.store.load_conversation(project_id, agent_id) {
+                    Ok(previous) => {
+                        match encode_partial_cache(
+                            persisted,
+                            previous,
+                            fx_store::format::MAX_CONVERSATION_BYTES,
+                        ) {
+                            Ok((record, encoded)) => {
+                                persisted = record;
+                                bytes = encoded;
+                            }
+                            Err(error) => {
+                                self.last_error = Some(error);
+                                continue;
+                            }
+                        }
+                        self.last_error = Some("This conversation exceeds the local history cache limit. The complete history remains with the provider and in memory; its draft and session have been saved with the available cached history.".into());
+                    }
+                    Err(error) => {
+                        self.last_error = Some(format!(
+                            "Could not preserve this large conversation's draft without replacing an unreadable cache: {error}"
+                        ));
+                        continue;
+                    }
+                }
+            }
             if self.saved_conversations.get(&agent_id) == Some(&bytes) {
+                self.saved_conversation_versions.insert(agent_id, version);
                 continue;
             }
             let result = if persisted.is_worth_persisting() {
@@ -1054,6 +1163,7 @@ impl AppState {
             match result {
                 Ok(()) => {
                     self.saved_conversations.insert(agent_id, bytes);
+                    self.saved_conversation_versions.insert(agent_id, version);
                 }
                 Err(error) => {
                     tracing::error!(%agent_id, %error, "could not save the conversation");
@@ -1078,6 +1188,650 @@ impl AppState {
         self.capture_drafts(cx);
         self.save_conversations();
         self.save();
+    }
+
+    /// The root calls this on an idle-capable 500ms timer. Unit tests explicitly
+    /// exercise result application instead of launching installed provider CLIs.
+    pub fn native_sync_enabled(&self) -> bool {
+        self.native_sync.allowed() && self.snapshot_writable && !self.snapshot.projects.is_empty()
+    }
+
+    pub fn native_history_loading(&self, agent_id: Uuid) -> bool {
+        self.native_sync.history_loading(agent_id)
+    }
+
+    pub fn native_status(&self, project_id: Uuid) -> crate::native_sync::NativeSyncStatus {
+        let mut warnings: Vec<_> = self
+            .native_sync
+            .warnings
+            .iter()
+            .filter(|((id, _), _)| *id == project_id)
+            .flat_map(|(_, warnings)| warnings.clone())
+            .collect();
+        if let Some(agent) = self.snapshot.active_agent_id
+            && self.project_for_agent(agent) == Some(project_id)
+            && let Some(warning) = self.native_sync.history_warnings.get(&agent)
+        {
+            warnings.push(warning.clone());
+        }
+        warnings.sort();
+        warnings.dedup();
+        crate::native_sync::NativeSyncStatus {
+            syncing: self.native_sync.pending_for(project_id),
+            warnings,
+        }
+    }
+
+    pub fn request_native_refresh(&mut self, project_id: Uuid) {
+        for provider in crate::native_sync::PROVIDERS {
+            self.native_sync
+                .index_due
+                .remove(&(project_id, provider.into()));
+        }
+        if self.snapshot.active_project_id == Some(project_id)
+            && let Some(agent) = self.snapshot.active_agent_id
+        {
+            self.native_sync.history_due.remove(&agent);
+        }
+    }
+
+    /// Apply completed background work, then schedule only due requests. Returns
+    /// whether the shell should redraw; waiting never forces continuous repaint.
+    pub fn poll_native_sync(&mut self, cx: &App) -> bool {
+        if !self.native_sync_enabled() {
+            return false;
+        }
+        let mut changed = false;
+        for completion in self.native_sync.drain() {
+            self.capture_drafts(cx);
+            self.apply_native_completion(completion);
+            changed = true;
+        }
+        let selected = self
+            .snapshot
+            .active_project_id
+            .zip(self.snapshot.active_agent_id);
+        if self.native_sync.selected != selected {
+            self.native_sync.selected = selected;
+            if let Some((_, agent)) = selected {
+                self.native_sync.history_due.remove(&agent);
+            }
+        }
+        let now = Instant::now();
+        for provider in crate::native_sync::PROVIDERS {
+            if !self.native_sync.ready(provider) {
+                continue;
+            }
+            let active = self.snapshot.active_project_id;
+            // Every saved project is discovered once. After that only the
+            // active project polls; activation/explicit refresh makes others due.
+            let mut projects: Vec<_> = self
+                .snapshot
+                .projects
+                .iter()
+                .filter_map(|record| record.project.as_ref())
+                .collect();
+            projects.sort_by_key(|project| Some(project.id) != active);
+            let due_project = projects
+                .into_iter()
+                .find(|project| {
+                    match self
+                        .native_sync
+                        .index_due
+                        .get(&(project.id, provider.into()))
+                    {
+                        None => true,
+                        Some(due) => Some(project.id) == active && now >= *due,
+                    }
+                })
+                .map(|project| (project.id, project.root_path.clone()));
+            let history_ticket = selected.and_then(|(project, agent)| {
+                if self.is_thread_busy(agent)
+                    || self
+                        .native_sync
+                        .completed_turns
+                        .get(&agent)
+                        .is_some_and(|finished| finished.elapsed() < Duration::from_secs(4))
+                    || self
+                        .native_sync
+                        .history_due
+                        .get(&agent)
+                        .is_some_and(|due| now < *due)
+                {
+                    return None;
+                }
+                let root = self.project(project)?.root_path.clone();
+                let binding = self
+                    .snapshot
+                    .projects
+                    .iter()
+                    .flat_map(|record| &record.native_bindings)
+                    .find(|binding| binding.agent_id == agent && binding.provider_id == provider)?
+                    .clone();
+                let conversation = self.conversation(project, agent);
+                let revision = conversation
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .revision();
+                Some(crate::native_sync::Ticket {
+                    project,
+                    root,
+                    provider: provider.into(),
+                    generation: self.native_sync.generation(project),
+                    kind: crate::native_sync::RequestKind::History {
+                        agent,
+                        session: binding.session_id,
+                        revision,
+                        known_revision: if binding.local_history_pending {
+                            None
+                        } else {
+                            self.native_sync.loaded_revisions.get(&agent).cloned()
+                        },
+                    },
+                })
+            });
+            let initial_history = selected
+                .is_some_and(|(_, agent)| !self.native_sync.history_due.contains_key(&agent));
+            let prefer_history = history_ticket.is_some()
+                && (initial_history
+                    || due_project.is_none()
+                    || self
+                        .native_sync
+                        .last_was_index
+                        .get(provider)
+                        .copied()
+                        .unwrap_or(false));
+            let ticket = if prefer_history {
+                history_ticket
+            } else if let Some((project, root)) = due_project {
+                let record = self
+                    .snapshot
+                    .projects
+                    .iter()
+                    .find(|record| record.project.as_ref().is_some_and(|p| p.id == project))
+                    .unwrap();
+                let candidates = record
+                    .agents
+                    .iter()
+                    .filter(|agent| {
+                        agent
+                            .configuration
+                            .provider_id
+                            .as_deref()
+                            .unwrap_or("codex")
+                            == provider
+                            && !record
+                                .native_bindings
+                                .iter()
+                                .any(|binding| binding.agent_id == agent.id)
+                    })
+                    .map(|agent| agent.id)
+                    .collect();
+                let missing_candidates = record
+                    .native_bindings
+                    .iter()
+                    .filter(|binding| binding.provider_id == provider)
+                    .map(|binding| (binding.agent_id, binding.session_id.clone()))
+                    .collect();
+                self.native_sync.index_due.insert(
+                    (project, provider.into()),
+                    now + crate::native_sync::INDEX_INTERVAL,
+                );
+                Some(crate::native_sync::Ticket {
+                    project,
+                    root,
+                    provider: provider.into(),
+                    generation: self.native_sync.generation(project),
+                    kind: crate::native_sync::RequestKind::Index {
+                        candidates,
+                        missing_candidates,
+                    },
+                })
+            } else {
+                history_ticket
+            };
+            if let Some(ticket) = ticket {
+                let project = ticket.project;
+                if let crate::native_sync::RequestKind::History { agent, .. } = ticket.kind {
+                    self.native_sync
+                        .history_due
+                        .insert(agent, now + crate::native_sync::HISTORY_INTERVAL);
+                }
+                match self.native_sync.submit(ticket, self.paths.clone()) {
+                    Ok(()) => changed = true,
+                    Err(error) => {
+                        self.native_sync
+                            .warnings
+                            .insert((project, provider.into()), vec![error]);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    fn apply_native_completion(&mut self, completion: crate::native_sync::Completion) -> bool {
+        use crate::native_sync::{Payload, RequestKind, same_project};
+        let ticket = completion.ticket;
+        if self.native_sync.generation(ticket.project) != ticket.generation
+            || !self
+                .project(ticket.project)
+                .is_some_and(|project| same_project(&project.root_path, &ticket.root))
+        {
+            return false;
+        }
+        match completion.result {
+            Err(error) => match ticket.kind {
+                RequestKind::Index { .. } => {
+                    self.native_sync.warnings.insert(
+                        (ticket.project, ticket.provider.clone()),
+                        vec![format!("{} history unavailable: {error}", ticket.provider)],
+                    );
+                }
+                RequestKind::History { agent, .. } => {
+                    if self.project_for_agent(agent) == Some(ticket.project) {
+                        self.native_sync.history_warnings.insert(agent, format!("Could not refresh native history: {error}. The cached conversation is preserved."));
+                    }
+                }
+            },
+            Ok(Payload::Index {
+                index,
+                sessions,
+                protected,
+            }) => {
+                let mut warnings = index.warnings;
+                let present: HashSet<_> = index
+                    .threads
+                    .iter()
+                    .map(|entry| entry.summary.identity.session_id.clone())
+                    .collect();
+                let mut next = self.snapshot.clone();
+                let record = next
+                    .projects
+                    .iter_mut()
+                    .find(|record| {
+                        record
+                            .project
+                            .as_ref()
+                            .is_some_and(|project| project.id == ticket.project)
+                    })
+                    .unwrap();
+                for entry in index.threads {
+                    let identity = &entry.summary.identity;
+                    if identity.provider_id != ticket.provider
+                        || identity.session_id.is_empty()
+                        || !same_project(&entry.summary.working_directory, &ticket.root)
+                    {
+                        warnings.push("A native history entry belonged to another provider or project and was ignored.".into());
+                        continue;
+                    }
+                    if record.suppressed_native_threads.iter().any(|deleted| {
+                        deleted.provider_id == identity.provider_id
+                            && deleted.session_id == identity.session_id
+                    }) {
+                        continue;
+                    }
+                    let existing = record
+                        .native_bindings
+                        .iter()
+                        .find(|binding| {
+                            binding.provider_id == identity.provider_id
+                                && binding.session_id == identity.session_id
+                        })
+                        .map(|binding| binding.agent_id)
+                        .or_else(|| {
+                            record
+                                .agents
+                                .iter()
+                                .find(|agent| {
+                                    if agent
+                                        .configuration
+                                        .provider_id
+                                        .as_deref()
+                                        .unwrap_or("codex")
+                                        != identity.provider_id
+                                    {
+                                        return false;
+                                    }
+                                    self.conversations
+                                        .get(&agent.id)
+                                        .is_some_and(|conversation| {
+                                            conversation
+                                                .lock()
+                                                .unwrap_or_else(|error| error.into_inner())
+                                                .session_id()
+                                                == Some(&identity.session_id)
+                                        })
+                                        || sessions.iter().any(|(id, session)| {
+                                            *id == agent.id && *session == identity.session_id
+                                        })
+                                })
+                                .map(|agent| agent.id)
+                        });
+                    let id = existing.unwrap_or_else(Uuid::new_v4);
+                    record.missing_native_agent_ids.retain(|agent| *agent != id);
+                    if self.is_thread_busy(id)
+                        || self
+                            .native_sync
+                            .completed_turns
+                            .get(&id)
+                            .is_some_and(|finished| finished.elapsed() < Duration::from_secs(4))
+                    {
+                        continue;
+                    }
+                    if !record.agents.iter().any(|agent| agent.id == id) {
+                        let mut agent = Agent::with_id(id, &entry.summary.title);
+                        agent.configuration.provider_id = Some(identity.provider_id.clone());
+                        record.agents.push(agent);
+                        record.project.as_mut().unwrap().agent_order.push(id);
+                    }
+                    let overrides = record
+                        .thread_overrides
+                        .iter()
+                        .find(|entry| entry.agent_id == id);
+                    let title = overrides
+                        .and_then(|entry| entry.title.clone())
+                        .unwrap_or_else(|| entry.summary.title.clone());
+                    let archived = overrides
+                        .and_then(|entry| entry.archived)
+                        .unwrap_or(entry.summary.is_archived);
+                    let agent = record
+                        .agents
+                        .iter_mut()
+                        .find(|agent| agent.id == id)
+                        .unwrap();
+                    agent.title = title;
+                    // Native defaults stay in the binding, separate from explicit
+                    // user model, effort, and access overrides.
+                    agent
+                        .configuration
+                        .provider_id
+                        .get_or_insert(identity.provider_id.clone());
+                    record.archived_agent_ids.retain(|agent| *agent != id);
+                    if archived {
+                        record.archived_agent_ids.push(id);
+                    }
+                    let previous = record
+                        .native_bindings
+                        .iter()
+                        .find(|binding| binding.agent_id == id)
+                        .cloned();
+                    record
+                        .native_bindings
+                        .retain(|binding| binding.agent_id != id);
+                    let mut binding = native_binding(id, &entry);
+                    if let Some(previous) = previous {
+                        binding.local_history_pending = previous.local_history_pending;
+                        binding.model = binding.model.or(previous.model);
+                        binding.effort = binding.effort.or(previous.effort);
+                        binding.agent_access = binding.agent_access.or(previous.agent_access);
+                        binding.context_window_size =
+                            binding.context_window_size.or(previous.context_window_size);
+                    }
+                    record.native_bindings.push(binding);
+                }
+                if warnings.is_empty() {
+                    for binding in record
+                        .native_bindings
+                        .iter()
+                        .filter(|binding| binding.provider_id == ticket.provider)
+                    {
+                        let id = binding.agent_id;
+                        let protected = protected.contains(&id)
+                            || self.is_thread_busy(id)
+                            || self.snapshot.active_agent_id == Some(id)
+                            || binding.local_history_pending
+                            || self
+                                .restored_drafts
+                                .get(&id)
+                                .is_some_and(|draft| !draft.is_empty())
+                            || self.conversations.get(&id).is_some_and(|conversation| {
+                                conversation
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner())
+                                    .unsent()
+                                    .is_some()
+                            });
+                        if !present.contains(&binding.session_id)
+                            && !protected
+                            && !record.missing_native_agent_ids.contains(&id)
+                        {
+                            record.missing_native_agent_ids.push(id);
+                        }
+                    }
+                }
+                if next.active_project_id == Some(ticket.project) && next.active_agent_id.is_none()
+                {
+                    next.active_agent_id = visible_agent(record, record.last_selected_agent_id);
+                }
+                // Provider errors and no-op polls must not rewrite the workspace.
+                if serde_json::to_vec(&next).ok() != serde_json::to_vec(&self.snapshot).ok() {
+                    self.commit_thread_change(next, "save native thread discovery");
+                }
+                self.native_sync
+                    .warnings
+                    .insert((ticket.project, ticket.provider), warnings);
+            }
+            Ok(Payload::Unchanged) => {
+                if let RequestKind::History { agent, .. } = ticket.kind {
+                    self.native_sync.history_warnings.remove(&agent);
+                }
+            }
+            Ok(Payload::History(history)) => {
+                let RequestKind::History {
+                    agent,
+                    session,
+                    revision,
+                    ..
+                } = ticket.kind
+                else {
+                    return false;
+                };
+                if self.project_for_agent(agent) != Some(ticket.project)
+                    || self.is_thread_busy(agent)
+                {
+                    return false;
+                }
+                let Some(binding) = self
+                    .snapshot
+                    .projects
+                    .iter()
+                    .flat_map(|record| &record.native_bindings)
+                    .find(|binding| {
+                        binding.agent_id == agent
+                            && binding.provider_id == ticket.provider
+                            && binding.session_id == session
+                    })
+                    .cloned()
+                else {
+                    return false;
+                };
+                if history.entry.summary.identity.provider_id != ticket.provider
+                    || history.entry.summary.identity.session_id != session
+                    || !same_project(&history.entry.summary.working_directory, &ticket.root)
+                {
+                    self.native_sync.history_warnings.insert(agent, "Native history did not match this thread's project and provider; the cache was preserved.".into());
+                    return true;
+                }
+                if history.history_truncated {
+                    self.native_sync.history_warnings.insert(agent, "The provider returned incomplete history. The cached conversation is preserved.".into());
+                    return true;
+                }
+                if self.protected_conversations.contains(&agent) {
+                    self.native_sync.history_warnings.insert(agent, "The local conversation cache could not be read. Its files and draft are preserved.".into());
+                    return true;
+                }
+                let conversation = self.conversation(ticket.project, agent);
+                {
+                    let mut conversation = conversation
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    if conversation.revision() != revision
+                        || conversation.is_busy()
+                        || conversation.unsent().is_some()
+                    {
+                        return false;
+                    }
+                    if history.messages.is_empty() && conversation.message_count() > 0 {
+                        self.native_sync.history_warnings.insert(agent, "The provider returned empty history for a cached conversation. The local history is preserved.".into());
+                        return true;
+                    }
+                    if binding.local_history_pending
+                        && !native_contains_local_tail(&conversation, &history.messages)
+                    {
+                        self.native_sync.history_warnings.insert(agent, "The provider's history has not caught up with the latest turn. The local conversation is preserved.".into());
+                        return true;
+                    }
+                    if !conversation.messages().eq(history.messages.iter()) {
+                        conversation.replace_full_history(history.messages);
+                    }
+                    if let Some(tokens) = history.current_context_tokens
+                        && tokens != conversation.usage().current_context_tokens
+                    {
+                        let mut usage = conversation.usage();
+                        usage.current_context_tokens = tokens;
+                        conversation.restore_usage(usage);
+                    }
+                }
+                let metadata_before = serde_json::to_vec(&binding).ok();
+                let mut metadata_changed = false;
+                for binding in self
+                    .snapshot
+                    .projects
+                    .iter_mut()
+                    .flat_map(|record| &mut record.native_bindings)
+                    .filter(|binding| binding.agent_id == agent)
+                {
+                    binding.local_history_pending = false;
+                    binding.model = history
+                        .entry
+                        .defaults
+                        .model_id
+                        .clone()
+                        .or(binding.model.clone());
+                    binding.effort = history
+                        .entry
+                        .defaults
+                        .effort
+                        .clone()
+                        .or(binding.effort.clone());
+                    binding.agent_access =
+                        history.entry.defaults.agent_access.or(binding.agent_access);
+                    binding.context_window_size = history
+                        .entry
+                        .defaults
+                        .context_window_size
+                        .or(binding.context_window_size);
+                    metadata_changed = serde_json::to_vec(binding).ok() != metadata_before;
+                }
+                self.native_sync.history_warnings.remove(&agent);
+                self.native_sync
+                    .loaded_revisions
+                    .insert(agent, history.entry.revision);
+                self.save_conversations();
+                if metadata_changed {
+                    self.save();
+                }
+            }
+        }
+        true
+    }
+
+    /// Adopt a Rust-created session before index discovery, so the same provider
+    /// session can never appear as a second sidebar thread.
+    fn bind_local_session(&mut self, agent_id: Uuid) {
+        let Some(project_id) = self.project_for_agent(agent_id) else {
+            return;
+        };
+        let conversation = self.conversation(project_id, agent_id);
+        let session = conversation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .session_id()
+            .map(str::to_owned);
+        let Some(session) = session else {
+            return;
+        };
+        let record = self
+            .snapshot
+            .projects
+            .iter_mut()
+            .find(|record| {
+                record
+                    .project
+                    .as_ref()
+                    .is_some_and(|project| project.id == project_id)
+            })
+            .unwrap();
+        if record
+            .native_bindings
+            .iter()
+            .any(|binding| binding.agent_id == agent_id)
+        {
+            return;
+        }
+        let agent = record
+            .agents
+            .iter()
+            .find(|agent| agent.id == agent_id)
+            .unwrap();
+        record.native_bindings.push(fx_store::PersistedBinding {
+            agent_id,
+            provider_id: agent
+                .configuration
+                .provider_id
+                .clone()
+                .unwrap_or_else(|| "codex".into()),
+            session_id: session,
+            title: agent.title.clone(),
+            working_directory: record.project.as_ref().unwrap().root_path.clone(),
+            updated_at: fx_core::models::now(),
+            model: None,
+            effort: None,
+            agent_access: None,
+            is_archived: record.archived_agent_ids.contains(&agent_id),
+            revision: String::new(),
+            context_window_size: None,
+            local_history_pending: false,
+        });
+    }
+
+    fn mark_native_local_turn(&mut self, agent_id: Uuid) {
+        let Some(project) = self.project_for_agent(agent_id) else {
+            return;
+        };
+        self.bind_local_session(agent_id);
+        for binding in self
+            .snapshot
+            .projects
+            .iter_mut()
+            .flat_map(|record| &mut record.native_bindings)
+            .filter(|binding| binding.agent_id == agent_id)
+        {
+            binding.local_history_pending = true;
+        }
+        self.native_sync.invalidate(project);
+        self.native_sync
+            .completed_turns
+            .insert(agent_id, Instant::now());
+        self.save();
+    }
+
+    pub fn native_defaults(&self, agent_id: Uuid) -> fx_core::NativeDefaults {
+        self.snapshot
+            .projects
+            .iter()
+            .flat_map(|record| &record.native_bindings)
+            .find(|binding| binding.agent_id == agent_id)
+            .map(|binding| fx_core::NativeDefaults {
+                provider_id: Some(binding.provider_id.clone()),
+                model_id: binding.model.clone(),
+                effort: binding.effort.clone(),
+                agent_access: binding.agent_access,
+                context_window_size: binding.context_window_size,
+            })
+            .unwrap_or_default()
     }
 
     /// The current design settings.
@@ -1110,6 +1864,120 @@ impl AppState {
         let theme = self.theme();
         self.set_theme(theme.with_text_size(theme.text_size.next()));
     }
+}
+
+/// Keep local-only drafts and resume metadata even when native history cannot
+/// fit the bounded recovery cache. The caller reports this partial cache.
+fn encode_partial_cache(
+    mut record: PersistedConversation,
+    previous: Option<PersistedConversation>,
+    limit: u64,
+) -> Result<(PersistedConversation, Vec<u8>), String> {
+    record.messages = previous.map(|old| old.messages).unwrap_or_default();
+    let mut bytes = serde_json::to_vec(&record).map_err(|error| error.to_string())?;
+    if bytes.len() as u64 > limit {
+        record.messages.clear();
+        bytes = serde_json::to_vec(&record).map_err(|error| error.to_string())?;
+    }
+    if bytes.len() as u64 > limit {
+        return Err(
+            "The unsent draft itself exceeds the local cache limit and could not be saved.".into(),
+        );
+    }
+    Ok((record, bytes))
+}
+
+fn local_override(
+    record: &mut fx_store::PersistedProject,
+    agent_id: Uuid,
+) -> &mut fx_store::format::PersistedThreadOverride {
+    if let Some(index) = record
+        .thread_overrides
+        .iter()
+        .position(|entry| entry.agent_id == agent_id)
+    {
+        return &mut record.thread_overrides[index];
+    }
+    record
+        .thread_overrides
+        .push(fx_store::format::PersistedThreadOverride {
+            agent_id,
+            title: None,
+            archived: None,
+        });
+    record.thread_overrides.last_mut().unwrap()
+}
+
+fn native_binding(
+    agent_id: Uuid,
+    entry: &fx_agent::native::NativeThreadSummary,
+) -> fx_store::PersistedBinding {
+    fx_store::PersistedBinding {
+        agent_id,
+        provider_id: entry.summary.identity.provider_id.clone(),
+        session_id: entry.summary.identity.session_id.clone(),
+        title: entry.summary.title.clone(),
+        working_directory: entry.summary.working_directory.clone(),
+        updated_at: entry.summary.updated_at,
+        model: entry.defaults.model_id.clone(),
+        effort: entry.defaults.effort.clone(),
+        agent_access: entry.defaults.agent_access,
+        is_archived: entry.summary.is_archived,
+        revision: entry.revision.clone(),
+        context_window_size: entry.defaults.context_window_size,
+        local_history_pending: false,
+    }
+}
+
+/// Native files may lag a successfully completed pipe turn. Do not exchange a
+/// known good local tail for an older file merely because a cooldown elapsed.
+fn native_contains_local_tail(
+    conversation: &Conversation,
+    messages: &[fx_core::ConversationMessage],
+) -> bool {
+    // Providers may combine or split assistant prose around tools differently.
+    // Compare normalized, consecutive role blocks, consuming each native block
+    // once. Checking only the final text anywhere in history lets an earlier
+    // identical "continue" / "Done." turn masquerade as the just-finished one.
+    fn prose_blocks<'a>(
+        messages: impl Iterator<Item = &'a fx_core::ConversationMessage>,
+    ) -> Vec<(fx_core::MessageRole, String)> {
+        let mut blocks: Vec<(fx_core::MessageRole, String)> = Vec::new();
+        for message in messages {
+            if !matches!(
+                message.role,
+                fx_core::MessageRole::User | fx_core::MessageRole::Assistant
+            ) {
+                continue;
+            }
+            let text = message
+                .text_content()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            if text.is_empty() {
+                continue;
+            }
+            if let Some((role, previous)) = blocks.last_mut()
+                && *role == message.role
+            {
+                previous.push(' ');
+                previous.push_str(&text);
+            } else {
+                blocks.push((message.role, text));
+            }
+        }
+        blocks
+    }
+
+    let mut native = prose_blocks(messages.iter()).into_iter();
+    prose_blocks(conversation.messages())
+        .into_iter()
+        .all(|(role, text)| {
+            native.any(|(native_role, native_text)| {
+                native_role == role && native_text.contains(&text)
+            })
+        })
 }
 
 /// Copy of a conversation for persistence.
@@ -1149,7 +2017,7 @@ pub(crate) fn restore_conversation(
     conversation: &mut Conversation,
     persisted: PersistedConversation,
 ) {
-    conversation.replace_messages(persisted.messages);
+    conversation.replace_full_history(persisted.messages);
     if let Some(session_id) = persisted.session_id {
         conversation.set_session_id(session_id);
     }
@@ -1173,7 +2041,9 @@ pub(crate) fn restore_conversation(
 
 fn visible_agent(record: &fx_store::PersistedProject, preferred: Option<Uuid>) -> Option<Uuid> {
     let visible = |id: &Uuid| {
-        !record.archived_agent_ids.contains(id) && record.agents.iter().any(|agent| agent.id == *id)
+        !record.archived_agent_ids.contains(id)
+            && !record.missing_native_agent_ids.contains(id)
+            && record.agents.iter().any(|agent| agent.id == *id)
     };
     preferred
         .filter(visible)
@@ -1427,6 +2297,9 @@ mod persistence_tests {
                     effort: None,
                     agent_access: None,
                     is_archived: false,
+                    revision: String::new(),
+                    context_window_size: None,
+                    local_history_pending: false,
                 });
                 record
                     .native_presentation_ids
@@ -1949,5 +2822,727 @@ mod persistence_tests {
                 ));
             })
         });
+    }
+}
+
+#[cfg(test)]
+mod native_sync_tests {
+    use super::*;
+    use crate::native_sync::{Completion, Payload, RequestKind, Ticket};
+    use fx_agent::native::{NativeThread, NativeThreadIndex, NativeThreadSummary};
+    use fx_core::{ConversationMessage, MessageRole, NativeDefaults};
+
+    fn setup(cx: &mut App, paths: AppPaths, root: &str) -> (Entity<AppState>, Uuid) {
+        let state = cx.new(|cx| AppState::restore(paths, cx));
+        let project = state.update(cx, |state, _| {
+            state.add_project(root);
+            state.snapshot.active_project_id.unwrap()
+        });
+        (state, project)
+    }
+
+    fn entry(root: &str, provider: &str, session: &str, title: &str) -> NativeThreadSummary {
+        NativeThreadSummary {
+            summary: fx_agent::ThreadSummary {
+                identity: fx_agent::ThreadIdentity {
+                    provider_id: provider.into(),
+                    session_id: session.into(),
+                },
+                title: title.into(),
+                working_directory: root.into(),
+                updated_at: fx_core::models::now(),
+                is_archived: false,
+            },
+            defaults: NativeDefaults {
+                provider_id: Some(provider.into()),
+                model_id: Some("native-model".into()),
+                effort: Some("high".into()),
+                agent_access: Some(fx_core::AgentAccess::Supervised),
+                context_window_size: Some(200_000),
+            },
+            revision: "revision-1".into(),
+        }
+    }
+
+    fn index(
+        state: &mut AppState,
+        project: Uuid,
+        provider: &str,
+        entries: Vec<NativeThreadSummary>,
+        sessions: Vec<(Uuid, String)>,
+    ) {
+        state.apply_native_completion(Completion {
+            ticket: Ticket {
+                project,
+                root: state.project(project).unwrap().root_path.clone(),
+                provider: provider.into(),
+                generation: state.native_sync.generation(project),
+                kind: RequestKind::Index {
+                    candidates: Vec::new(),
+                    missing_candidates: Vec::new(),
+                },
+            },
+            result: Ok(Payload::Index {
+                index: NativeThreadIndex {
+                    threads: entries,
+                    warnings: Vec::new(),
+                },
+                sessions,
+                protected: Vec::new(),
+            }),
+        });
+    }
+
+    fn history_ticket(state: &mut AppState, project: Uuid, agent: Uuid) -> Ticket {
+        let binding = state
+            .snapshot
+            .projects
+            .iter()
+            .flat_map(|record| &record.native_bindings)
+            .find(|binding| binding.agent_id == agent)
+            .unwrap()
+            .clone();
+        let revision = state
+            .conversation(project, agent)
+            .lock()
+            .unwrap()
+            .revision();
+        Ticket {
+            project,
+            root: state.project(project).unwrap().root_path.clone(),
+            provider: binding.provider_id,
+            generation: state.native_sync.generation(project),
+            kind: RequestKind::History {
+                agent,
+                session: binding.session_id,
+                revision,
+                known_revision: None,
+            },
+        }
+    }
+
+    fn history(
+        state: &mut AppState,
+        ticket: Ticket,
+        entry: NativeThreadSummary,
+        messages: Vec<ConversationMessage>,
+    ) {
+        state.apply_native_completion(Completion {
+            ticket,
+            result: Ok(Payload::History(NativeThread {
+                entry,
+                messages,
+                current_context_tokens: Some(123),
+                history_truncated: false,
+            })),
+        });
+    }
+
+    #[test]
+    fn discovery_reuses_disk_session_and_isolates_provider_project_and_deleted_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_string_lossy().to_string();
+        let paths = AppPaths::at(temp.path().join("store"));
+        let test = gpui::TestAppContext::single();
+        let (state, project) = test.update(|cx| setup(cx, paths.clone(), &root));
+        let (codex_id, claude_id) = test.update(|cx| {
+            state.update(cx, |state, _| {
+                let codex_id = state.create_thread().unwrap();
+                let mut cached = PersistedConversation::from_messages(
+                    codex_id,
+                    vec![ConversationMessage::text(
+                        MessageRole::User,
+                        "Saved locally",
+                    )],
+                );
+                cached.session_id = Some("same-session".into());
+                state
+                    .store
+                    .save_conversation(project, codex_id, &cached)
+                    .unwrap();
+                state.conversations.remove(&codex_id);
+                state.snapshot.projects[0].agents[0]
+                    .configuration
+                    .agent_access = Some(fx_core::AgentAccess::AcceptEdits);
+                let good = entry(&root, "codex", "same-session", "Remote title");
+                index(
+                    state,
+                    project,
+                    "codex",
+                    vec![
+                        good,
+                        entry("/some/other/project", "codex", "wrong", "Wrong"),
+                        entry(&root, "claude", "wrong-provider", "Wrong"),
+                    ],
+                    vec![(codex_id, "same-session".into())],
+                );
+                assert_eq!(state.snapshot.projects[0].agents.len(), 1);
+                assert_eq!(state.snapshot.active_agent_id, Some(codex_id));
+                assert_eq!(
+                    state.thread(codex_id).unwrap().configuration.agent_access,
+                    Some(fx_core::AgentAccess::AcceptEdits)
+                );
+                assert_eq!(
+                    state.native_defaults(codex_id).agent_access,
+                    Some(fx_core::AgentAccess::Supervised)
+                );
+                index(
+                    state,
+                    project,
+                    "claude",
+                    vec![entry(&root, "claude", "same-session", "Claude")],
+                    Vec::new(),
+                );
+                let claude_id = state.snapshot.projects[0]
+                    .native_bindings
+                    .iter()
+                    .find(|binding| binding.provider_id == "claude")
+                    .unwrap()
+                    .agent_id;
+                assert_ne!(codex_id, claude_id);
+                assert_eq!(
+                    state
+                        .thread(claude_id)
+                        .unwrap()
+                        .configuration
+                        .provider_id
+                        .as_deref(),
+                    Some("claude")
+                );
+                assert!(state.delete_thread(codex_id));
+                assert_eq!(
+                    state.snapshot.projects[0].suppressed_native_threads.len(),
+                    1
+                );
+                (codex_id, claude_id)
+            })
+        });
+        test.update(|cx| {
+            let reopened = cx.new(|cx| AppState::restore(paths, cx));
+            reopened.update(cx, |state, _| {
+                index(
+                    state,
+                    project,
+                    "codex",
+                    vec![entry(&root, "codex", "same-session", "Would resurrect")],
+                    Vec::new(),
+                );
+                assert!(state.thread(codex_id).is_none());
+                assert!(state.thread(claude_id).is_some());
+                assert_eq!(state.snapshot.projects[0].agents.len(), 1);
+                assert!(
+                    !state.native_sync_enabled(),
+                    "view tests never launch installed CLIs"
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn full_history_and_external_rewrites_preserve_drafts_and_survive_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_string_lossy().to_string();
+        let paths = AppPaths::at(temp.path().join("store"));
+        let test = gpui::TestAppContext::single();
+        let (state, project) = test.update(|cx| setup(cx, paths.clone(), &root));
+        let agent = test.update(|cx| {
+            state.update(cx, |state, cx| {
+                let entry = entry(&root, "claude", "native", "Imported");
+                index(state, project, "claude", vec![entry.clone()], Vec::new());
+                let agent = state.snapshot.active_agent_id.unwrap();
+                let ticket = history_ticket(state, project, agent);
+                assert_eq!(
+                    state
+                        .conversation(project, agent)
+                        .lock()
+                        .unwrap()
+                        .session_id(),
+                    Some("native")
+                );
+                state
+                    .draft(agent, cx)
+                    .update(cx, |draft, cx| draft.set_value("Unsent typing", cx));
+                state.capture_drafts(cx);
+                let messages: Vec<_> = (0..900)
+                    .map(|index| {
+                        ConversationMessage::text(
+                            MessageRole::Assistant,
+                            format!("message {index}"),
+                        )
+                    })
+                    .collect();
+                history(state, ticket, entry.clone(), messages);
+                let conversation = state.conversation(project, agent);
+                assert_eq!(conversation.lock().unwrap().message_count(), 900);
+                conversation
+                    .lock()
+                    .unwrap()
+                    .append(ConversationMessage::text(
+                        MessageRole::Assistant,
+                        "Continued",
+                    ));
+                assert_eq!(
+                    conversation.lock().unwrap().message_count(),
+                    901,
+                    "continuing native history keeps its oldest rows"
+                );
+                let ticket = history_ticket(state, project, agent);
+                history(
+                    state,
+                    ticket,
+                    entry,
+                    vec![ConversationMessage::text(
+                        MessageRole::User,
+                        "External rewrite",
+                    )],
+                );
+                assert_eq!(conversation.lock().unwrap().message_count(), 1);
+                assert_eq!(
+                    conversation.lock().unwrap().last_text().as_deref(),
+                    Some("External rewrite")
+                );
+                assert_eq!(state.draft(agent, cx).read(cx).value(), "Unsent typing");
+                state.save_all(cx);
+                agent
+            })
+        });
+        test.update(|cx| {
+            let reopened = cx.new(|cx| AppState::restore(paths, cx));
+            reopened.update(cx, |state, cx| {
+                assert_eq!(state.snapshot.active_agent_id, Some(agent));
+                assert_eq!(
+                    state
+                        .conversation(project, agent)
+                        .lock()
+                        .unwrap()
+                        .session_id(),
+                    Some("native")
+                );
+                assert_eq!(
+                    state
+                        .conversation(project, agent)
+                        .lock()
+                        .unwrap()
+                        .last_text()
+                        .as_deref(),
+                    Some("External rewrite")
+                );
+                assert_eq!(state.draft(agent, cx).read(cx).value(), "Unsent typing");
+            });
+        });
+    }
+
+    #[test]
+    fn late_history_cannot_replace_busy_completed_unsent_or_removed_threads() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_string_lossy().to_string();
+        let test = gpui::TestAppContext::single();
+        let (state, project) =
+            test.update(|cx| setup(cx, AppPaths::at(temp.path().join("store")), &root));
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                let entry = entry(&root, "codex", "native", "Imported");
+                index(state, project, "codex", vec![entry.clone()], Vec::new());
+                let agent = state.snapshot.active_agent_id.unwrap();
+                let stale_ticket = history_ticket(state, project, agent);
+                assert!(state.prepare_prompt(agent, "Newest question", cx));
+                history(
+                    state,
+                    stale_ticket,
+                    entry.clone(),
+                    vec![ConversationMessage::text(
+                        MessageRole::Assistant,
+                        "Old response",
+                    )],
+                );
+                let conversation = state.conversation(project, agent);
+                assert_eq!(
+                    conversation.lock().unwrap().last_text().as_deref(),
+                    Some("Newest question")
+                );
+                conversation.lock().unwrap().clear_unsent();
+                conversation
+                    .lock()
+                    .unwrap()
+                    .append(ConversationMessage::text(
+                        MessageRole::Assistant,
+                        "Newest answer",
+                    ));
+                state.mark_native_local_turn(agent);
+                let current_ticket = history_ticket(state, project, agent);
+                history(
+                    state,
+                    current_ticket,
+                    entry.clone(),
+                    vec![ConversationMessage::text(
+                        MessageRole::User,
+                        "Older question",
+                    )],
+                );
+                assert_eq!(
+                    conversation.lock().unwrap().last_text().as_deref(),
+                    Some("Newest answer")
+                );
+                assert!(
+                    state
+                        .native_status(project)
+                        .warnings
+                        .iter()
+                        .any(|warning| warning.contains("caught up"))
+                );
+                let current_ticket = history_ticket(state, project, agent);
+                history(
+                    state,
+                    current_ticket,
+                    entry.clone(),
+                    vec![
+                        ConversationMessage::text(MessageRole::User, "Newest question"),
+                        ConversationMessage::text(MessageRole::Assistant, "Newest answer"),
+                    ],
+                );
+                assert!(!state.snapshot.projects[0].native_bindings[0].local_history_pending);
+                let current_ticket = history_ticket(state, project, agent);
+                conversation
+                    .lock()
+                    .unwrap()
+                    .set_phase(fx_agent::conversation::Phase::Running);
+                history(
+                    state,
+                    current_ticket,
+                    entry.clone(),
+                    vec![ConversationMessage::text(
+                        MessageRole::Assistant,
+                        "Busy replacement",
+                    )],
+                );
+                assert_eq!(
+                    conversation.lock().unwrap().last_text().as_deref(),
+                    Some("Newest answer")
+                );
+                conversation
+                    .lock()
+                    .unwrap()
+                    .set_phase(fx_agent::conversation::Phase::Idle);
+                let late_ticket = history_ticket(state, project, agent);
+                state.remove_project(project);
+                history(
+                    state,
+                    late_ticket,
+                    entry,
+                    vec![ConversationMessage::text(
+                        MessageRole::Assistant,
+                        "Removed project replacement",
+                    )],
+                );
+                assert!(state.snapshot.projects.is_empty());
+                assert_eq!(
+                    conversation.lock().unwrap().last_text().as_deref(),
+                    Some("Newest answer")
+                );
+            })
+        });
+    }
+
+    #[test]
+    fn remote_metadata_updates_unless_locally_overridden_and_failed_read_keeps_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_string_lossy().to_string();
+        let test = gpui::TestAppContext::single();
+        let (state, project) =
+            test.update(|cx| setup(cx, AppPaths::at(temp.path().join("store")), &root));
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                let mut entry = entry(&root, "codex", "native", "Original");
+                index(state, project, "codex", vec![entry.clone()], Vec::new());
+                let agent = state.snapshot.active_agent_id.unwrap();
+                entry.summary.title = "Remote rename".into();
+                entry.summary.is_archived = true;
+                index(state, project, "codex", vec![entry.clone()], Vec::new());
+                assert_eq!(state.thread(agent).unwrap().title, "Remote rename");
+                assert!(state.is_thread_archived(agent));
+                assert!(state.rename_thread(agent, "Local name"));
+                assert!(state.set_thread_archived(agent, false));
+                index(state, project, "codex", vec![entry], Vec::new());
+                assert_eq!(state.thread(agent).unwrap().title, "Local name");
+                assert!(!state.is_thread_archived(agent));
+                let ticket = history_ticket(state, project, agent);
+                state.apply_native_completion(Completion {
+                    ticket,
+                    result: Err("offline".into()),
+                });
+                assert_eq!(
+                    state
+                        .conversation(project, agent)
+                        .lock()
+                        .unwrap()
+                        .session_id(),
+                    Some("native")
+                );
+                assert!(
+                    state
+                        .native_status(project)
+                        .warnings
+                        .iter()
+                        .any(|warning| warning.contains("offline"))
+                );
+                assert_eq!(state.snapshot.projects[0].native_bindings.len(), 1);
+            })
+        });
+    }
+    #[test]
+    fn missing_native_threads_hide_only_after_complete_index_and_keep_local_drafts() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_string_lossy().to_string();
+        let test = gpui::TestAppContext::single();
+        let (state, project) =
+            test.update(|cx| setup(cx, AppPaths::at(temp.path().join("store")), &root));
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                let first = entry(&root, "codex", "first", "First");
+                let second = entry(&root, "codex", "second", "Second");
+                index(
+                    state,
+                    project,
+                    "codex",
+                    vec![first.clone(), second.clone()],
+                    Vec::new(),
+                );
+                let first_id = state.snapshot.active_agent_id.unwrap();
+                let second_id = state.snapshot.projects[0]
+                    .native_bindings
+                    .iter()
+                    .find(|binding| binding.session_id == "second")
+                    .unwrap()
+                    .agent_id;
+                // A partial index cannot prove that a thread was deleted.
+                let ticket = Ticket {
+                    project,
+                    root: root.clone(),
+                    provider: "codex".into(),
+                    generation: state.native_sync.generation(project),
+                    kind: RequestKind::Index {
+                        candidates: Vec::new(),
+                        missing_candidates: Vec::new(),
+                    },
+                };
+                state.apply_native_completion(Completion {
+                    ticket: ticket.clone(),
+                    result: Ok(Payload::Index {
+                        index: NativeThreadIndex {
+                            threads: vec![first.clone()],
+                            warnings: vec!["One file unreadable".into()],
+                        },
+                        sessions: Vec::new(),
+                        protected: Vec::new(),
+                    }),
+                });
+                assert!(
+                    state.snapshot.projects[0]
+                        .missing_native_agent_ids
+                        .is_empty()
+                );
+                // The worker checks an unopened missing thread's disk cache for drafts.
+                state.apply_native_completion(Completion {
+                    ticket,
+                    result: Ok(Payload::Index {
+                        index: NativeThreadIndex {
+                            threads: vec![first.clone()],
+                            warnings: Vec::new(),
+                        },
+                        sessions: Vec::new(),
+                        protected: vec![second_id],
+                    }),
+                });
+                assert!(
+                    state.snapshot.projects[0]
+                        .missing_native_agent_ids
+                        .is_empty()
+                );
+                index(state, project, "codex", vec![first.clone()], Vec::new());
+                assert_eq!(
+                    state.snapshot.projects[0].missing_native_agent_ids,
+                    vec![second_id]
+                );
+                assert!(
+                    state.thread(second_id).is_some(),
+                    "configuration and binding survive disappearance"
+                );
+                assert_eq!(
+                    state
+                        .active_agents()
+                        .iter()
+                        .map(|agent| agent.id)
+                        .collect::<Vec<_>>(),
+                    vec![first_id]
+                );
+                index(state, project, "codex", vec![first, second], Vec::new());
+                assert!(
+                    state.snapshot.projects[0]
+                        .missing_native_agent_ids
+                        .is_empty()
+                );
+                assert_eq!(
+                    state.snapshot.projects[0].agents.len(),
+                    2,
+                    "reappearance reuses the same presentation"
+                );
+            })
+        });
+    }
+
+    #[test]
+    fn oversized_history_recovery_keeps_draft_unsent_and_previous_cache() {
+        let agent = Uuid::new_v4();
+        let old = PersistedConversation::from_messages(
+            agent,
+            vec![ConversationMessage::text(MessageRole::User, "Old cache")],
+        );
+        let mut incoming = PersistedConversation::from_messages(
+            agent,
+            vec![ConversationMessage::text(
+                MessageRole::Assistant,
+                "large".repeat(4000),
+            )],
+        );
+        incoming.session_id = Some("native-session".into());
+        incoming.draft_text = "Keep my local typing".into();
+        incoming.unsent_prompt = Some(fx_store::PersistedUnsentPrompt::new(
+            "Failed send".into(),
+            0,
+            Some("native-session".into()),
+        ));
+        let (partial, bytes) = encode_partial_cache(incoming, Some(old), 2048).unwrap();
+        assert!(bytes.len() <= 2048);
+        assert_eq!(partial.messages[0].text_content(), "Old cache");
+        assert_eq!(partial.draft_text, "Keep my local typing");
+        assert_eq!(partial.unsent_prompt.unwrap().text, "Failed send");
+        assert_eq!(partial.session_id.as_deref(), Some("native-session"));
+        let reopened: PersistedConversation = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(reopened.draft_text, "Keep my local typing");
+    }
+
+    #[test]
+    fn fake_worker_pipeline_prioritizes_selected_history_and_throttles_unchanged_reads() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_string_lossy().to_string();
+        let test = gpui::TestAppContext::single();
+        let (state, project) =
+            test.update(|cx| setup(cx, AppPaths::at(temp.path().join("store")), &root));
+        test.update(|cx| state.update(cx, |state, cx| {
+            let native_entry = entry(&root, "codex", "native", "Imported");
+            index(state, project, "codex", vec![native_entry.clone()], Vec::new());
+            let agent = state.snapshot.active_agent_id.unwrap();
+            let (codex_jobs, codex_results) = state.native_sync.test_worker("codex");
+            let (claude_jobs, _claude_results) = state.native_sync.test_worker("claude");
+            assert!(state.poll_native_sync(cx));
+            let initial = codex_jobs.try_recv().unwrap();
+            assert!(matches!(initial.kind, RequestKind::History { agent: id, known_revision: None, .. } if id == agent), "saved native selection loads before startup index jobs");
+            let other_provider = claude_jobs.try_recv().unwrap();
+            assert!(matches!(other_provider.kind, RequestKind::Index { candidates, missing_candidates } if candidates.is_empty() && missing_candidates.is_empty()));
+            // Pending work remains bounded even while many timer ticks pass.
+            for _ in 0..20 { state.poll_native_sync(cx); }
+            assert!(codex_jobs.try_recv().is_err());
+            codex_results.send(Completion { ticket: initial, result: Ok(Payload::History(NativeThread { entry: native_entry, messages: vec![ConversationMessage::text(MessageRole::Assistant, "Native history")], current_context_tokens: None, history_truncated: false })) }).unwrap();
+            state.poll_native_sync(cx);
+            let index_ticket = codex_jobs.try_recv().unwrap();
+            assert!(matches!(index_ticket.kind, RequestKind::Index { .. }), "metadata gets a turn after selected history");
+            codex_results.send(Completion { ticket: index_ticket, result: Ok(Payload::Index { index: NativeThreadIndex::default(), sessions: Vec::new(), protected: Vec::new() }) }).unwrap();
+            state.poll_native_sync(cx);
+            assert!(codex_jobs.try_recv().is_err(), "normal history polling is throttled");
+            state.native_sync.history_due.insert(agent, Instant::now() - Duration::from_secs(1));
+            state.poll_native_sync(cx);
+            let repeat = codex_jobs.try_recv().unwrap();
+            assert!(matches!(&repeat.kind, RequestKind::History { known_revision: Some(revision), .. } if revision == "revision-1"));
+            let revision = state.conversation(project, agent).lock().unwrap().revision();
+            codex_results.send(Completion { ticket: repeat, result: Ok(Payload::Unchanged) }).unwrap();
+            state.poll_native_sync(cx);
+            assert_eq!(state.conversation(project, agent).lock().unwrap().revision(), revision);
+        }));
+    }
+    #[test]
+    fn an_earlier_identical_turn_cannot_clear_the_pending_local_history_guard() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_string_lossy().to_string();
+        let test = gpui::TestAppContext::single();
+        let (state, project) =
+            test.update(|cx| setup(cx, AppPaths::at(temp.path().join("store")), &root));
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                let entry = entry(&root, "codex", "repeated", "Repeated turns");
+                index(state, project, "codex", vec![entry.clone()], Vec::new());
+                let agent = state.snapshot.active_agent_id.unwrap();
+                let conversation = state.conversation(project, agent);
+                let one_turn = vec![
+                    ConversationMessage::text(MessageRole::User, "continue"),
+                    ConversationMessage::text(MessageRole::Assistant, "Done."),
+                ];
+                let two_turns = [one_turn.clone(), one_turn.clone()].concat();
+                conversation
+                    .lock()
+                    .unwrap()
+                    .replace_full_history(two_turns.clone());
+                state.mark_native_local_turn(agent);
+                let ticket = history_ticket(state, project, agent);
+                history(state, ticket, entry.clone(), one_turn);
+                assert!(state.snapshot.projects[0].native_bindings[0].local_history_pending);
+                assert_eq!(
+                    conversation.lock().unwrap().message_count(),
+                    4,
+                    "the second identical turn must not be replaced by the first"
+                );
+                assert!(
+                    state
+                        .native_status(project)
+                        .warnings
+                        .iter()
+                        .any(|warning| warning.contains("caught up"))
+                );
+                let ticket = history_ticket(state, project, agent);
+                history(state, ticket, entry, two_turns);
+                assert!(!state.snapshot.projects[0].native_bindings[0].local_history_pending);
+                assert_eq!(conversation.lock().unwrap().message_count(), 4);
+                assert!(state.native_status(project).warnings.is_empty());
+            })
+        });
+    }
+
+    #[test]
+    fn native_catchup_preserves_role_order_and_normalizes_split_prose() {
+        let mut conversation = Conversation::new(Uuid::new_v4());
+        conversation.replace_full_history(vec![
+            ConversationMessage::text(MessageRole::User, "Check this"),
+            ConversationMessage::text(MessageRole::Assistant, "Checking the file."),
+            ConversationMessage::text(MessageRole::Tool, "Tool output"),
+            ConversationMessage::text(MessageRole::Assistant, "Done."),
+        ]);
+        assert!(native_contains_local_tail(
+            &conversation,
+            &[
+                ConversationMessage::text(MessageRole::User, "Check this"),
+                ConversationMessage::text(MessageRole::Assistant, "Checking the file.\n\nDone."),
+            ]
+        ));
+        assert!(!native_contains_local_tail(
+            &conversation,
+            &[
+                ConversationMessage::text(MessageRole::Assistant, "Checking the file. Done."),
+                ConversationMessage::text(MessageRole::User, "Check this"),
+            ]
+        ));
+        conversation.replace_full_history(vec![
+            ConversationMessage::text(MessageRole::User, "continue"),
+            ConversationMessage::text(MessageRole::Assistant, "Done."),
+            ConversationMessage::text(MessageRole::Assistant, "Done."),
+        ]);
+        assert!(
+            !native_contains_local_tail(
+                &conversation,
+                &[
+                    ConversationMessage::text(MessageRole::User, "continue"),
+                    ConversationMessage::text(MessageRole::Assistant, "Done."),
+                ]
+            ),
+            "one native prose occurrence cannot satisfy two local segments"
+        );
     }
 }

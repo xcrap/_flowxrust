@@ -7,6 +7,7 @@
 pub mod catalog;
 #[cfg(test)]
 mod fake_claude;
+pub mod native;
 pub mod stream;
 pub mod transport;
 
