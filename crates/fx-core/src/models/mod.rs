@@ -12,8 +12,8 @@ pub mod project;
 pub mod tool_approval;
 
 pub use agent::{
-    ALL_EFFORTS, Agent, AgentAccess, AgentConfiguration, AgentExecutionState, AgentMode,
-    AppDefaults, DEFAULT_CODEX_MODEL_ID, DEFAULT_EFFORT, DEFAULT_PROVIDER_ID, NativeDefaults,
+    ALL_EFFORTS, Agent, AgentAccess, AgentConfiguration, AgentExecutionState, AppDefaults,
+    DEFAULT_CODEX_MODEL_ID, DEFAULT_EFFORT, DEFAULT_PROVIDER_ID, NativeDefaults,
     ResolvedConfiguration,
 };
 pub use conversation::{

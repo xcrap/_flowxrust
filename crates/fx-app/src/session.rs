@@ -41,7 +41,7 @@ use fx_agent::codex::session::TurnRequest;
 use fx_agent::codex::{ApprovalPolicy, CodexProvider, CodexSession, Transport, TurnOutcome};
 use fx_agent::{Conversation, Phase, ProviderEvent};
 use fx_core::services::runtime::{BinarySpec, RuntimeDiscovery, claude_spec};
-use fx_core::{Agent, AgentAccess, AgentMode, DEFAULT_CODEX_MODEL_ID};
+use fx_core::{Agent, AgentAccess, DEFAULT_CODEX_MODEL_ID};
 
 /// The version reported to Codex.
 ///
@@ -209,7 +209,6 @@ impl TurnRunner {
             access: agent.configuration.resolved_access(AgentAccess::default()),
             model,
             effort,
-            mode: agent.configuration.resolved_mode(),
             system_prompt: agent.configuration.system_prompt.clone(),
             on_update: Arc::new(Mutex::new(Box::new(on_update))),
             // The job keeps a sender of its own for the length of the run, so
@@ -309,7 +308,6 @@ struct Job {
     access: AgentAccess,
     model: String,
     effort: Option<String>,
-    mode: AgentMode,
     system_prompt: Option<String>,
     on_update: UpdateSink,
     /// Held for the length of the run so its receivers never close spuriously.
@@ -437,8 +435,7 @@ impl Job {
             let request = TurnRequest::new(&thread_id, &self.prompt, &self.project_root)
                 .model(&self.model)
                 .effort(self.effort.as_deref().unwrap_or_default())
-                .access(self.access)
-                .plan_mode(self.mode == AgentMode::Plan);
+                .access(self.access);
             let mut turn = Box::pin(session.run_turn_interactive(
                 &request,
                 &mut responses,
@@ -521,7 +518,6 @@ impl Job {
             model: (!self.model.is_empty()).then(|| self.model.clone()),
             effort: self.effort.clone(),
             system_prompt: self.system_prompt.clone(),
-            mode: self.mode,
             access: Some(self.access),
             resume_session_id: resume.clone(),
             ..Default::default()
@@ -583,7 +579,7 @@ impl Job {
                             }
                             if let ProviderEvent::Approval(ref request) = event {
                                 let auto = if self.approvals == ApprovalPolicy::Ask {
-                                    (self.access == AgentAccess::FullAccess && self.mode != AgentMode::Plan).then_some(true)
+                                    (self.access == AgentAccess::FullAccess).then_some(true)
                                 } else { Some(self.approvals.allows(&request.tool_name, &request.input)) };
                                 if let Some(approved) = auto {
                                     if let Err(error) = transport.approve(&request.id, approved).await {
@@ -1242,7 +1238,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_uses_the_agents_model_effort_plan_access_and_instructions() {
+    fn codex_uses_the_agents_model_effort_access_and_instructions_without_workflow_overrides() {
         let Some(server) = FakeServer::new() else {
             return;
         };
@@ -1253,7 +1249,6 @@ mod tests {
         let mut agent = Agent::new("Configured");
         agent.configuration.model_id = Some("fixture-model".into());
         agent.configuration.effort = Some("high".into());
-        agent.configuration.agent_mode = Some(AgentMode::Plan);
         agent.configuration.agent_access = Some(AgentAccess::Supervised);
         agent.configuration.system_prompt = Some("fixture instructions".into());
         let recorder = Recorder::default();
@@ -1280,13 +1275,57 @@ mod tests {
         let params: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(params["model"], "fixture-model");
         assert_eq!(params["effort"], "high");
-        assert_eq!(params["collaborationMode"]["mode"], "plan");
+        assert_eq!(params["collaborationMode"]["mode"], "default");
+        assert_eq!(
+            params["collaborationMode"]["settings"]["model"],
+            "fixture-model"
+        );
+        assert_eq!(
+            params["collaborationMode"]["settings"]["reasoning_effort"],
+            "high"
+        );
+        assert!(params["collaborationMode"]["settings"]["developer_instructions"].is_null());
+        assert!(params.get("additionalContext").is_none());
         assert_eq!(params["approvalPolicy"], "untrusted");
         assert_eq!(params["sandboxPolicy"]["type"], "workspaceWrite");
         assert_eq!(
             server.thread_calls()[0].1["developerInstructions"],
             "fixture instructions"
         );
+    }
+
+    #[test]
+    fn a_resumed_codex_thread_leaves_its_previously_saved_planning_workflow() {
+        let Some(server) = FakeServer::new() else {
+            return;
+        };
+        let Some(provider) = server.provider() else {
+            return;
+        };
+        let conversation = conversation();
+        lock(&conversation).set_session_id("thread-previous-plan");
+        let mut agent = Agent::new("Resumed");
+        agent.configuration.agent_access = Some(AgentAccess::Supervised);
+        let recorder = Recorder::default();
+        let sink = recorder.clone();
+        let _runner = TurnRunner::launch_with(
+            conversation.clone(),
+            "/tmp/project".into(),
+            agent,
+            "echo-workflow".into(),
+            ApprovalPolicy::Ask,
+            provider,
+            move |update| sink.record(update),
+        );
+        let updates = recorder.wait_for_end(TURN_BUDGET);
+        assert!(
+            matches!(updates.last(), Some(SessionUpdate::Finished { outcome }) if outcome.is_completed())
+        );
+        assert_eq!(rows(&conversation), vec!["text: default"]);
+        let calls = server.thread_calls();
+        assert_eq!(calls[0].0, "thread/resume");
+        assert_eq!(calls[0].1["threadId"], "thread-previous-plan");
+        assert_eq!(calls[0].1["approvalPolicy"], "untrusted");
     }
 
     struct ClaudeFixture {
@@ -1433,6 +1472,7 @@ for line in sys.stdin:
                 "{args:?}"
             );
         }
+        assert!(!args.iter().any(|arg| arg == "plan"), "{args:?}");
         assert!(
             launches[1]
                 .as_array()
@@ -1443,17 +1483,13 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn claude_models_without_effort_support_omit_the_flag_even_with_a_stale_saved_choice() {
+    fn claude_unknown_default_capabilities_omit_the_flag_even_with_a_stale_saved_choice() {
         let Some(server) = ClaudeFixture::new() else {
             return;
         };
         let conversation = conversation();
-        let (_runner, recorder) = server.start_with_model(
-            &conversation,
-            "hello",
-            AgentAccess::Supervised,
-            "claude-haiku-4-5",
-        );
+        let (_runner, recorder) =
+            server.start_with_model(&conversation, "hello", AgentAccess::Supervised, "default");
         let updates = recorder.wait_for_end(TURN_BUDGET);
         assert!(
             matches!(updates.last(), Some(SessionUpdate::Finished { outcome }) if outcome.is_completed()),
@@ -1496,6 +1532,30 @@ for line in sys.stdin:
             .unwrap();
         assert_eq!(response["response"]["response"]["behavior"], "deny");
         assert!(lock(&conversation).pending_approvals().is_empty());
+    }
+
+    #[test]
+    fn claude_explicit_full_access_approves_tools_without_workflow_overrides() {
+        let Some(server) = ClaudeFixture::new() else {
+            return;
+        };
+        let conversation = conversation();
+        let (_runner, recorder) = server.start(&conversation, "tool", AgentAccess::FullAccess);
+        let updates = recorder.wait_for_end(TURN_BUDGET);
+        assert!(
+            matches!(updates.last(), Some(SessionUpdate::Finished { outcome }) if outcome.is_completed())
+        );
+        assert!(
+            !updates
+                .iter()
+                .any(|update| matches!(update, SessionUpdate::Interaction { .. }))
+        );
+        let response = server
+            .received()
+            .into_iter()
+            .find(|item| item["type"] == "control_response")
+            .unwrap();
+        assert_eq!(response["response"]["response"]["behavior"], "allow");
     }
 
     #[test]
@@ -1745,6 +1805,7 @@ def send(obj):
     sys.stdout.write(json.dumps(obj) + "\n")
     sys.stdout.flush()
 
+workflow = "default"
 for line in sys.stdin:
     line = line.strip()
     if not line:
@@ -1763,9 +1824,12 @@ for line in sys.stdin:
             log.write(json.dumps({"method": method,
                                   "params": msg.get("params")}) + "\n")
         requested = (msg.get("params") or {}).get("threadId")
+        # Codex restores this from its saved thread context on resume.
+        workflow = "plan" if requested == "thread-previous-plan" else "default"
         send({"jsonrpc": "2.0", "id": mid, "result": {"thread": {
             "id": requested or "thread-new"}}})
     elif method == "turn/start":
+        workflow = ((msg.get("params") or {}).get("collaborationMode") or {}).get("mode", workflow)
         prompt = ""
         for item in (msg.get("params") or {}).get("input") or []:
             if item.get("type") == "text":
@@ -1776,9 +1840,10 @@ for line in sys.stdin:
             send({"jsonrpc": "2.0", "method": "turn/completed",
                   "params": {"turn": {"id": "turn-1", "status": "failed",
                                       "error": {"message": "the model refused"}}}})
-        elif prompt == "echo-params":
+        elif prompt in ("echo-params", "echo-workflow"):
             send({"jsonrpc": "2.0", "method": "turn/started", "params": {"turn": {"id": "turn-1"}}})
-            send({"jsonrpc": "2.0", "method": "item/agentMessage/delta", "params": {"delta": json.dumps(msg.get("params"))}})
+            echoed = json.dumps(msg.get("params")) if prompt == "echo-params" else workflow
+            send({"jsonrpc": "2.0", "method": "item/agentMessage/delta", "params": {"delta": echoed}})
             send({"jsonrpc": "2.0", "method": "turn/completed", "params": {"turn": {"id": "turn-1", "status": "completed"}}})
         elif prompt == "hang":
             # Starts, says nothing, and never completes.

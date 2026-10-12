@@ -262,7 +262,6 @@ impl Inspector {
             SegmentedOption::new(RightPanelTab::Files, "Files"),
         ];
         let for_tabs = self.state.clone();
-        let for_hide = self.state.clone();
         div()
             .h(px(INSPECTOR_HEADER_HEIGHT))
             .debug_selector(|| "inspector-header".into())
@@ -284,17 +283,6 @@ impl Inspector {
                     .ghost()
                     .enabled(self.project.is_some() && !self.loading),
                 cx.listener(|this, _, _, cx| this.refresh(cx)),
-            ))
-            .child(icon_button(
-                IconButtonProps::new(Icon::SIDEBAR_RIGHT, "Hide inspector")
-                    .small()
-                    .ghost(),
-                move |_, _, cx| {
-                    for_hide.update(cx, |state, cx| {
-                        state.toggle_inspector();
-                        cx.notify();
-                    });
-                },
             ))
             .into_any_element()
     }
@@ -819,13 +807,12 @@ mod tests {
             let refresh = visual
                 .debug_bounds("icon-button:Refresh files and changes")
                 .unwrap();
-            let hide = visual.debug_bounds("icon-button:Hide inspector").unwrap();
+            assert!(visual.debug_bounds("icon-button:Hide inspector").is_none());
             assert_eq!(root.size.width, px(width));
             assert!(tabs.left() > root.left());
             assert!(tabs.right() < refresh.left());
-            assert!(refresh.right() < hide.left());
-            assert!(hide.right() < root.right());
-            assert_eq!(tabs.center().y, hide.center().y);
+            assert_eq!(root.right() - refresh.right(), px(Spacing::MD));
+            assert_eq!(tabs.center().y, refresh.center().y);
         }
     }
 

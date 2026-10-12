@@ -67,6 +67,8 @@ pub struct AppState {
     /// A failed read must never be followed by an empty write over the source.
     snapshot_writable: bool,
     protected_conversations: HashSet<Uuid>,
+    /// Late worker notifications must never recreate a deleted thread.
+    deleted_agents: HashSet<Uuid>,
     restored_drafts: HashMap<Uuid, String>,
     accepted_drafts: HashMap<Uuid, String>,
     saved_conversations: HashMap<Uuid, Vec<u8>>,
@@ -118,27 +120,33 @@ impl AppState {
         snapshot.min_right_panel_width = Layout::RIGHT_PANEL_MIN_WIDTH;
         snapshot.max_right_panel_width = Layout::RIGHT_PANEL_MAX_WIDTH;
 
-        // Falling back to the first project and its first thread means opening
-        // the app lands on something rather than on an empty centre column.
-        if snapshot.active_project_id.is_none() {
+        // Stale or archived selections never reopen a hidden thread.
+        if !snapshot.projects.iter().any(|record| {
+            record
+                .project
+                .as_ref()
+                .is_some_and(|project| Some(project.id) == snapshot.active_project_id)
+        }) {
             snapshot.active_project_id = snapshot
                 .projects
-                .first()
-                .and_then(|record| record.project.as_ref())
-                .map(|project| project.id);
+                .iter()
+                .find_map(|record| record.project.as_ref().map(|project| project.id));
         }
-        if snapshot.active_agent_id.is_none() {
-            snapshot.active_agent_id = snapshot
-                .active_project_id
-                .and_then(|id| {
-                    snapshot
-                        .projects
-                        .iter()
-                        .find(|record| record.project.as_ref().is_some_and(|p| p.id == id))
-                })
-                .and_then(|record| record.project.as_ref())
-                .and_then(|project| project.agent_order.first().copied());
-        }
+        snapshot.active_agent_id = snapshot
+            .projects
+            .iter()
+            .find(|record| {
+                record
+                    .project
+                    .as_ref()
+                    .is_some_and(|project| Some(project.id) == snapshot.active_project_id)
+            })
+            .and_then(|record| {
+                visible_agent(
+                    record,
+                    snapshot.active_agent_id.or(record.last_selected_agent_id),
+                )
+            });
 
         let sidebar_visible = snapshot.sidebar_visible;
         // Both halves of one channel: the runner sends, the render path receives.
@@ -158,6 +166,7 @@ impl AppState {
             targeted_tx,
             snapshot_writable,
             protected_conversations: HashSet::new(),
+            deleted_agents: HashSet::new(),
             restored_drafts: HashMap::new(),
             accepted_drafts: HashMap::new(),
             saved_conversations: HashMap::new(),
@@ -274,13 +283,24 @@ impl AppState {
         project
             .agent_order
             .iter()
+            .filter(|id| !record.archived_agent_ids.contains(id))
             .filter_map(|id| by_id.get(id).map(|a| (*a).clone()))
             .collect()
     }
 
     pub fn active_agent(&self) -> Option<Agent> {
         let id = self.snapshot.active_agent_id?;
-        self.active_agents().into_iter().find(|a| a.id == id)
+        self.snapshot
+            .projects
+            .iter()
+            .find(|record| {
+                record
+                    .project
+                    .as_ref()
+                    .is_some_and(|project| Some(project.id) == self.snapshot.active_project_id)
+            })
+            .and_then(|record| record.agents.iter().find(|agent| agent.id == id))
+            .cloned()
     }
 
     /// What the centre column titles itself.
@@ -293,14 +313,221 @@ impl AppState {
     }
 
     pub fn select_project(&mut self, id: Uuid) {
+        let Some(record) = self.snapshot.projects.iter().find(|record| {
+            record
+                .project
+                .as_ref()
+                .is_some_and(|project| project.id == id)
+        }) else {
+            return;
+        };
         self.snapshot.active_project_id = Some(id);
-        self.snapshot.active_agent_id = self
-            .project(id)
-            .and_then(|p| p.agent_order.first().copied());
+        self.snapshot.active_agent_id = visible_agent(record, record.last_selected_agent_id);
     }
 
     pub fn select_agent(&mut self, id: Uuid) {
+        let Some(record) = self
+            .snapshot
+            .projects
+            .iter_mut()
+            .find(|record| record.agents.iter().any(|agent| agent.id == id))
+        else {
+            return;
+        };
+        let Some(project) = &record.project else {
+            return;
+        };
+        self.snapshot.active_project_id = Some(project.id);
         self.snapshot.active_agent_id = Some(id);
+        record.last_selected_agent_id = Some(id);
+    }
+
+    pub fn thread(&self, agent_id: Uuid) -> Option<&Agent> {
+        self.snapshot
+            .projects
+            .iter()
+            .flat_map(|record| &record.agents)
+            .find(|agent| agent.id == agent_id)
+    }
+
+    pub fn is_thread_archived(&self, agent_id: Uuid) -> bool {
+        self.snapshot
+            .projects
+            .iter()
+            .any(|record| record.archived_agent_ids.contains(&agent_id))
+    }
+
+    pub fn is_thread_busy(&self, agent_id: Uuid) -> bool {
+        self.runners.contains_key(&agent_id)
+            || self
+                .conversations
+                .get(&agent_id)
+                .is_some_and(|conversation| {
+                    conversation
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .is_busy()
+                })
+    }
+
+    fn thread_can_change(&mut self, agent_id: Uuid) -> bool {
+        if !self.snapshot_writable {
+            self.last_error = Some(
+                "The saved workspace could not be read. Restore its files before changing threads."
+                    .into(),
+            );
+            return false;
+        }
+        if self.thread(agent_id).is_none() {
+            self.last_error = Some("This thread is no longer available.".into());
+            return false;
+        }
+        if self.is_thread_busy(agent_id) {
+            self.last_error = Some("Stop this thread's running turn before changing it.".into());
+            return false;
+        }
+        true
+    }
+
+    /// Commit metadata before changing the live view. If the backup write fails
+    /// after the primary landed, try restoring the previous snapshot as well.
+    fn commit_thread_change(&mut self, mut next: PersistedApp, action: &str) -> bool {
+        next.sidebar_visible = self.sidebar_visible;
+        next.normalize();
+        if let Err(error) = self.store.save_app(&next) {
+            let rollback = self.store.save_app(&self.snapshot);
+            self.last_error = Some(match rollback {
+                Ok(()) => format!("Could not {action}: {error}"),
+                Err(rollback) => format!(
+                    "Could not {action}: {error}. Could not confirm the previous saved state: {rollback}"
+                ),
+            });
+            return false;
+        }
+        self.snapshot = next;
+        true
+    }
+
+    pub fn rename_thread(&mut self, agent_id: Uuid, title: &str) -> bool {
+        if !self.thread_can_change(agent_id) {
+            return false;
+        }
+        let title = title.trim();
+        if title.is_empty() {
+            self.last_error = Some("Enter a name for this thread.".into());
+            return false;
+        }
+        let mut next = self.snapshot.clone();
+        for record in &mut next.projects {
+            if let Some(agent) = record.agents.iter_mut().find(|agent| agent.id == agent_id) {
+                agent.title = title.to_string();
+                for binding in &mut record.native_bindings {
+                    if binding.agent_id == agent_id {
+                        binding.title = title.to_string();
+                    }
+                }
+                break;
+            }
+        }
+        self.commit_thread_change(next, "rename this thread")
+    }
+
+    pub fn set_thread_archived(&mut self, agent_id: Uuid, archived: bool) -> bool {
+        if !self.thread_can_change(agent_id) {
+            return false;
+        }
+        if self.is_thread_archived(agent_id) == archived {
+            return true;
+        }
+        let mut next = self.snapshot.clone();
+        for record in &mut next.projects {
+            if !record.agents.iter().any(|agent| agent.id == agent_id) {
+                continue;
+            }
+            if archived {
+                record.archived_agent_ids.push(agent_id);
+                if record.last_selected_agent_id == Some(agent_id) {
+                    record.last_selected_agent_id = visible_agent(record, None);
+                }
+                if next.active_agent_id == Some(agent_id) {
+                    next.active_agent_id = visible_agent(record, record.last_selected_agent_id);
+                }
+            } else {
+                record.archived_agent_ids.retain(|id| *id != agent_id);
+            }
+            break;
+        }
+        if !self.commit_thread_change(
+            next,
+            if archived {
+                "archive this thread"
+            } else {
+                "restore this thread"
+            },
+        ) {
+            return false;
+        }
+        if archived {
+            self.pending_interactions.remove(&agent_id);
+        }
+        true
+    }
+
+    /// Remove only FlowX's local thread and cached history. Provider records and
+    /// files in the project directory are outside this operation.
+    pub fn delete_thread(&mut self, agent_id: Uuid) -> bool {
+        if !self.thread_can_change(agent_id) {
+            return false;
+        }
+        let Some(project_id) = self.project_for_agent(agent_id) else {
+            return false;
+        };
+        let mut next = self.snapshot.clone();
+        for record in &mut next.projects {
+            if !record.agents.iter().any(|agent| agent.id == agent_id) {
+                continue;
+            }
+            record.agents.retain(|agent| agent.id != agent_id);
+            record.archived_agent_ids.retain(|id| *id != agent_id);
+            if let Some(project) = &mut record.project {
+                project.agent_order.retain(|id| *id != agent_id);
+            }
+            record
+                .workspaces
+                .retain(|workspace| workspace.agent_id != agent_id);
+            record
+                .native_bindings
+                .retain(|binding| binding.agent_id != agent_id);
+            record
+                .native_presentation_ids
+                .retain(|presentation| presentation.agent_id != agent_id);
+            if record.last_selected_agent_id == Some(agent_id) {
+                record.last_selected_agent_id = visible_agent(record, None);
+            }
+            if next.active_agent_id == Some(agent_id) {
+                next.active_agent_id = visible_agent(record, record.last_selected_agent_id);
+            }
+            break;
+        }
+        if !self.commit_thread_change(next, "delete this thread") {
+            return false;
+        }
+        self.deleted_agents.insert(agent_id);
+        self.conversations.remove(&agent_id);
+        self.drafts.remove(&agent_id);
+        self.runners.remove(&agent_id);
+        self.protected_conversations.remove(&agent_id);
+        self.restored_drafts.remove(&agent_id);
+        self.accepted_drafts.remove(&agent_id);
+        self.saved_conversations.remove(&agent_id);
+        self.restored_costs.remove(&agent_id);
+        self.pending_interactions.remove(&agent_id);
+        if let Err(error) = self.store.delete_thread_files(project_id, agent_id) {
+            self.last_error = Some(format!(
+                "The thread was removed, but its saved files could not all be deleted: {error}"
+            ));
+        }
+        true
     }
 
     pub fn toggle_sidebar(&mut self) {
@@ -489,6 +716,9 @@ impl AppState {
         {
             return false;
         }
+        if self.is_thread_archived(agent_id) && !self.set_thread_archived(agent_id, false) {
+            return false;
+        }
         let Some(project_id) = self.project_for_agent(agent_id) else {
             return false;
         };
@@ -598,6 +828,9 @@ impl AppState {
 
     fn apply_update(&mut self, agent_id: Option<Uuid>, update: crate::session::SessionUpdate) {
         use crate::session::SessionUpdate;
+        if agent_id.is_some_and(|id| self.deleted_agents.contains(&id)) {
+            return;
+        }
         let mut should_save = true;
         match update {
             SessionUpdate::Started { thread_id } => {
@@ -938,6 +1171,21 @@ pub(crate) fn restore_conversation(
     }
 }
 
+fn visible_agent(record: &fx_store::PersistedProject, preferred: Option<Uuid>) -> Option<Uuid> {
+    let visible = |id: &Uuid| {
+        !record.archived_agent_ids.contains(id) && record.agents.iter().any(|agent| agent.id == *id)
+    };
+    preferred
+        .filter(visible)
+        .or_else(|| {
+            record
+                .project
+                .as_ref()
+                .and_then(|project| project.agent_order.iter().copied().find(visible))
+        })
+        .or_else(|| record.agents.iter().map(|agent| agent.id).find(visible))
+}
+
 fn interaction_id(event: &fx_agent::ProviderEvent) -> Option<&str> {
     match event {
         fx_agent::ProviderEvent::Approval(request) => Some(&request.id),
@@ -962,6 +1210,9 @@ pub fn default_theme() -> Theme {
 /// `Entity<AppState>` to write through, and in GPUI 0.2.2 there is no way to get
 /// the current entity from inside `App`.
 pub fn open_project_picker(state: Entity<AppState>, window: &mut gpui::Window, cx: &mut App) {
+    if crate::workspace_ui::has_modal(&state, cx) {
+        return;
+    }
     let menu = state.read(cx).menu_layer.clone();
     menu.update(cx, |menu, cx| {
         if menu.dismiss().is_some() {
@@ -1027,6 +1278,353 @@ mod persistence_tests {
             first.id,
             second.id,
         )
+    }
+
+    #[test]
+    fn archiving_survives_restart_and_preserves_history_drafts_and_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, project, first, second) = test.update(|cx| workspace(cx, &paths));
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                let conversation = state.conversation(project, first);
+                {
+                    let mut conversation = conversation.lock().unwrap();
+                    conversation
+                        .append(ConversationMessage::text(MessageRole::User, "Keep history"));
+                    conversation.set_session_id("native-session");
+                }
+                let draft = state.draft(first, cx);
+                draft.update(cx, |field, cx| field.set_value("Keep draft", cx));
+                state.save_all(cx);
+                let before = std::fs::read(paths.conversation_file(project, first)).unwrap();
+                assert!(state.set_thread_archived(first, true));
+                assert_eq!(state.snapshot.active_agent_id, Some(second));
+                assert_eq!(
+                    state
+                        .active_agents()
+                        .iter()
+                        .map(|agent| agent.id)
+                        .collect::<Vec<_>>(),
+                    vec![second]
+                );
+                assert_eq!(
+                    std::fs::read(paths.conversation_file(project, first)).unwrap(),
+                    before
+                );
+            })
+        });
+        let reopened = test.update(|cx| cx.new(|cx| AppState::restore(paths.clone(), cx)));
+        test.update(|cx| {
+            reopened.update(cx, |state, cx| {
+                assert!(state.is_thread_archived(first));
+                assert_eq!(state.snapshot.active_agent_id, Some(second));
+                state.select_agent(first);
+                assert_eq!(
+                    state.active_agent().unwrap().id,
+                    first,
+                    "explicit selection can read archived history"
+                );
+                let conversation = state.active_conversation().unwrap();
+                assert_eq!(
+                    conversation.lock().unwrap().session_id(),
+                    Some("native-session")
+                );
+                assert_eq!(
+                    conversation
+                        .lock()
+                        .unwrap()
+                        .messages()
+                        .next()
+                        .unwrap()
+                        .text_content(),
+                    "Keep history"
+                );
+                assert_eq!(state.draft(first, cx).read(cx).value(), "Keep draft");
+                state.select_project(project);
+                assert_eq!(state.snapshot.active_agent_id, Some(second));
+                assert!(state.set_thread_archived(first, false));
+                assert_eq!(
+                    state.snapshot.active_agent_id,
+                    Some(second),
+                    "restoring does not force selection"
+                );
+                assert_eq!(state.active_agents().len(), 2);
+                assert!(state.set_thread_archived(first, true));
+                assert!(state.set_thread_archived(second, true));
+                assert_eq!(state.snapshot.active_agent_id, None);
+                state.select_agent(first);
+                state.save();
+            })
+        });
+        test.update(|cx| {
+            let reopened = cx.new(|cx| AppState::restore(paths.clone(), cx));
+            assert_eq!(
+                reopened.read(cx).snapshot.active_agent_id,
+                None,
+                "restart never automatically selects an archive"
+            );
+        });
+    }
+
+    #[test]
+    fn rename_targets_an_inactive_thread_and_persists_without_moving_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, _, first, second) = test.update(|cx| workspace(cx, &paths));
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                assert!(state.rename_thread(second, "  Renamed thread  "));
+                assert_eq!(state.thread(second).unwrap().title, "Renamed thread");
+                assert_eq!(state.thread(first).unwrap().title, "First");
+                assert_eq!(state.snapshot.active_agent_id, Some(first));
+                assert!(!state.rename_thread(second, "  \n "));
+                assert_eq!(state.thread(second).unwrap().title, "Renamed thread");
+                assert!(state.set_thread_archived(second, true));
+                assert_eq!(state.snapshot.active_agent_id, Some(first));
+            })
+        });
+        let saved = Store::new(paths).load_app().unwrap();
+        assert_eq!(saved.projects[0].agents[1].title, "Renamed thread");
+        assert_eq!(saved.projects[0].archived_agent_ids, vec![second]);
+    }
+
+    #[test]
+    fn deleting_an_inactive_thread_removes_only_its_local_data_and_ignores_late_updates() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let source = temp.path().join("source.txt");
+        std::fs::write(&source, "project content").unwrap();
+        let test = gpui::TestAppContext::single();
+        let (state, project, first, second) = test.update(|cx| workspace(cx, &paths));
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                for id in [first, second] {
+                    state
+                        .conversation(project, id)
+                        .lock()
+                        .unwrap()
+                        .append(ConversationMessage::text(MessageRole::User, id.to_string()));
+                    state
+                        .draft(id, cx)
+                        .update(cx, |field, cx| field.set_value("draft", cx));
+                }
+                let record = &mut state.snapshot.projects[0];
+                record.workspaces.push(fx_store::PersistedWorkspace {
+                    agent_id: second,
+                    ..Default::default()
+                });
+                record.native_bindings.push(fx_store::PersistedBinding {
+                    agent_id: second,
+                    provider_id: "codex".into(),
+                    session_id: "native-session".into(),
+                    title: "Second".into(),
+                    working_directory: temp.path().to_string_lossy().into_owned(),
+                    updated_at: fx_core::models::now(),
+                    model: None,
+                    effort: None,
+                    agent_access: None,
+                    is_archived: false,
+                });
+                record
+                    .native_presentation_ids
+                    .push(fx_store::format::PersistedPresentation {
+                        agent_id: second,
+                        provider_id: "codex".into(),
+                        session_id: "native-session".into(),
+                    });
+                state.save_all(cx);
+                let first_path = paths.conversation_file(project, first);
+                let first_bytes = std::fs::read(&first_path).unwrap();
+                let first_backup =
+                    std::fs::read(fx_store::write::backup_path(&first_path)).unwrap();
+                let second_path = paths.conversation_file(project, second);
+                let assets = paths.assets_dir(project, second);
+                std::fs::create_dir_all(&assets).unwrap();
+                std::fs::write(assets.join("attachment.png"), "cached image").unwrap();
+                state.protected_conversations.insert(second);
+                state.accepted_drafts.insert(second, "accepted".into());
+                state.restored_costs.insert(second, 2.0);
+                let request =
+                    fx_agent::ProviderEvent::UserInput(fx_agent::provider::UserInputRequest {
+                        id: "old-request".into(),
+                        questions: vec![],
+                    });
+                state
+                    .pending_interactions
+                    .entry(second)
+                    .or_default()
+                    .push_back(request.clone());
+                let late = state.update_sender_for(second);
+                assert!(state.delete_thread(second));
+                assert_eq!(state.snapshot.active_agent_id, Some(first));
+                assert!(state.thread(second).is_none());
+                assert!(!state.conversations.contains_key(&second));
+                assert!(!state.drafts.contains_key(&second));
+                assert!(!state.protected_conversations.contains(&second));
+                assert!(!state.restored_drafts.contains_key(&second));
+                assert!(!state.accepted_drafts.contains_key(&second));
+                assert!(!state.saved_conversations.contains_key(&second));
+                assert!(!state.restored_costs.contains_key(&second));
+                assert!(state.next_interaction().is_none());
+                let record = &state.snapshot.projects[0];
+                assert!(record.workspaces.is_empty());
+                assert!(record.native_bindings.is_empty());
+                assert!(record.native_presentation_ids.is_empty());
+                assert_eq!(record.project.as_ref().unwrap().agent_order, vec![first]);
+                assert!(!second_path.exists());
+                assert!(!fx_store::write::backup_path(&second_path).exists());
+                assert!(!assets.exists());
+                late(SessionUpdate::Interaction { event: request });
+                late(SessionUpdate::Failed {
+                    reason: "late failure".into(),
+                });
+                state.drain_updates();
+                assert!(state.next_interaction().is_none());
+                assert!(state.last_error.is_none());
+                state.save_all(cx);
+                assert!(
+                    !second_path.exists(),
+                    "autosave must not resurrect deleted history"
+                );
+                assert_eq!(std::fs::read(first_path).unwrap(), first_bytes);
+                assert_eq!(
+                    std::fs::read(fx_store::write::backup_path(
+                        &paths.conversation_file(project, first)
+                    ))
+                    .unwrap(),
+                    first_backup
+                );
+                assert!(state.delete_thread(first));
+                assert_eq!(state.snapshot.active_agent_id, None);
+            })
+        });
+        assert_eq!(std::fs::read_to_string(source).unwrap(), "project content");
+        assert!(
+            Store::new(paths).load_app().unwrap().projects[0]
+                .agents
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn running_threads_refuse_all_lifecycle_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, project, first, _) = test.update(|cx| workspace(cx, &paths));
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                let conversation = state.conversation(project, first);
+                for phase in [
+                    fx_agent::conversation::Phase::Running,
+                    fx_agent::conversation::Phase::WaitingForApproval,
+                ] {
+                    conversation.lock().unwrap().set_phase(phase);
+                    assert!(!state.rename_thread(first, "Must not change"));
+                    assert!(!state.set_thread_archived(first, true));
+                    assert!(!state.delete_thread(first));
+                    assert_eq!(state.thread(first).unwrap().title, "First");
+                    assert!(!state.is_thread_archived(first));
+                    assert!(
+                        state
+                            .last_error
+                            .as_deref()
+                            .unwrap()
+                            .contains("running turn")
+                    );
+                }
+            })
+        });
+    }
+
+    #[test]
+    fn failed_lifecycle_saves_preserve_the_live_thread_and_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, project, first, _) = test.update(|cx| workspace(cx, &paths));
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                state
+                    .conversation(project, first)
+                    .lock()
+                    .unwrap()
+                    .append(ConversationMessage::text(MessageRole::User, "preserve"));
+                state.save_all(cx);
+                let before = serde_json::to_value(&state.snapshot).unwrap();
+                let history = std::fs::read(paths.conversation_file(project, first)).unwrap();
+                std::fs::remove_file(paths.projects_file()).unwrap();
+                std::fs::create_dir(paths.projects_file()).unwrap();
+                assert!(!state.rename_thread(first, "Changed"));
+                assert!(!state.set_thread_archived(first, true));
+                assert!(!state.delete_thread(first));
+                assert_eq!(serde_json::to_value(&state.snapshot).unwrap(), before);
+                assert_eq!(
+                    std::fs::read(paths.conversation_file(project, first)).unwrap(),
+                    history
+                );
+                assert!(state.last_error.is_some());
+            })
+        });
+    }
+
+    #[test]
+    fn failed_file_cleanup_keeps_a_committed_deletion_and_reports_the_remaining_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, project, first, second) = test.update(|cx| workspace(cx, &paths));
+        let blocked = paths.conversation_file(project, first);
+        std::fs::create_dir_all(&blocked).unwrap();
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                assert!(
+                    state.delete_thread(first),
+                    "sidebar deletion has already committed"
+                );
+                assert!(state.thread(first).is_none());
+                assert_eq!(state.snapshot.active_agent_id, Some(second));
+                assert!(
+                    state
+                        .last_error
+                        .as_deref()
+                        .unwrap()
+                        .contains("saved files could not all be deleted")
+                );
+            })
+        });
+        assert!(blocked.exists());
+        let saved = Store::new(paths).load_app().unwrap();
+        assert_eq!(saved.projects[0].agents.len(), 1);
+        assert_eq!(saved.projects[0].agents[0].id, second);
+    }
+
+    #[test]
+    fn sending_to_an_archive_requires_a_successfully_persisted_restore() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, _, first, _) = test.update(|cx| workspace(cx, &paths));
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                assert!(state.set_thread_archived(first, true));
+                state.select_agent(first);
+                assert!(state.prepare_prompt(first, "Resume this conversation", cx));
+                assert!(!state.is_thread_archived(first));
+                assert!(state.set_thread_archived(first, true));
+                std::fs::remove_file(paths.projects_file()).unwrap();
+                std::fs::create_dir(paths.projects_file()).unwrap();
+                assert!(!state.prepare_prompt(first, "Do not send", cx));
+                assert!(state.is_thread_archived(first));
+                assert_eq!(
+                    state.conversations[&first].lock().unwrap().message_count(),
+                    1
+                );
+            })
+        });
     }
 
     #[test]

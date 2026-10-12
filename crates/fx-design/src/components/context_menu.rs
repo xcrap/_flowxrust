@@ -8,8 +8,8 @@
 //!
 //! ## How it works
 //!
-//! During layout, an element that carries a context menu records the rectangle
-//! GPUI gives it. Those rectangles accumulate in a [`ContextRegistry`] owned by
+//! During prepaint, an element that carries a context menu records the clipped
+//! rectangle GPUI gives it. Those rectangles accumulate in a [`ContextRegistry`] owned by
 //! the app. A right-click anywhere in the window asks the registry which region
 //! contains the cursor; the deepest match wins, because a nested region's rect
 //! is contained by its parent's.
@@ -18,7 +18,10 @@
 //! the thing that owns it is on screen, so a scrolled-away row stops offering a
 //! context menu without any explicit bookkeeping.
 
-use gpui::{App, Entity, MouseButton, MouseDownEvent, Window};
+use gpui::{
+    AnyElement, App, Bounds, Element, ElementId, Entity, GlobalElementId, InspectorElementId,
+    IntoElement, LayoutId, MouseButton, MouseDownEvent, Pixels, SharedString, Window,
+};
 
 use crate::components::menu::MenuLayer;
 use crate::components::menu_model::{MenuModel, MenuSection};
@@ -78,18 +81,22 @@ pub struct ContextRegistry {
     regions: Vec<ContextRegion>,
     /// Monotonic order, used to break ties between equal depths.
     next_order: usize,
+    /// The prepaint nesting of transparent context-region wrappers.
+    active_depth: usize,
 }
 
 impl ContextRegistry {
     /// Forget the previous frame's regions.
     ///
-    /// Called once per frame before layout, so a region only lives as long as
+    /// Called once per frame before child prepaint, so a region only lives as long as
     /// the element that registered it.
     pub fn reset(&mut self) {
         self.regions.clear();
+        self.next_order = 0;
+        self.active_depth = 0;
     }
 
-    /// Record a region. Called during layout.
+    /// Record a region. Called during prepaint.
     pub fn register(&mut self, mut region: ContextRegion) {
         region.order = self.next_order;
         self.next_order += 1;
@@ -142,6 +149,128 @@ impl ContextRegistry {
     }
 }
 
+/// Wrap the window's root once. Resetting before child prepaint ties the
+/// registry to the displayed frame, including scrolls and hidden rows.
+pub fn context_frame(registry: &Entity<ContextRegistry>, content: impl IntoElement) -> AnyElement {
+    ContextTracker {
+        registry: registry.clone(),
+        content: content.into_any_element(),
+        region: None,
+        reset: true,
+    }
+    .into_any_element()
+}
+
+/// Attach a menu to an element's visible rectangle without changing its layout
+/// or installing a competing per-row mouse handler. Nested wrappers receive
+/// deeper precedence automatically; `None` deliberately blocks an ancestor.
+pub fn context_region(
+    registry: &Entity<ContextRegistry>,
+    owner: impl Into<SharedString>,
+    menu: Option<MenuModel>,
+    content: impl IntoElement,
+) -> AnyElement {
+    ContextTracker {
+        registry: registry.clone(),
+        content: content.into_any_element(),
+        region: Some((owner.into(), menu)),
+        reset: false,
+    }
+    .into_any_element()
+}
+
+struct ContextTracker {
+    registry: Entity<ContextRegistry>,
+    content: AnyElement,
+    region: Option<(SharedString, Option<MenuModel>)>,
+    reset: bool,
+}
+
+impl IntoElement for ContextTracker {
+    type Element = Self;
+
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl Element for ContextTracker {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        (self.content.request_layout(window, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if self.reset {
+            self.registry.update(cx, |registry, _| registry.reset());
+        }
+        let depth = self.region.as_ref().map(|(owner, menu)| {
+            // GPUI's content mask already includes every enclosing scroll
+            // viewport and the window. Layout bounds alone include hidden rows.
+            let clipped = bounds.intersect(&window.content_mask().bounds);
+            self.registry.update(cx, |registry, _| {
+                let depth = registry.active_depth;
+                registry.active_depth += 1;
+                if !clipped.is_empty() {
+                    registry.register(ContextRegion {
+                        bounds: clipped,
+                        depth,
+                        owner: owner.clone(),
+                        sections: menu
+                            .as_ref()
+                            .map(|menu| menu.sections().to_vec())
+                            .unwrap_or_default(),
+                        menu: menu.clone(),
+                        order: 0,
+                    });
+                }
+                depth
+            })
+        });
+        self.content.prepaint(window, cx);
+        if let Some(depth) = depth {
+            self.registry
+                .update(cx, |registry, _| registry.active_depth = depth);
+        }
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.content.paint(window, cx);
+    }
+}
+
 /// Open a context menu at a point, if a region covers it.
 ///
 /// Returns whether a menu opened, so a caller can fall through to some other
@@ -189,7 +318,10 @@ pub fn handle_root_right_click(
         return false;
     }
     let opened = open_at(registry, layer, event.position, cx);
-    let _ = window;
+    if opened {
+        cx.stop_propagation();
+        window.refresh();
+    }
     opened
 }
 

@@ -89,7 +89,6 @@ pub struct TurnRequest<'a> {
     pub effort: &'a str,
     pub access: AgentAccess,
     pub working_directory: &'a str,
-    pub plan_mode: bool,
 }
 
 impl<'a> TurnRequest<'a> {
@@ -102,7 +101,6 @@ impl<'a> TurnRequest<'a> {
             effort: "medium",
             access: AgentAccess::FullAccess,
             working_directory,
-            plan_mode: false,
         }
     }
 
@@ -125,11 +123,6 @@ impl<'a> TurnRequest<'a> {
         self.access = access;
         self
     }
-
-    pub fn plan_mode(mut self, plan_mode: bool) -> Self {
-        self.plan_mode = plan_mode;
-        self
-    }
 }
 
 /// Parameters for `turn/start`.
@@ -142,7 +135,6 @@ pub fn turn_params(request: &TurnRequest<'_>) -> Value {
         effort,
         access,
         working_directory,
-        plan_mode,
     } = *request;
     let (approval, _) = access_params(access);
     let mut params = json!({
@@ -152,28 +144,21 @@ pub fn turn_params(request: &TurnRequest<'_>) -> Value {
         "sandboxPolicy": sandbox_policy(access, working_directory),
         "model": model,
         "cwd": working_directory,
+        // Codex restores a saved collaboration mode when resuming a thread.
+        // Always select its normal workflow so older FlowX planning sessions
+        // cannot retain their previous restrictions after the UI mode is gone.
+        "collaborationMode": {
+            "mode": "default",
+            "settings": {
+                "model": model,
+                "reasoning_effort": if effort.is_empty() { Value::Null } else { json!(effort) },
+                "developer_instructions": Value::Null,
+            },
+        },
     });
 
     if !effort.is_empty() {
         params["effort"] = json!(effort);
-    }
-    if plan_mode {
-        // Codex carries FlowX's plan mode as extra context plus a collaboration
-        // mode, rather than as a flag of its own.
-        params["additionalContext"] = json!({
-            "flowx-plan-mode": {
-                "kind": "application",
-                "value": "Plan the requested work and present the plan for review before making changes or running mutating commands."
-            }
-        });
-        params["collaborationMode"] = json!({
-            "mode": "plan",
-            "settings": {
-                "model": model,
-                "developer_instructions": Value::Null,
-                "reasoning_effort": if effort.is_empty() { Value::Null } else { json!(effort) },
-            }
-        });
     }
     params
 }
@@ -946,22 +931,20 @@ mod tests {
     }
 
     #[test]
-    fn plan_mode_is_carried_as_context_and_a_collaboration_mode() {
-        let normal = turn_params(&TurnRequest::new("t1", "do it", "/w"));
-        assert!(normal.get("collaborationMode").is_none());
-
-        let planning = turn_params(&TurnRequest::new("t1", "do it", "/w").plan_mode(true));
-        assert_eq!(planning["collaborationMode"]["mode"], "plan");
-        assert_eq!(
-            planning["collaborationMode"]["settings"]["reasoning_effort"],
-            "medium"
-        );
-        assert!(
-            planning["additionalContext"]["flowx-plan-mode"]["value"]
-                .as_str()
-                .is_some_and(|v| v.contains("present the plan")),
-            "{planning}"
-        );
+    fn turns_preserve_access_without_injecting_workflow_instructions() {
+        for (access, approval, sandbox) in [
+            (AgentAccess::Supervised, "untrusted", "workspaceWrite"),
+            (AgentAccess::AcceptEdits, "on-request", "workspaceWrite"),
+            (AgentAccess::FullAccess, "never", "dangerFullAccess"),
+        ] {
+            let params = turn_params(&TurnRequest::new("t1", "do it", "/w").access(access));
+            assert_eq!(params["collaborationMode"]["mode"], "default");
+            assert!(params["collaborationMode"]["settings"]["developer_instructions"].is_null());
+            assert!(params.get("additionalContext").is_none(), "{params}");
+            assert_eq!(params["input"], json!([{"type":"text", "text":"do it"}]));
+            assert_eq!(params["approvalPolicy"], approval);
+            assert_eq!(params["sandboxPolicy"]["type"], sandbox);
+        }
     }
 
     #[test]
@@ -1435,12 +1418,11 @@ mod tests {
     }
 
     #[test]
-    fn an_unspecified_effort_is_omitted_from_normal_and_plan_requests() {
+    fn an_unspecified_effort_is_omitted_from_turn_requests() {
         let request = TurnRequest::new("thread", "prompt", "/tmp").effort("");
-        assert!(turn_params(&request).get("effort").is_none());
-        let planned = turn_params(&request.plan_mode(true));
-        assert!(planned.get("effort").is_none());
-        assert!(planned["collaborationMode"]["settings"]["reasoning_effort"].is_null());
+        let params = turn_params(&request);
+        assert!(params.get("effort").is_none());
+        assert!(params["collaborationMode"]["settings"]["reasoning_effort"].is_null());
     }
 
     #[test]

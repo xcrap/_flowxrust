@@ -1,9 +1,9 @@
 //! The sidebar: projects and their threads.
 
-use fx_core::{Agent, AgentMode, Project};
+use fx_core::{Agent, Project};
 use fx_design::components::{
-    ActivityState, BadgeTone, ButtonStyle, DividerAxis, IconButtonProps, MenuItem, MenuItemTone,
-    MenuModel, MenuSection, activity_dot, button_with_icon, divider_with_axis, empty_state,
+    ActivityState, ButtonStyle, DividerAxis, IconButtonProps, MenuItem, MenuItemTone, MenuModel,
+    MenuSection, activity_dot, button_with_icon, context_region, divider_with_axis, empty_state,
     icon_button,
 };
 use fx_design::icon::Icon;
@@ -153,6 +153,7 @@ fn body(state: Entity<AppState>, cx: &mut App) -> AnyElement {
         let mut group = div()
             .flex()
             .flex_col()
+            .flex_shrink_0()
             .gap(px_len(Spacing::XXXS))
             .child(project_row(
                 state.clone(),
@@ -163,13 +164,43 @@ fn body(state: Entity<AppState>, cx: &mut App) -> AnyElement {
                 cx,
             ));
         if record.is_expanded {
-            let agents = project
+            let (archived, agents): (Vec<_>, Vec<_>) = project
                 .agent_order
                 .iter()
                 .filter_map(|id| record.agents.iter().find(|agent| agent.id == *id))
                 .cloned()
-                .collect();
-            group = group.child(threads(&state, id, agents, snapshot.active_agent_id, cx));
+                .partition(|agent| record.archived_agent_ids.contains(&agent.id));
+            group = group.child(threads(
+                &state,
+                id,
+                agents,
+                snapshot.active_agent_id,
+                false,
+                cx,
+            ));
+            if !archived.is_empty() {
+                group = group
+                    .child(
+                        div()
+                            .px(px_len(Spacing::SM))
+                            .pt(px_len(Spacing::SM))
+                            .pb(px_len(Spacing::XXS))
+                            .fx_overline()
+                            .text_color(Colors::fg_tertiary(&theme))
+                            .child(SharedString::from(format!(
+                                "Archived threads · {}",
+                                archived.len()
+                            ))),
+                    )
+                    .child(threads(
+                        &state,
+                        id,
+                        archived,
+                        snapshot.active_agent_id,
+                        true,
+                        cx,
+                    ));
+            }
         }
         list = list.child(group);
     }
@@ -183,7 +214,7 @@ fn project_row(
     project: Project,
     selected: bool,
     expanded: bool,
-    _cx: &mut App,
+    cx: &mut App,
 ) -> AnyElement {
     let theme = global::current();
     let label = if project.name.trim().is_empty() {
@@ -192,9 +223,15 @@ fn project_row(
         project.name.clone()
     };
     // Built before the closures below, so neither has to borrow the project.
-    let menu = project_menu(&project.name);
+    let busy = project
+        .agent_order
+        .iter()
+        .any(|id| state.read(cx).is_thread_busy(*id));
+    let menu = project_menu(&project.name, busy);
+    let context_menu = menu.clone();
+    let registry = state.read(cx).context_registry.clone();
 
-    div()
+    let row = div()
         .id(SharedString::from(format!("project:{id}")))
         .h(px(PROJECT_ROW_HEIGHT))
         .flex_shrink_0()
@@ -202,7 +239,8 @@ fn project_row(
         .items_center()
         .gap(px_len(Spacing::XXS))
         .pl(px_len(Spacing::XS))
-        .pr(px_len(Spacing::XXXS))
+        // The list's 8pt inset plus this 4pt inset matches the header's 12pt gutter.
+        .pr(px_len(Spacing::XXS))
         .cursor_pointer()
         .rounded(px_len(Radii::SM))
         .hover(|s| s.fx_background(Colors::bg_hover(&theme)))
@@ -246,6 +284,7 @@ fn project_row(
         )
         .child(
             div()
+                .debug_selector(|| "sidebar-project-title".into())
                 .flex_1()
                 .min_w_0()
                 .overflow_hidden()
@@ -285,12 +324,17 @@ fn project_row(
                 let model = menu.clone();
                 let layer = state.read(cx).menu_layer.clone();
                 layer.update(cx, |layer, cx| {
-                    layer.open_at(model, format!("project:{id}"), event.position());
+                    let owner = format!("project:{id}");
+                    if layer.is_owner(&owner) {
+                        layer.dismiss();
+                    } else {
+                        layer.open_at(model, owner, event.position());
+                    }
                     cx.notify();
                 });
             },
-        ))
-        .into_any_element()
+        ));
+    context_region(&registry, format!("project:{id}"), Some(context_menu), row).into_any_element()
 }
 
 /// A project's threads, indented under the project name.
@@ -299,11 +343,13 @@ fn threads(
     project_id: Uuid,
     agents: Vec<Agent>,
     active_agent: Option<Uuid>,
+    archived: bool,
     cx: &mut App,
 ) -> AnyElement {
     let mut column = div()
         .flex()
         .flex_col()
+        .flex_shrink_0()
         .gap(px_len(Spacing::XXXS))
         .pb(px_len(Spacing::XXS));
     if agents.is_empty() {
@@ -322,6 +368,7 @@ fn threads(
             project_id,
             agent.clone(),
             Some(agent.id) == active_agent,
+            archived,
             cx,
         ));
     }
@@ -333,16 +380,20 @@ fn thread_row(
     project_id: Uuid,
     agent: Agent,
     selected: bool,
+    archived: bool,
     cx: &mut App,
 ) -> AnyElement {
     let theme = global::current();
     let agent_id = agent.id;
     let title = thread_title(&agent);
-    let mode = agent.configuration.resolved_mode();
-    let busy = state.read(cx).runners.contains_key(&agent_id);
+    let busy = state.read(cx).is_thread_busy(agent_id);
+    let menu = thread_menu(archived, busy);
+    let context_menu = menu.clone();
+    let registry = state.read(cx).context_registry.clone();
 
-    div()
+    let row = div()
         .id(SharedString::from(format!("thread:{agent_id}")))
+        .debug_selector(move || format!("sidebar-thread:{agent_id}"))
         .h(px(THREAD_ROW_HEIGHT))
         .flex_shrink_0()
         .flex()
@@ -350,7 +401,7 @@ fn thread_row(
         .gap(px_len(Spacing::SM))
         // Past the project row's disclosure triangle and gutter.
         .pl(px_len(Spacing::SM))
-        .pr(px_len(Spacing::SM))
+        .pr(px_len(Spacing::XXS))
         .cursor_pointer()
         .rounded(px_len(Radii::SM))
         .bg(if selected {
@@ -359,30 +410,55 @@ fn thread_row(
             no_fill()
         })
         .hover(|s| s.fx_background(Colors::bg_hover(&theme)))
-        .on_click(move |_, _window, cx| {
-            state.update(cx, |state, cx| {
-                state.select_project(project_id);
-                state.select_agent(agent_id);
-                // Read the transcript on first selection rather than at launch.
-                state.conversation(project_id, agent_id);
-                cx.notify();
-            });
+        .on_click({
+            let state = state.clone();
+            move |_, _window, cx| {
+                state.update(cx, |state, cx| {
+                    state.select_project(project_id);
+                    state.select_agent(agent_id);
+                    // Read the transcript on first selection rather than at launch.
+                    state.conversation(project_id, agent_id);
+                    cx.notify();
+                });
+            }
         })
-        .child(activity_dot(
-            if busy || selected {
-                Colors::accent(&theme)
-            } else {
-                Colors::fg_tertiary(&theme)
-            },
-            if busy {
-                ActivityState::Running
-            } else {
-                ActivityState::Idle
-            },
-            0.0,
-        ))
+        .child(if archived {
+            div()
+                .w(px_len(Spacing::LG))
+                .flex_shrink_0()
+                .flex()
+                .justify_center()
+                .child(Icon::ARCHIVEBOX.render(
+                    IconSize::Small,
+                    Colors::fg_tertiary(&theme),
+                    &theme,
+                ))
+                .into_any_element()
+        } else {
+            activity_dot(
+                if busy || selected {
+                    Colors::accent(&theme)
+                } else {
+                    Colors::fg_tertiary(&theme)
+                },
+                if busy {
+                    ActivityState::Running
+                } else {
+                    ActivityState::Idle
+                },
+                0.0,
+            )
+            .into_any_element()
+        })
         .child(
             div()
+                .debug_selector(move || {
+                    if archived {
+                        "sidebar-archived-thread-title".into()
+                    } else {
+                        "sidebar-thread-title".into()
+                    }
+                })
                 .flex_1()
                 .min_w_0()
                 .overflow_hidden()
@@ -396,15 +472,31 @@ fn thread_row(
                 })
                 .child(SharedString::from(title)),
         )
-        // Only a plan thread earns a badge; one on every chat thread turns the
-        // sidebar into a wall of identical chips.
-        .child(if mode == AgentMode::Plan {
-            fx_design::components::badge(SharedString::from(mode.label()), BadgeTone::Accent, false)
-                .into_any_element()
-        } else {
-            div().w(px(0.0)).h(px(0.0)).into_any_element()
-        })
-        .into_any_element()
+        .child(icon_button(
+            IconButtonProps::new(Icon::ELLIPSIS_CIRCLE, "Thread actions")
+                .tiny()
+                .ghost(),
+            move |event, _, cx| {
+                cx.stop_propagation();
+                let layer = state.read(cx).menu_layer.clone();
+                layer.update(cx, |layer, cx| {
+                    let owner = format!("thread:{agent_id}");
+                    if layer.is_owner(&owner) {
+                        layer.dismiss();
+                    } else {
+                        layer.open_at(menu.clone(), owner, event.position());
+                    }
+                    cx.notify();
+                });
+            },
+        ));
+    context_region(
+        &registry,
+        format!("thread:{agent_id}"),
+        Some(context_menu),
+        row,
+    )
+    .into_any_element()
 }
 
 fn thread_title(agent: &Agent) -> String {
@@ -417,7 +509,7 @@ fn thread_title(agent: &Agent) -> String {
 }
 
 /// The actions for a project row.
-fn project_menu(name: &str) -> MenuModel {
+fn project_menu(name: &str, busy: bool) -> MenuModel {
     MenuModel::new(vec![
         MenuSection::new(
             "actions",
@@ -430,7 +522,33 @@ fn project_menu(name: &str) -> MenuModel {
             "danger",
             vec![
                 MenuItem::new("collapse", "Collapse all threads"),
-                MenuItem::new("remove", "Remove from sidebar").tone(MenuItemTone::Destructive),
+                MenuItem::new("remove", "Remove from sidebar")
+                    .tone(MenuItemTone::Destructive)
+                    .enabled(!busy),
+            ],
+        ),
+    ])
+}
+
+fn thread_menu(archived: bool, busy: bool) -> MenuModel {
+    MenuModel::new(vec![
+        MenuSection::new(
+            "actions",
+            vec![
+                MenuItem::new("rename", "Rename thread…").enabled(!busy),
+                if archived {
+                    MenuItem::new("unarchive", "Restore thread").enabled(!busy)
+                } else {
+                    MenuItem::new("archive", "Archive thread").enabled(!busy)
+                },
+            ],
+        ),
+        MenuSection::new(
+            "danger",
+            vec![
+                MenuItem::new("delete", "Delete thread…")
+                    .tone(MenuItemTone::Destructive)
+                    .enabled(!busy),
             ],
         ),
     ])
@@ -439,4 +557,289 @@ fn project_menu(name: &str) -> MenuModel {
 /// A thread's title, falling back to a placeholder rather than an empty row.
 pub fn fallback_title() -> &'static str {
     "Untitled thread"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fx_design::components::{context_frame, handle_root_right_click};
+    use fx_store::{AppPaths, PersistedApp, PersistedProject, Store};
+    use gpui::{Context, MouseButton, Render, TestAppContext, VisualTestContext, point, size};
+
+    struct SidebarProbe(Entity<AppState>);
+
+    impl Render for SidebarProbe {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let registry = self.0.read(cx).context_registry.clone();
+            let click_registry = registry.clone();
+            let layer = self.0.read(cx).menu_layer.clone();
+            context_frame(
+                &registry,
+                div()
+                    .size_full()
+                    .on_mouse_down(MouseButton::Right, move |event, window, cx| {
+                        handle_root_right_click(&click_registry, &layer, event, window, cx);
+                    })
+                    .child(view(self.0.clone(), window, cx)),
+            )
+        }
+    }
+
+    fn seeded(
+        test: &mut TestAppContext,
+        paths: AppPaths,
+        count: usize,
+        archive_last: bool,
+    ) -> (Entity<AppState>, Vec<Uuid>) {
+        let agents: Vec<_> = (0..count)
+            .map(|index| Agent::new(format!("Thread {index}")))
+            .collect();
+        let ids: Vec<_> = agents.iter().map(|agent| agent.id).collect();
+        let mut project = Project::new(paths.root().to_string_lossy());
+        project.agent_order = ids.clone();
+        let snapshot = PersistedApp {
+            active_project_id: Some(project.id),
+            active_agent_id: ids.first().copied(),
+            projects: vec![PersistedProject {
+                project: Some(project),
+                agents,
+                archived_agent_ids: if archive_last {
+                    ids.last().copied().into_iter().collect()
+                } else {
+                    Vec::new()
+                },
+                is_expanded: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        Store::new(paths.clone()).save_app(&snapshot).unwrap();
+        let state = test.update(|cx| cx.new(|cx| AppState::restore(paths, cx)));
+        (state, ids)
+    }
+
+    fn thread_bounds(
+        test: &TestAppContext,
+        state: &Entity<AppState>,
+        id: Uuid,
+    ) -> gpui::Bounds<gpui::Pixels> {
+        test.read(|cx| {
+            state
+                .read(cx)
+                .context_registry
+                .read(cx)
+                .regions()
+                .iter()
+                .find(|region| region.owner.as_ref() == format!("thread:{id}"))
+                .expect("painted thread is registered")
+                .bounds
+        })
+    }
+
+    #[test]
+    fn header_project_and_thread_actions_share_trailing_columns() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut test = TestAppContext::single();
+        let (state, _) = seeded(&mut test, AppPaths::at(temp.path()), 2, true);
+        let for_view = state.clone();
+        let window = test.add_window(move |_, _| crate::FlowX::new(for_view));
+        let mut visual = VisualTestContext::from_window(window.into(), &test);
+        visual.simulate_resize(size(px(1100.0), px(700.0)));
+        test.refresh().unwrap();
+
+        let workspace = visual
+            .debug_bounds("icon-button:Workspace actions")
+            .unwrap();
+        let add = visual.debug_bounds("icon-button:Add project").unwrap();
+        let project = visual.debug_bounds("icon-button:Project actions").unwrap();
+        let new_thread = visual.debug_bounds("icon-button:New thread").unwrap();
+        let thread = visual.debug_bounds("icon-button:Thread actions").unwrap();
+        assert_eq!(workspace.center().x, project.center().x);
+        assert_eq!(workspace.center().x, thread.center().x);
+        assert_eq!(add.center().x, new_thread.center().x);
+
+        let project_title = visual.debug_bounds("sidebar-project-title").unwrap();
+        let active_title = visual.debug_bounds("sidebar-thread-title").unwrap();
+        let archived_title = visual
+            .debug_bounds("sidebar-archived-thread-title")
+            .unwrap();
+        assert!(active_title.left() > project_title.left());
+        assert_eq!(active_title.left(), archived_title.left());
+
+        let toggle = visual
+            .debug_bounds("icon-button:Toggle sidebar · ⌘B")
+            .unwrap();
+        // The sidebar has a half-point column border; the titlebar spans it.
+        assert!((toggle.center().x - workspace.center().x).abs() <= px(BorderWidth::HAIRLINE));
+        let title = visual.debug_bounds("workspace-title").unwrap();
+        assert!(title.left() >= px(Layout::SIDEBAR_WIDTH));
+
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                state.toggle_sidebar();
+                cx.notify();
+            })
+        });
+        test.refresh().unwrap();
+        let toggle = visual
+            .debug_bounds("icon-button:Toggle sidebar · ⌘B")
+            .unwrap();
+        assert!(toggle.left() >= px(crate::TRAFFIC_LIGHT_GUTTER));
+        let title = visual.debug_bounds("workspace-title").unwrap();
+        assert!(title.left() < px(Layout::SIDEBAR_WIDTH));
+    }
+
+    #[test]
+    fn painted_right_click_and_ellipsis_target_the_clicked_thread_without_selecting_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut test = TestAppContext::single();
+        let (state, ids) = seeded(&mut test, AppPaths::at(temp.path()), 2, false);
+        let for_view = state.clone();
+        let window = test.add_window(move |_, _| SidebarProbe(for_view));
+        test.refresh().unwrap();
+        let mut visual = VisualTestContext::from_window(window.into(), &test);
+        let bounds = thread_bounds(&test, &state, ids[1]);
+        visual.simulate_mouse_down(bounds.center(), MouseButton::Right, Default::default());
+        test.read(|cx| {
+            let state = state.read(cx);
+            assert_eq!(state.snapshot.active_agent_id, Some(ids[0]));
+            assert_eq!(
+                state.menu_layer.read(cx).owner(),
+                Some(format!("thread:{}", ids[1]).as_str())
+            );
+        });
+        test.update(|cx| {
+            state
+                .read(cx)
+                .menu_layer
+                .clone()
+                .update(cx, |layer, _| layer.dismiss());
+        });
+        test.refresh().unwrap();
+        // The trailing action target remains available without a secondary
+        // mouse button and must not bubble into the row's selection handler.
+        let button = point(bounds.right() - px(20.0), bounds.center().y);
+        visual.simulate_mouse_down(button, MouseButton::Left, Default::default());
+        visual.simulate_mouse_up(button, MouseButton::Left, Default::default());
+        test.read(|cx| {
+            let state = state.read(cx);
+            assert_eq!(state.snapshot.active_agent_id, Some(ids[0]));
+            assert_eq!(
+                state.menu_layer.read(cx).owner(),
+                Some(format!("thread:{}", ids[1]).as_str())
+            );
+        });
+    }
+
+    #[test]
+    fn scrolling_clips_regions_and_collapsed_or_hidden_rows_leave_no_stale_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut test = TestAppContext::single();
+        let (state, ids) = seeded(&mut test, AppPaths::at(temp.path()), 30, false);
+        let for_view = state.clone();
+        let window = test.add_window(move |_, _| SidebarProbe(for_view));
+        let mut visual = VisualTestContext::from_window(window.into(), &test);
+        visual.simulate_resize(size(px(Layout::SIDEBAR_WIDTH), px(157.0)));
+        test.refresh().unwrap();
+        test.read(|cx| {
+            let registry = state.read(cx).context_registry.read(cx);
+            assert!(registry.len() > 2);
+            assert!(registry.len() < ids.len());
+            assert!(registry.regions().iter().all(|region| {
+                !region.bounds.is_empty() && region.bounds.bottom() <= px(157.0)
+            }));
+            // At least one laid-out row extends beyond the viewport, but only
+            // its painted fragment may offer actions.
+            assert!(registry.regions().iter().any(|region| {
+                region.owner.starts_with("thread:")
+                    && region.bounds.size.height < px(THREAD_ROW_HEIGHT)
+            }));
+            assert!(
+                registry
+                    .regions()
+                    .iter()
+                    .all(|region| region.owner.as_ref() != format!("thread:{}", ids[29]))
+            );
+        });
+        visual.simulate_event(gpui::ScrollWheelEvent {
+            position: point(px(100.0), px(120.0)),
+            delta: gpui::ScrollDelta::Pixels(point(px(0.0), px(-120.0))),
+            modifiers: Default::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        test.refresh().unwrap();
+        test.read(|cx| {
+            let registry = state.read(cx).context_registry.read(cx);
+            assert!(!registry.is_empty());
+            assert!(registry.regions().iter().all(|region| {
+                region.bounds.top() >= px(SIDEBAR_HEADER_HEIGHT)
+                    && region.bounds.bottom() <= px(157.0)
+                    && region.owner.as_ref() != format!("thread:{}", ids[0])
+            }));
+        });
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                state.snapshot.projects[0].is_expanded = false
+            });
+        });
+        test.refresh().unwrap();
+        test.read(|cx| assert_eq!(state.read(cx).context_registry.read(cx).len(), 1));
+        test.update(|cx| state.update(cx, |state, _| state.sidebar_visible = false));
+        test.refresh().unwrap();
+        test.read(|cx| assert!(state.read(cx).context_registry.read(cx).is_empty()));
+    }
+
+    #[test]
+    fn archived_threads_remain_visible_once_with_restore_actions_and_can_be_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut test = TestAppContext::single();
+        let (state, ids) = seeded(&mut test, AppPaths::at(temp.path()), 2, true);
+        let for_view = state.clone();
+        let window = test.add_window(move |_, _| SidebarProbe(for_view));
+        test.refresh().unwrap();
+        test.read(|cx| {
+            let registry = state.read(cx).context_registry.read(cx);
+            let matches: Vec<_> = registry
+                .regions()
+                .iter()
+                .filter(|region| region.owner.as_ref() == format!("thread:{}", ids[1]))
+                .collect();
+            assert_eq!(matches.len(), 1);
+            let choices: Vec<_> = matches[0]
+                .menu
+                .as_ref()
+                .unwrap()
+                .sections()
+                .iter()
+                .flat_map(|section| section.items.iter().map(|item| item.id.as_str()))
+                .collect();
+            assert_eq!(choices, ["rename", "unarchive", "delete"]);
+        });
+        let mut visual = VisualTestContext::from_window(window.into(), &test);
+        let position = thread_bounds(&test, &state, ids[1]).center();
+        visual.simulate_mouse_down(position, MouseButton::Left, Default::default());
+        visual.simulate_mouse_up(position, MouseButton::Left, Default::default());
+        test.read(|cx| {
+            let state = state.read(cx);
+            assert_eq!(state.snapshot.active_agent_id, Some(ids[1]));
+            assert!(
+                state.snapshot.projects[0]
+                    .archived_agent_ids
+                    .contains(&ids[1])
+            );
+        });
+    }
+
+    #[test]
+    fn running_threads_cannot_be_renamed_archived_or_deleted() {
+        for archived in [false, true] {
+            let menu = thread_menu(archived, true);
+            assert!(
+                menu.sections()
+                    .iter()
+                    .flat_map(|s| &s.items)
+                    .all(|i| !i.enabled)
+            );
+        }
+    }
 }

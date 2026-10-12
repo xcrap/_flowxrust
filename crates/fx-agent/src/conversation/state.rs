@@ -15,7 +15,7 @@
 
 use std::collections::VecDeque;
 
-use fx_core::{AgentAccess, AgentMode, ConversationMessage, MessageRole, Timestamp};
+use fx_core::{AgentAccess, ConversationMessage, MessageRole, Timestamp};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -783,10 +783,6 @@ impl Conversation {
         )
     }
 }
-
-/// Plan mode is decided per thread, not per conversation; this keeps the type
-/// visible where the composer reads it.
-pub type ConversationMode = AgentMode;
 
 #[cfg(test)]
 mod tests {

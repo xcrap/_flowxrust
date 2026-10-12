@@ -8,7 +8,7 @@
 //! one bad value.** A project whose thread list is malformed loses that thread,
 //! not the whole file.
 
-use fx_core::{Agent, AgentAccess, AgentMode, ConversationMessage, Project, Timestamp};
+use fx_core::{Agent, AgentAccess, ConversationMessage, Project, Timestamp};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -116,6 +116,9 @@ pub struct PersistedProject {
     pub project: Option<Project>,
     #[serde(default)]
     pub agents: Vec<Agent>,
+    /// Archived threads retain their place, history, and provider binding.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub archived_agent_ids: Vec<Uuid>,
     #[serde(default)]
     pub is_expanded: bool,
     #[serde(rename = "lastSelectedAgentId")]
@@ -210,8 +213,6 @@ pub struct PersistedBinding {
     pub model: Option<String>,
     #[serde(default)]
     pub effort: Option<String>,
-    #[serde(rename = "agentMode", default)]
-    pub agent_mode: Option<AgentMode>,
     #[serde(rename = "agentAccess", default)]
     pub agent_access: Option<AgentAccess>,
     #[serde(rename = "isArchived", default)]
@@ -238,6 +239,18 @@ impl PersistedApp {
         let (min, max) = (self.min_right_panel_width, self.max_right_panel_width);
         self.right_panel_width = self.right_panel_width.clamp(min, max);
         for record in &mut self.projects {
+            let agents: std::collections::HashSet<_> =
+                record.agents.iter().map(|agent| agent.id).collect();
+            let mut seen = std::collections::HashSet::new();
+            record
+                .archived_agent_ids
+                .retain(|id| agents.contains(id) && seen.insert(*id));
+            if record
+                .last_selected_agent_id
+                .is_some_and(|id| !agents.contains(&id) || record.archived_agent_ids.contains(&id))
+            {
+                record.last_selected_agent_id = None;
+            }
             // Workspace layout is recorded on the wrapper, so it is normalized
             // even for a record whose domain project failed to decode.
             if let Some(project) = record.project.as_mut()
@@ -420,6 +433,34 @@ mod tests {
         assert_eq!(decoded.sidebar_visible, built.sidebar_visible);
         assert_eq!(decoded.right_panel_visible, built.right_panel_visible);
         assert_eq!(decoded.right_panel_tab, built.right_panel_tab);
+    }
+
+    #[test]
+    fn archive_metadata_defaults_safely_and_keeps_only_distinct_existing_threads() {
+        let legacy: PersistedProject = serde_json::from_str("{}").unwrap();
+        assert!(legacy.archived_agent_ids.is_empty());
+        assert!(
+            serde_json::to_value(&legacy)
+                .unwrap()
+                .get("archived_agent_ids")
+                .is_none()
+        );
+        let agent = Agent::new("Archived thread");
+        let mut app = PersistedApp {
+            projects: vec![PersistedProject {
+                agents: vec![agent.clone()],
+                archived_agent_ids: vec![agent.id, Uuid::new_v4(), agent.id],
+                last_selected_agent_id: Some(agent.id),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        app.normalize();
+        assert_eq!(app.projects[0].archived_agent_ids, vec![agent.id]);
+        assert_eq!(app.projects[0].last_selected_agent_id, None);
+        let restored: PersistedApp =
+            serde_json::from_value(serde_json::to_value(app).unwrap()).unwrap();
+        assert_eq!(restored.projects[0].archived_agent_ids, vec![agent.id]);
     }
 
     #[test]

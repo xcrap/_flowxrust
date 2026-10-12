@@ -97,6 +97,8 @@ struct FieldGeometry {
     /// The measured width of the text area. The next render needs it to wrap and
     /// scroll correctly, because this render is what produces the measurement.
     content_width: f32,
+    #[cfg(test)]
+    first_painted_text_origin: Option<Point<Pixels>>,
 }
 
 /// The field state the element needs while it draws, snapshotted so painting
@@ -778,6 +780,15 @@ impl Element for TextFieldElement {
         cx: &mut App,
     ) {
         let content = content_bounds(&bounds, &self.metrics);
+        // Render uses the previous frame's width for shaping. On the first
+        // frame that width is zero, so its scroll offset would hide the entire
+        // prefilled value. Resolve scrolling from this frame's real viewport
+        // before any text, selection, or caret is painted.
+        self.layout.scroll_to_caret(
+            self.snapshot.selection.head,
+            content.size.width,
+            content.size.height,
+        );
         {
             let mut geometry = self.geometry.borrow_mut();
             geometry.bounds = Some(bounds);
@@ -818,6 +829,11 @@ impl Element for TextFieldElement {
             content.origin.x - self.layout.scroll_x,
             content.origin.y - self.layout.scroll_y,
         );
+        #[cfg(test)]
+        self.geometry
+            .borrow_mut()
+            .first_painted_text_origin
+            .get_or_insert(origin);
 
         window.with_content_mask(Some(ContentMask { bounds: content }), |window| {
             self.paint_selection(origin, &theme, window);
@@ -1130,6 +1146,28 @@ struct TextLayout {
 }
 
 impl TextLayout {
+    fn scroll_to_caret(&mut self, caret: usize, visible_width: Pixels, visible_height: Pixels) {
+        let text_width = self
+            .rows
+            .iter()
+            .map(|row| row.width(&self.lines[row.line].shape))
+            .fold(px(0.0), Pixels::max);
+        let text_height = self.line_height * self.rows.len() as f32;
+        let (scroll_x, scroll_y) = match self.row_for_byte(caret) {
+            Some(row) => (
+                Self::horizontal_scroll(
+                    row.x_for(caret, &self.lines[row.line].shape),
+                    text_width,
+                    visible_width,
+                ),
+                Self::vertical_scroll(row.top, text_height, visible_height),
+            ),
+            None => (px(0.0), px(0.0)),
+        };
+        self.scroll_x = scroll_x;
+        self.scroll_y = scroll_y;
+    }
+
     /// The top of a logical line's first visual row.
     fn line_top(&self, line: usize) -> Pixels {
         self.rows
@@ -1276,43 +1314,21 @@ fn build_layout(
         });
     }
 
-    let text_width = rows
-        .iter()
-        .map(|row| row.width(&lines[row.line].shape))
-        .fold(px(0.0), |widest, row| widest.max(row));
-    let text_height = metrics.line_height * rows.len() as f32;
     let visible_rows = rows
         .len()
         .clamp(1, metrics.max_visible_rows.ceil().max(1.0) as usize);
     let visible_height = metrics.line_height * visible_rows as f32;
 
-    let caret = snap_back(value, caret);
-    let caret_row = rows
-        .iter()
-        .find(|row| caret >= row.start && caret <= row.end);
-    let (scroll_x, scroll_y) = match caret_row {
-        Some(row) => (
-            TextLayout::horizontal_scroll(
-                row.x_for(caret, &lines[row.line].shape),
-                text_width,
-                visible_width,
-            ),
-            TextLayout::vertical_scroll(row.top, text_height, visible_height),
-        ),
-        // No row holds the caret. The empty-value case above guarantees one row,
-        // so this only fires if that ever stops being true; scrolling to the top
-        // is a harmless way to be wrong, and a panic inside a paint is not.
-        None => (px(0.0), px(0.0)),
-    };
-
-    TextLayout {
+    let mut layout = TextLayout {
         shaped,
         lines,
-        scroll_x,
-        scroll_y,
+        scroll_x: px(0.0),
+        scroll_y: px(0.0),
         rows,
         line_height: metrics.line_height,
-    }
+    };
+    layout.scroll_to_caret(snap_back(value, caret), visible_width, visible_height);
+    layout
 }
 
 /// Shape the value, wrapping only when there is a width to wrap against.
@@ -2016,6 +2032,43 @@ mod tests {
             assert!(
                 geometry.content_width > 380.0,
                 "an empty field collapsed to its padding"
+            );
+        });
+    }
+
+    #[test]
+    fn a_prefilled_focused_field_paints_its_title_inside_the_first_frame() {
+        struct SeededProbe(Entity<TextField>);
+        impl Render for SeededProbe {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().flex().w(px(420.0)).child(self.0.clone())
+            }
+        }
+        let mut test = gpui::TestAppContext::single();
+        let field = test.update(|cx| {
+            cx.new(|cx| {
+                let mut field = TextField::new(cx).placeholder("Thread name");
+                field.set_value("Existing thread title", cx);
+                field
+            })
+        });
+        let for_window = field.clone();
+        test.add_window(move |window, cx| {
+            for_window.read(cx).focus_handle().focus(window);
+            SeededProbe(for_window)
+        });
+        test.refresh().unwrap();
+        test.read(|cx| {
+            let field = field.read(cx);
+            assert_eq!(field.value(), "Existing thread title");
+            let geometry = field.geometry.borrow();
+            let metrics = field.metrics(&global::current(), true);
+            let content = content_bounds(&geometry.bounds.unwrap(), &metrics);
+            assert_eq!(content.size.width + metrics.inset_x * 2.0, px(420.0));
+            assert_eq!(
+                geometry.first_painted_text_origin.unwrap(),
+                content.origin,
+                "a title fitting the field must not scroll outside its paint mask"
             );
         });
     }

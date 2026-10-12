@@ -114,6 +114,20 @@ impl Store {
         write::remove(&self.paths.conversation_file(project_id, agent_id))
     }
 
+    /// Delete the local transcript, recovery copy, and attachment cache only.
+    /// The caller commits removal from the snapshot first, so a cleanup error
+    /// can leave recoverable orphan files but never resurrect the sidebar row.
+    pub fn delete_thread_files(&self, project_id: Uuid, agent_id: Uuid) -> std::io::Result<()> {
+        self.delete_conversation(project_id, agent_id)?;
+        let assets = self.paths.assets_dir(project_id, agent_id);
+        match std::fs::symlink_metadata(&assets) {
+            Ok(metadata) if metadata.file_type().is_dir() => std::fs::remove_dir_all(assets),
+            Ok(_) => std::fs::remove_file(assets),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Read every saved thread for a project, keyed by agent.
     ///
     /// One unreadable thread is skipped rather than failing the whole project:
@@ -270,6 +284,79 @@ mod tests {
         let loaded = store.load_app().unwrap();
         assert_eq!(loaded.projects.len(), 1);
         assert_eq!(loaded.right_panel_tab, RightPanelTab::Changes);
+    }
+
+    #[test]
+    fn old_mode_values_are_removed_on_save_without_losing_thread_configuration_or_history() {
+        let (store, _temp) = store();
+        let mut app = populated();
+        let project_id = app.projects[0].project.as_ref().unwrap().id;
+        let mut agent = fx_core::Agent::new("Keep this conversation");
+        agent.configuration = fx_core::AgentConfiguration {
+            provider_id: Some("codex".into()),
+            model_id: Some("saved-model".into()),
+            effort: Some("high".into()),
+            system_prompt: Some("Saved instructions".into()),
+            agent_access: Some(fx_core::AgentAccess::Supervised),
+            context_window_size: Some(200_000),
+        };
+        let agent_id = agent.id;
+        app.projects[0].agents.push(agent.clone());
+        app.active_project_id = Some(project_id);
+        app.active_agent_id = Some(agent_id);
+        let mut legacy = serde_json::to_value(&app).unwrap();
+        legacy["projects"][0]["agents"][0]["configuration"]["agent_mode"] =
+            serde_json::json!("plan");
+        legacy["projects"][0]["agents"][0]["configuration"]["agentMode"] =
+            serde_json::json!("auto");
+        legacy["projects"][0]["native_bindings"] = serde_json::json!([{
+            "agentId": agent_id,
+            "providerId": "codex",
+            "sessionId": "saved-native-session",
+            "title": "Keep this conversation",
+            "workingDirectory": app.projects[0].project.as_ref().unwrap().root_path,
+            "updatedAt": agent.created_at,
+            "model": "saved-model",
+            "effort": "high",
+            "agentMode": "plan",
+            "agentAccess": "supervised"
+        }]);
+        store.paths().ensure().unwrap();
+        std::fs::write(
+            store.paths().projects_file(),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        let mut conversation =
+            PersistedConversation::from_messages(agent_id, vec![message("Keep the transcript")]);
+        conversation.session_id = Some("saved-native-session".into());
+        conversation.draft_text = "Keep the draft".into();
+        store
+            .save_conversation(project_id, agent_id, &conversation)
+            .unwrap();
+
+        let restored = store.load_app().unwrap();
+        assert_eq!(restored.projects[0].agents, vec![agent.clone()]);
+        let binding = &restored.projects[0].native_bindings[0];
+        assert_eq!(binding.session_id, "saved-native-session");
+        assert_eq!(binding.model.as_deref(), Some("saved-model"));
+        assert_eq!(binding.effort.as_deref(), Some("high"));
+        assert_eq!(binding.agent_access, Some(fx_core::AgentAccess::Supervised));
+        store.save_app(&restored).unwrap();
+        let rewritten = std::fs::read_to_string(store.paths().projects_file()).unwrap();
+        assert!(!rewritten.contains("agentMode"));
+        assert!(!rewritten.contains("agent_mode"));
+        let reopened = store.load_app().unwrap();
+        assert_eq!(reopened.projects[0].agents, vec![agent]);
+        assert_eq!(reopened.active_agent_id, Some(agent_id));
+        let reopened_history = store
+            .load_conversation(project_id, agent_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(reopened_history).unwrap(),
+            serde_json::to_value(conversation).unwrap()
+        );
     }
 
     #[test]

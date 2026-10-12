@@ -1,9 +1,10 @@
 //! The Claude provider.
 //!
 //! Claude Code does not speak JSON-RPC. It writes one JSON object per line and
-//! narrates what it is doing, so the work here is reading a sequence and holding
-//! the state that sequence implies — not correlating replies.
+//! narrates each turn as a sequence of events. Its separate SDK control
+//! protocol also supplies a metadata-only initialization response for discovery.
 
+pub mod catalog;
 #[cfg(test)]
 mod fake_claude;
 pub mod stream;

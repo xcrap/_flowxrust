@@ -5,14 +5,16 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use fx_agent::claude::catalog::ModelCatalog;
 use fx_agent::{Model, codex::CodexProvider};
-use fx_core::services::runtime::{RuntimeDiscovery, claude_spec};
+use fx_core::services::runtime::RuntimeDiscovery;
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
 
 struct Catalog {
     models: Vec<Model>,
+    aliases: HashMap<String, String>,
     running: bool,
     last_attempt: Option<Instant>,
     warning: Option<String>,
@@ -22,22 +24,38 @@ impl Catalog {
     fn new(provider: &str) -> Self {
         Self {
             models: fallback_models(provider),
+            aliases: HashMap::new(),
             running: false,
             last_attempt: None,
             warning: None,
         }
     }
 
-    fn finish(&mut self, result: Result<Vec<Model>, String>) {
+    fn finish(&mut self, result: Result<ModelCatalog, String>) {
         self.running = false;
         match result {
-            Ok(models) if !models.is_empty() => {
-                self.models = models;
+            Ok(catalog) if !catalog.models.is_empty() => {
+                self.models = catalog.models;
+                self.aliases = catalog.aliases;
                 self.warning = None;
             }
             Ok(_) => self.warning = Some("The provider returned no model choices.".into()),
             Err(reason) => self.warning = Some(reason),
         }
+    }
+
+    fn begin(&mut self, force: bool) -> bool {
+        if self.running
+            || !force
+                && self
+                    .last_attempt
+                    .is_some_and(|last| last.elapsed() < REFRESH_INTERVAL)
+        {
+            return false;
+        }
+        self.running = true;
+        self.last_attempt = Some(Instant::now());
+        true
     }
 }
 
@@ -55,6 +73,20 @@ pub fn models(provider: &str) -> Vec<Model> {
         .clone()
 }
 
+/// Resolve both a native menu value and a saved concrete provider model ID.
+pub fn model(provider: &str, id: &str) -> Option<Model> {
+    let mut catalogs = catalogs().lock().unwrap_or_else(|error| error.into_inner());
+    let catalog = catalogs
+        .entry(provider.into())
+        .or_insert_with(|| Catalog::new(provider));
+    let lookup = catalog.aliases.get(id).map(String::as_str).unwrap_or(id);
+    catalog
+        .models
+        .iter()
+        .find(|model| model.id == lookup)
+        .cloned()
+}
+
 /// Resolve an effort against the actual selected model. An empty advertised
 /// list means the provider takes no effort parameter (for example Haiku).
 pub fn effective_effort(
@@ -62,8 +94,8 @@ pub fn effective_effort(
     model_id: &str,
     configured: Option<&str>,
 ) -> Option<String> {
-    let models = models(provider);
-    resolve_effort(models.iter().find(|model| model.id == model_id), configured)
+    let model = model(provider, model_id);
+    resolve_effort(model.as_ref(), configured)
 }
 
 fn resolve_effort(model: Option<&Model>, configured: Option<&str>) -> Option<String> {
@@ -110,6 +142,15 @@ pub fn is_refreshing() -> bool {
 /// Refresh at most once per interval and once concurrently per provider. Safe
 /// to call when opening a picker; it returns immediately on the UI thread.
 pub fn refresh(provider: &str) -> bool {
+    start_refresh(provider, false)
+}
+
+/// An explicit user refresh bypasses the cooldown, but never duplicates a worker.
+pub fn refresh_now(provider: &str) -> bool {
+    start_refresh(provider, true)
+}
+
+fn start_refresh(provider: &str, force: bool) -> bool {
     if !matches!(provider, "codex" | "claude") {
         return false;
     }
@@ -118,15 +159,9 @@ pub fn refresh(provider: &str) -> bool {
         let catalog = catalogs
             .entry(provider.into())
             .or_insert_with(|| Catalog::new(provider));
-        if catalog.running
-            || catalog
-                .last_attempt
-                .is_some_and(|last| last.elapsed() < REFRESH_INTERVAL)
-        {
+        if !catalog.begin(force) {
             return false;
         }
-        catalog.running = true;
-        catalog.last_attempt = Some(Instant::now());
     }
     let provider_id = provider.to_owned();
     let worker = std::thread::Builder::new()
@@ -164,32 +199,19 @@ pub fn refresh(provider: &str) -> bool {
     true
 }
 
-async fn discover(provider: &str) -> Result<Vec<Model>, String> {
+async fn discover(provider: &str) -> Result<ModelCatalog, String> {
     let discovery = RuntimeDiscovery::default();
     if provider == "codex" {
         return CodexProvider::new(discovery)
             .discover_models()
             .await
+            .map(|models| ModelCatalog {
+                models,
+                aliases: HashMap::new(),
+            })
             .map_err(|error| error.to_string());
     }
-    // Claude's help is a capability probe, not a model-list endpoint. Preserve
-    // the complete curated Swift catalog, including models absent from help's
-    // examples; the user's explicit/custom model remains a UI-level choice.
-    let output = discovery
-        .run(
-            &claude_spec(),
-            &["--help".into()],
-            None,
-            Duration::from_secs(10),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-    if !output.succeeded() || !output.stdout.contains("--model") {
-        return Err(
-            "Claude Code did not advertise model selection; using the saved catalog.".into(),
-        );
-    }
-    Ok(fallback_models("claude"))
+    fx_agent::claude::catalog::discover_models(&discovery).await
 }
 
 pub fn fallback_models(provider: &str) -> Vec<Model> {
@@ -199,36 +221,18 @@ pub fn fallback_models(provider: &str) -> Vec<Model> {
     if provider != "claude" {
         return Vec::new();
     }
-    // Kept in step with ClaudeCodeProvider.fallbackModels in the Swift app.
-    [
-        ("default", "Provider default", 0, true),
-        ("claude-fable-5", "Claude Fable 5", 1_000_000, false),
-        ("claude-opus-4-8", "Claude Opus 4.8", 1_000_000, false),
-        ("claude-sonnet-5", "Claude Sonnet 5", 200_000, false),
-        ("claude-haiku-4-5", "Claude Haiku 4.5", 200_000, false),
-    ]
-    .into_iter()
-    .map(|(id, name, context, is_default)| {
-        let has_effort = id != "claude-haiku-4-5";
-        Model {
-            id: id.into(),
-            display_name: name.into(),
-            context_window: context,
-            max_context_window: context,
-            supported_efforts: if has_effort {
-                ["low", "medium", "high", "xhigh", "max"]
-                    .into_iter()
-                    .map(str::to_owned)
-                    .collect()
-            } else {
-                Vec::new()
-            },
-            default_effort: has_effort.then(|| "high".into()),
-            supports_vision: true,
-            is_default,
-        }
-    })
-    .collect()
+    // `default` is a stable CLI choice, not a claim about which model or effort
+    // the account currently has. Real choices come only from initialization.
+    vec![Model {
+        id: "default".into(),
+        display_name: "Provider default".into(),
+        context_window: 0,
+        max_context_window: 0,
+        supported_efforts: Vec::new(),
+        default_effort: None,
+        supports_vision: false,
+        is_default: true,
+    }]
 }
 
 #[cfg(test)]
@@ -240,27 +244,62 @@ mod tests {
         let mut catalog = Catalog::new("codex");
         let mut discovered = catalog.models[0].clone();
         discovered.id = "account-specific-model".into();
-        catalog.finish(Ok(vec![discovered.clone()]));
+        catalog.finish(Ok(ModelCatalog {
+            models: vec![discovered.clone()],
+            aliases: HashMap::from([("alias".into(), discovered.id.clone())]),
+        }));
         catalog.finish(Err("offline".into()));
         assert_eq!(catalog.models, vec![discovered.clone()]);
         assert_eq!(catalog.warning.as_deref(), Some("offline"));
         assert!(!catalog.running);
-        catalog.finish(Ok(Vec::new()));
+        catalog.finish(Ok(ModelCatalog::default()));
         assert_eq!(catalog.models, vec![discovered]);
     }
 
     #[test]
     fn efforts_follow_model_capabilities_including_models_without_reasoning_control() {
-        let claude = fallback_models("claude");
-        let haiku = claude.iter().find(|model| model.id == "claude-haiku-4-5");
-        assert_eq!(resolve_effort(haiku, Some("high")), None);
-        let opus = claude.iter().find(|model| model.id == "claude-opus-4-8");
-        assert_eq!(resolve_effort(opus, None).as_deref(), Some("high"));
+        let mut model = fallback_models("claude").remove(0);
+        assert_eq!(resolve_effort(Some(&model), Some("high")), None);
+        model.supported_efforts = vec!["low".into(), "high".into(), "max".into()];
+        model.default_effort = Some("high".into());
+        assert_eq!(resolve_effort(Some(&model), None).as_deref(), Some("high"));
         assert_eq!(
-            resolve_effort(opus, Some("unsupported")).as_deref(),
+            resolve_effort(Some(&model), Some("xhigh")).as_deref(),
             Some("high")
         );
-        assert_eq!(resolve_effort(opus, Some("low")).as_deref(), Some("low"));
+        assert_eq!(
+            resolve_effort(Some(&model), Some("low")).as_deref(),
+            Some("low")
+        );
         assert_eq!(resolve_effort(None, None), None);
+    }
+
+    #[test]
+    fn a_successful_refresh_replaces_old_choices_and_aliases() {
+        let mut catalog = Catalog::new("claude");
+        catalog
+            .aliases
+            .insert("old-resolved-model".into(), "old".into());
+        let mut model = catalog.models[0].clone();
+        model.id = "new-native-value".into();
+        catalog.finish(Ok(ModelCatalog {
+            models: vec![model.clone()],
+            aliases: HashMap::from([("new-resolved-model".into(), model.id.clone())]),
+        }));
+        assert_eq!(catalog.models, [model]);
+        assert!(!catalog.aliases.contains_key("old-resolved-model"));
+        assert_eq!(catalog.aliases["new-resolved-model"], "new-native-value");
+        assert!(catalog.warning.is_none());
+    }
+
+    #[test]
+    fn explicit_refresh_bypasses_cooldown_without_starting_duplicate_workers() {
+        let mut catalog = Catalog::new("claude");
+        assert!(catalog.begin(false));
+        assert!(!catalog.begin(true));
+        catalog.finish(Err("offline".into()));
+        assert!(!catalog.begin(false));
+        assert!(catalog.begin(true));
+        assert!(!catalog.begin(true));
     }
 }

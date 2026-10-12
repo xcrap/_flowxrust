@@ -18,9 +18,14 @@ not complete.** The remaining work is listed below.
 - Codex and Claude turns using the user's installed command-line tools, with
   streaming output, cancellation, provider session continuation and independent
   running turns in different threads.
-- Thread-level provider, model, effort, access and chat/plan configuration. The
+- Thread-level provider, model, effort and access configuration. The
   provider is fixed after a conversation begins, so an existing session is not
-  accidentally resumed through another provider.
+  accidentally resumed through another provider. Model choices and supported
+  reasoning levels come from the installed providers; the model picker includes
+  a Refresh models action.
+- Thread actions through right-click or the row menu: rename, archive/restore
+  and confirmed local deletion. Archived conversations remain available in the
+  sidebar; these actions manage FlowX's saved records and preserve project files.
 - Interactive tool approvals and grouped questions, including masked secret
   answers. Responses return to the thread that requested them.
 - Saved transcripts, provider session IDs, token/context totals, drafts and
@@ -109,7 +114,7 @@ support location. `RUST_LOG` controls diagnostic logging.
 | Images | Attachment import, decoding, resizing/conversion, storage, provider submission, previews and cache lifecycle. |
 | Transcript | Full Markdown and code presentation, text selection/copy behavior, and remaining Swift transcript interactions. |
 | Native history | Discover and import existing Codex/Claude conversations, load their history, synchronize external changes and migrate Swift application data. |
-| Thread management | Complete rename, archive/restore and remaining provider lifecycle/sidebar actions. |
+| Thread management | Synchronize local rename/archive/delete actions with provider-native lifecycle APIs and complete remaining sidebar parity. |
 | Composer | Complete attachment controls, follow-up queueing and steering behavior. |
 | Git workspace | Build on the read-only inspector with the remaining diff navigation and editing workflows, staging, commit and push UI. |
 | Distribution and parity | Finish workspace geometry/shortcut parity, application packaging, signing/notarization and broader live-provider acceptance testing. |

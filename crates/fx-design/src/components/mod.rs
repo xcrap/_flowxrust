@@ -13,7 +13,9 @@ pub mod status;
 pub mod surface;
 pub mod tooltip;
 
-pub use context_menu::{ContextRegion, ContextRegistry, handle_root_right_click, open_at};
+pub use context_menu::{
+    ContextRegion, ContextRegistry, context_frame, context_region, handle_root_right_click, open_at,
+};
 pub use menu::{
     MenuLayer, MenuTrigger, RowPalette, menu_layer_overlay, menu_overlay, menu_surface,
     menu_trigger, row_palette,

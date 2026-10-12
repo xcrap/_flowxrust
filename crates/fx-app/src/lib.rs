@@ -21,6 +21,7 @@ pub mod settings;
 pub mod sidebar;
 pub mod state;
 pub mod text_field;
+mod thread_actions;
 pub mod transcript;
 pub mod workspace_ui;
 
@@ -72,6 +73,7 @@ pub struct FlowX {
     state: Entity<AppState>,
     subscriptions: Vec<gpui::Subscription>,
     draft_values: std::collections::HashMap<uuid::Uuid, String>,
+    draft_subscriptions: std::collections::HashMap<uuid::Uuid, gpui::Subscription>,
     poller: Option<gpui::Task<()>>,
     polling: bool,
     autosave: Option<gpui::Task<()>>,
@@ -86,6 +88,7 @@ impl FlowX {
             state,
             subscriptions: Vec::new(),
             draft_values: Default::default(),
+            draft_subscriptions: Default::default(),
             poller: None,
             polling: false,
             autosave: None,
@@ -122,13 +125,25 @@ impl FlowX {
         {
             focus.focus(window);
         }
+        let thread_ids: std::collections::HashSet<_> = self
+            .state
+            .read(cx)
+            .snapshot
+            .projects
+            .iter()
+            .flat_map(|record| record.agents.iter().map(|agent| agent.id))
+            .collect();
+        self.draft_values.retain(|id, _| thread_ids.contains(id));
+        self.draft_subscriptions
+            .retain(|id, _| thread_ids.contains(id));
         let active_agent = self.state.read(cx).active_agent();
         let active_id = active_agent.as_ref().map(|agent| agent.id);
         let selection_changed = self.focused_thread != active_id;
         self.focused_thread = active_id;
         let modal_open = self.state.read(cx).picker.is_some()
             || ui.read(cx).settings.is_some()
-            || ui.read(cx).request.is_some();
+            || ui.read(cx).request.is_some()
+            || ui.read(cx).thread_dialog.is_some();
         if selection_changed
             && !modal_open
             && let Some(focus) = &self.focus
@@ -144,8 +159,9 @@ impl FlowX {
                 self.draft_values.entry(agent.id)
             {
                 entry.insert(field.read(cx).value().to_string());
-                self.subscriptions
-                    .push(cx.observe(&field, move |this, field, cx| {
+                self.draft_subscriptions.insert(
+                    agent.id,
+                    cx.observe(&field, move |this, field, cx| {
                         let value = field.read(cx).value().to_string();
                         if this.draft_values.get(&agent.id) == Some(&value) {
                             return;
@@ -158,7 +174,8 @@ impl FlowX {
                             });
                         }));
                         cx.notify();
-                    }));
+                    }),
+                );
             }
         }
         if !self.polling
@@ -202,12 +219,14 @@ impl Render for FlowX {
 
         let layer = self.state.read(cx).menu_layer.clone();
         let registry = self.state.read(cx).context_registry.clone();
+        let frame_registry = registry.clone();
         let for_click = layer.clone();
         let ui = workspace_ui::handle(cx);
         let settings = ui.read(cx).settings.clone();
         let request = ui.read(cx).request.clone();
+        let thread_dialog = ui.read(cx).thread_dialog.clone();
 
-        div()
+        let root = div()
             .relative()
             .size_full()
             .flex()
@@ -259,6 +278,9 @@ impl Render for FlowX {
             })
             .on_action(|_: &NewThread, _, cx| {
                 if let Some(handle) = AppHandle::get(cx) {
+                    if workspace_ui::has_modal(&handle.0, cx) {
+                        return;
+                    }
                     handle.0.update(cx, |state, cx| {
                         state.create_thread();
                         state.save();
@@ -345,7 +367,9 @@ impl Render for FlowX {
                 },
             ))
             .children(settings.map(AnyView::from))
-            .children(request.map(AnyView::from))
+            .children(thread_dialog.map(AnyView::from))
+            .children(request.map(AnyView::from));
+        fx_design::components::context_frame(&frame_registry, root)
     }
 }
 
@@ -368,6 +392,11 @@ fn title_bar(state: Entity<AppState>, cx: &mut Context<FlowX>) -> AnyElement {
     let for_sidebar = state.clone();
     let for_inspector = state.clone();
     let for_new = state.clone();
+    let sidebar_controls_width = if sidebar_visible {
+        Layout::SIDEBAR_WIDTH
+    } else {
+        TRAFFIC_LIGHT_GUTTER + Layout::CONTROL_COMPACT_HEIGHT + Spacing::MD
+    };
 
     div()
         .h(px(Layout::TITLE_BAR_HEIGHT))
@@ -375,26 +404,41 @@ fn title_bar(state: Entity<AppState>, cx: &mut Context<FlowX>) -> AnyElement {
         .flex()
         .items_center()
         .gap(px_len(Spacing::SM))
-        .pl(px(TRAFFIC_LIGHT_GUTTER))
         .pr(px_len(Spacing::MD))
         .border_b(px(fx_design::theme::BorderWidth::HAIRLINE))
         .border_color(Colors::border_subtle(&theme))
         .bg(Colors::sidebar_bg(&theme))
-        .child(fx_design::components::icon_button(
-            fx_design::components::IconButtonProps::new(Icon::SIDEBAR_LEFT, "Toggle sidebar · ⌘B")
-                .ghost()
-                .selected(sidebar_visible),
-            move |_, _window, cx| {
-                for_sidebar.update(cx, |state, cx| {
-                    state.toggle_sidebar();
-                    state.save();
-                    cx.notify();
-                });
-            },
-        ))
+        .child(
+            div()
+                .w(px(sidebar_controls_width))
+                .h_full()
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_end()
+                .pl(px(TRAFFIC_LIGHT_GUTTER))
+                .pr(px_len(Spacing::MD))
+                .child(fx_design::components::icon_button(
+                    fx_design::components::IconButtonProps::new(
+                        Icon::SIDEBAR_LEFT,
+                        "Toggle sidebar · ⌘B",
+                    )
+                    .small()
+                    .ghost()
+                    .selected(sidebar_visible),
+                    move |_, _window, cx| {
+                        for_sidebar.update(cx, |state, cx| {
+                            state.toggle_sidebar();
+                            state.save();
+                            cx.notify();
+                        });
+                    },
+                )),
+        )
         .child(
             div()
                 .id("workspace.title")
+                .debug_selector(|| "workspace-title".into())
                 .flex_1()
                 .min_w_0()
                 .h_full()
@@ -437,6 +481,7 @@ fn title_bar(state: Entity<AppState>, cx: &mut Context<FlowX>) -> AnyElement {
         }))
         .child(fx_design::components::icon_button(
             fx_design::components::IconButtonProps::new(Icon::PLUS, "New conversation · ⌘N")
+                .small()
                 .ghost()
                 .enabled(has_project),
             move |_, _, cx| {
@@ -452,6 +497,7 @@ fn title_bar(state: Entity<AppState>, cx: &mut Context<FlowX>) -> AnyElement {
                 Icon::SIDEBAR_RIGHT,
                 "Files and changes · ⌘G",
             )
+            .small()
             .ghost()
             .selected(show_inspector),
             move |_, _, cx| {
@@ -916,6 +962,31 @@ pub fn dispatch_menu_choice(owner: &str, chosen: &str, window: &mut Window, cx: 
     }
     if owner.starts_with("configuration:") {
         configuration::apply(&handle.0, owner, chosen, cx);
+        return;
+    }
+    if let Some(agent_id) = owner
+        .strip_prefix("thread:")
+        .and_then(|id| uuid::Uuid::parse_str(id).ok())
+    {
+        match chosen {
+            "rename" | "delete" => thread_actions::open(
+                handle.0,
+                agent_id,
+                if chosen == "rename" {
+                    thread_actions::ThreadAction::Rename
+                } else {
+                    thread_actions::ThreadAction::Delete
+                },
+                window,
+                cx,
+            ),
+            "archive" | "unarchive" => handle.0.update(cx, |state, cx| {
+                state.save_all(cx);
+                state.set_thread_archived(agent_id, chosen == "archive");
+                cx.notify();
+            }),
+            _ => {}
+        }
         return;
     }
     handle.0.update(cx, |state, cx| {

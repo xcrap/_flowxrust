@@ -3,7 +3,7 @@
 //!
 //! The text area is somebody else's — a [`TextField`] entity the caller owns and
 //! hands in. Everything around it is here: the container, the primary action,
-//! the model/effort/mode controls, and the strip that shows prompts waiting
+//! the model/effort controls, and the strip that shows prompts waiting
 //! behind the running turn.
 //!
 //! It is a function rather than a `Render` entity, for the same reason
@@ -25,7 +25,7 @@
 //!
 //! [`ComposerChrome`] is what the composer cannot derive from the field: whether
 //! a turn is running, what is queued behind it, and whether it accepts input.
-//! It also carries the three pickers' state and one callback.
+//! It also carries the two pickers' state and one callback.
 //!
 //! There is one callback, not one per control, because a method per callback is
 //! a method per *decision*, and every decision here is the caller's. The caller
@@ -38,7 +38,6 @@
 //!     enabled: true,
 //!     model,
 //!     effort,
-//!     mode,
 //!     ..ComposerChrome::default()
 //!     }
 //!     .on_action(move |action, _window, cx| match action {
@@ -47,7 +46,7 @@
 //!         ComposerAction::Attach => attach(cx),
 //!         ComposerAction::RemoveQueued(index) => dequeue(cx, index),
 //!         ComposerAction::Select(ComposerPicker::Effort, value) => set_effort(cx, value),
-//!         // The model and mode pickers are not wired yet.
+//!         // Handle model selection in the caller as well.
 //!         _ => {}
 //!     });
 //! composer::view(&field, &mut chrome, window, cx)
@@ -105,7 +104,7 @@ use crate::text_field::TextField;
 /// and the state has to be reachable without being captured.
 type ActionHandler = Rc<dyn Fn(ComposerAction, &mut Window, &mut App)>;
 
-/// Which of the three pickers changed.
+/// Which of the two pickers changed.
 ///
 /// Named rather than stringly typed so the caller cannot silently misspell one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -114,8 +113,6 @@ pub enum ComposerPicker {
     Model,
     /// The reasoning effort.
     Effort,
-    /// The conversation mode (chat or plan).
-    Mode,
 }
 
 /// Something a control asked for.
@@ -145,8 +142,7 @@ pub enum ComposerAction {
 /// One exclusive choice in a picker.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Choice {
-    /// What the caller calls it — a model id, an effort name, a mode's raw
-    /// value.
+    /// What the caller calls it — a model id or an effort name.
     pub value: String,
     /// What the reader sees.
     pub title: SharedString,
@@ -206,8 +202,6 @@ pub struct ComposerChrome {
     pub model: Picker,
     /// The reasoning effort.
     pub effort: Picker,
-    /// The conversation mode.
-    pub mode: Picker,
     on_action: Option<ActionHandler>,
 }
 
@@ -222,7 +216,6 @@ impl std::fmt::Debug for ComposerChrome {
             .field("enabled", &self.enabled)
             .field("model", &self.model)
             .field("effort", &self.effort)
-            .field("mode", &self.mode)
             .field("wired", &self.on_action.is_some())
             .finish()
     }
@@ -442,7 +435,10 @@ fn control_row(
     if let Some(model) =
         picker_control(&chrome.model, ComposerPicker::Model, &handler, pickers_live)
     {
-        controls = controls.child(model).child(control_divider());
+        controls = controls.child(model);
+        if chrome.effort.is_visible() {
+            controls = controls.child(control_divider());
+        }
     }
     if let Some(effort) = picker_control(
         &chrome.effort,
@@ -450,10 +446,7 @@ fn control_row(
         &handler,
         pickers_live,
     ) {
-        controls = controls.child(effort).child(control_divider());
-    }
-    if let Some(mode) = picker_control(&chrome.mode, ComposerPicker::Mode, &handler, pickers_live) {
-        controls = controls.child(mode);
+        controls = controls.child(effort);
     }
 
     div()
@@ -839,7 +832,6 @@ mod tests {
         let chrome = ComposerChrome::default();
         assert!(!chrome.model.is_visible());
         assert!(!chrome.effort.is_visible());
-        assert!(!chrome.mode.is_visible());
     }
 
     #[test]
@@ -1042,7 +1034,6 @@ mod tests {
                 queued: vec!["waiting".into()],
                 model: Picker::new(vec![choice("gpt-5", "GPT-5")], "gpt-5"),
                 effort: effort_picker(),
-                mode: Picker::new(vec![choice("auto", "Chat"), choice("plan", "Plan")], "auto"),
                 ..ComposerChrome::default()
             },
             "",
@@ -1086,7 +1077,6 @@ mod tests {
                     "gpt-5",
                 ),
                 effort: effort_picker(),
-                mode: Picker::new(vec![choice("auto", "Chat"), choice("plan", "Plan")], "plan"),
                 ..live()
             },
             "",
@@ -1223,7 +1213,6 @@ mod tests {
                 ],
                 "high",
             ),
-            mode: Picker::new(vec![choice("auto", "Chat"), choice("plan", "Plan")], "auto"),
             ..live()
         }
     }

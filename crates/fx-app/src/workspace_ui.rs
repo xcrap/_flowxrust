@@ -26,6 +26,7 @@ impl gpui::Global for UiHandle {}
 pub struct WorkspaceUi {
     pub settings: Option<Entity<SettingsSheet>>,
     pub request: Option<Entity<RequestPanel>>,
+    pub thread_dialog: Option<Entity<crate::thread_actions::ThreadDialog>>,
     request_key: Option<(Uuid, String)>,
     health: HealthResults,
     health_results: Option<mpsc::Receiver<Result<HealthResults, String>>>,
@@ -39,6 +40,14 @@ pub fn handle(cx: &mut App) -> Entity<WorkspaceUi> {
     let ui = cx.new(|_| WorkspaceUi::default());
     cx.set_global(UiHandle(ui.clone()));
     ui
+}
+
+pub fn has_modal(state: &Entity<AppState>, cx: &App) -> bool {
+    state.read(cx).picker.is_some()
+        || cx.try_global::<UiHandle>().is_some_and(|handle| {
+            let ui = handle.0.read(cx);
+            ui.settings.is_some() || ui.thread_dialog.is_some() || ui.request.is_some()
+        })
 }
 
 pub fn restore_preferences(state: &Entity<AppState>, cx: &mut App) {
@@ -103,6 +112,9 @@ fn apply_settings(
 }
 
 pub fn open_settings(state: Entity<AppState>, window: &mut Window, cx: &mut App) {
+    if has_modal(&state, cx) {
+        return;
+    }
     dismiss_popup(&state, cx);
     let ui = handle(cx);
     let apply_ui = ui.clone();
@@ -243,6 +255,14 @@ impl WorkspaceUi {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A provider may ask while another thread's dialog owns focus. Defer
+        // that request until the reader closes the current dialog.
+        if self.settings.is_some()
+            || self.thread_dialog.is_some()
+            || state.read(cx).picker.is_some()
+        {
+            return;
+        }
         let pending = state.read(cx).next_interaction();
         let key = pending
             .as_ref()

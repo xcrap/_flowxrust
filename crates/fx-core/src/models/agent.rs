@@ -67,34 +67,6 @@ impl AgentExecutionState {
     ];
 }
 
-/// Whether the agent works freely or proposes a plan first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum AgentMode {
-    #[default]
-    Auto,
-    Plan,
-}
-
-impl AgentMode {
-    pub const ALL: [Self; 2] = [Self::Auto, Self::Plan];
-
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Auto => "Chat",
-            Self::Plan => "Plan",
-        }
-    }
-
-    /// The one-line explanation shown as the dropdown subtitle.
-    pub const fn explanation(self) -> &'static str {
-        match self {
-            Self::Auto => "Allow the agent to work normally",
-            Self::Plan => "Ask for a plan before making changes",
-        }
-    }
-}
-
 /// How much the agent may do without asking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -132,7 +104,7 @@ impl AgentAccess {
 ///
 /// Every field is optional on purpose. `None` means *inherit*, which is
 /// meaningfully different from picking a value: a provider-native thread that
-/// leaves mode and access unset stays under the provider's persisted policy,
+/// leaves access unset stays under the provider's persisted policy,
 /// where an inferred value would turn inheritance into an override.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct AgentConfiguration {
@@ -145,33 +117,26 @@ pub struct AgentConfiguration {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_mode: Option<AgentMode>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_access: Option<AgentAccess>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window_size: Option<u64>,
 }
 
 impl AgentConfiguration {
-    /// The effective mode, inheriting the app default when unset.
-    pub fn resolved_mode(&self) -> AgentMode {
-        self.agent_mode.unwrap_or_default()
-    }
-
     /// The effective access level, inheriting the app default when unset.
     pub fn resolved_access(&self, app_default: AgentAccess) -> AgentAccess {
         self.agent_access.unwrap_or(app_default)
     }
 
-    /// Whether this configuration states any mode or access override at all.
+    /// Whether this configuration states an access override.
     ///
     /// `None` means *inherit*, which is meaningfully different from picking a
-    /// value: a provider-native thread that leaves both unset stays under the
+    /// value: a provider-native thread that leaves access unset stays under the
     /// provider's own persisted policy. Persisting an inferred value here would
     /// silently turn inheritance into an override on the next load, so the
     /// accessors below never do it.
-    pub fn has_mode_or_access_override(&self) -> bool {
-        self.agent_mode.is_some() || self.agent_access.is_some()
+    pub fn has_access_override(&self) -> bool {
+        self.agent_access.is_some()
     }
 
     /// Build the effective configuration by layering explicit overrides over
@@ -201,7 +166,6 @@ impl AgentConfiguration {
                 .clone()
                 .or_else(|| native.effort.clone())
                 .unwrap_or_else(|| app_defaults.effort.clone()),
-            agent_mode: self.agent_mode.or(native.agent_mode).unwrap_or_default(),
             agent_access: self
                 .agent_access
                 .or(native.agent_access)
@@ -218,7 +182,6 @@ pub struct NativeDefaults {
     pub provider_id: Option<String>,
     pub model_id: Option<String>,
     pub effort: Option<String>,
-    pub agent_mode: Option<AgentMode>,
     pub agent_access: Option<AgentAccess>,
     pub context_window_size: Option<u64>,
 }
@@ -249,7 +212,6 @@ pub struct ResolvedConfiguration {
     pub provider_id: String,
     pub model_id: String,
     pub effort: String,
-    pub agent_mode: AgentMode,
     pub agent_access: AgentAccess,
     pub system_prompt: Option<String>,
     pub context_window_size: Option<u64>,
@@ -274,8 +236,7 @@ mod tests {
     #[test]
     fn a_default_configuration_inherits_everything() {
         let c = AgentConfiguration::default();
-        assert!(!c.has_mode_or_access_override());
-        assert_eq!(c.resolved_mode(), AgentMode::Auto);
+        assert!(!c.has_access_override());
         assert_eq!(
             c.resolved_access(AgentAccess::Supervised),
             AgentAccess::Supervised,
@@ -297,29 +258,26 @@ mod tests {
 
     #[test]
     fn an_inheriting_configuration_round_trips_without_gaining_an_override() {
-        // The subtle case: a provider-native thread has both mode and access
-        // unset. If persisting inferred a value, the next load would turn
-        // inheritance into a hard override.
+        // A provider-native thread has access unset. If persisting inferred a
+        // value, the next load would turn inheritance into a hard override.
         let c = AgentConfiguration {
             model_id: Some("gpt-5.6-sol".into()),
             ..Default::default()
         };
         let json = serde_json::to_string(&c).unwrap();
         assert!(
-            !json.contains("agentMode") && !json.contains("agentAccess"),
+            !json.contains("agent_access"),
             "an inheriting config persisted an override: {json}"
         );
 
         let back: AgentConfiguration = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.agent_mode, None);
         assert_eq!(back.agent_access, None);
-        assert!(!back.has_mode_or_access_override());
+        assert!(!back.has_access_override());
     }
 
     #[test]
     fn a_configured_thread_round_trips_its_override() {
         let c = AgentConfiguration {
-            agent_mode: Some(AgentMode::Plan),
             agent_access: Some(AgentAccess::AcceptEdits),
             context_window_size: Some(272_000),
             ..Default::default()
@@ -331,16 +289,16 @@ mod tests {
 
     #[test]
     fn a_partial_override_stays_partial() {
-        // Only mode is pinned. Access must still inherit.
+        // Only the model is pinned. Access must still inherit.
         let c = AgentConfiguration {
-            agent_mode: Some(AgentMode::Plan),
+            model_id: Some("chosen-model".into()),
             ..Default::default()
         };
         let json = serde_json::to_string(&c).unwrap();
-        assert!(!json.contains("agentAccess"), "{json}");
+        assert!(!json.contains("agent_access"), "{json}");
 
         let back: AgentConfiguration = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.agent_mode, Some(AgentMode::Plan));
+        assert_eq!(back.model_id.as_deref(), Some("chosen-model"));
         assert_eq!(back.agent_access, None);
         assert_eq!(
             back.resolved_access(AgentAccess::Supervised),
@@ -354,6 +312,33 @@ mod tests {
         let json = r#"{"model_id":"gpt-5.6-sol","something_new":true}"#;
         let c: AgentConfiguration = serde_json::from_str(json).unwrap();
         assert_eq!(c.model_id.as_deref(), Some("gpt-5.6-sol"));
+    }
+
+    #[test]
+    fn removed_mode_fields_are_ignored_without_losing_configuration() {
+        let expected = AgentConfiguration {
+            provider_id: Some("claude".into()),
+            model_id: Some("saved-model".into()),
+            effort: Some("high".into()),
+            system_prompt: Some("Keep the saved instructions".into()),
+            agent_access: Some(AgentAccess::Supervised),
+            context_window_size: Some(200_000),
+        };
+        for key in ["agent_mode", "agentMode"] {
+            for value in [
+                serde_json::json!("auto"),
+                serde_json::json!("plan"),
+                serde_json::json!({"legacy": true}),
+            ] {
+                let mut saved = serde_json::to_value(&expected).unwrap();
+                saved[key] = value;
+                let restored: AgentConfiguration = serde_json::from_value(saved).unwrap();
+                assert_eq!(restored, expected);
+                let rewritten = serde_json::to_value(restored).unwrap();
+                assert!(rewritten.get("agent_mode").is_none());
+                assert!(rewritten.get("agentMode").is_none());
+            }
+        }
     }
 
     #[test]
@@ -382,7 +367,6 @@ mod tests {
             provider_id: Some("claude".into()),
             model_id: Some("claude-fable-5".into()),
             effort: Some("high".into()),
-            agent_mode: Some(AgentMode::Plan),
             agent_access: Some(AgentAccess::AcceptEdits),
             ..Default::default()
         };
@@ -390,7 +374,6 @@ mod tests {
         assert_eq!(r.provider_id, "claude");
         assert_eq!(r.model_id, "claude-fable-5");
         assert_eq!(r.effort, "high");
-        assert_eq!(r.agent_mode, AgentMode::Plan);
         assert_eq!(r.agent_access, AgentAccess::AcceptEdits);
     }
 
@@ -401,7 +384,6 @@ mod tests {
         assert_eq!(r.provider_id, DEFAULT_PROVIDER_ID);
         assert_eq!(r.model_id, DEFAULT_CODEX_MODEL_ID);
         assert_eq!(r.effort, DEFAULT_EFFORT);
-        assert_eq!(r.agent_mode, AgentMode::Auto);
         assert_eq!(r.agent_access, AgentAccess::FullAccess);
     }
 
@@ -438,14 +420,10 @@ mod tests {
     }
 
     #[test]
-    fn access_and_mode_labels_and_explanations_are_present() {
+    fn access_labels_and_explanations_are_present() {
         for a in AgentAccess::ALL {
             assert!(!a.label().is_empty());
             assert!(!a.explanation().is_empty());
-        }
-        for m in AgentMode::ALL {
-            assert!(!m.label().is_empty());
-            assert!(!m.explanation().is_empty());
         }
     }
 }

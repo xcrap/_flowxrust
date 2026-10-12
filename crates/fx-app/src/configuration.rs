@@ -1,6 +1,6 @@
 //! Thread-scoped configuration menus. An existing provider session keeps its provider.
 
-use fx_core::{Agent, AgentAccess, AgentMode, DEFAULT_CODEX_MODEL_ID};
+use fx_core::{Agent, AgentAccess, DEFAULT_CODEX_MODEL_ID};
 use fx_design::components::{MenuItem, MenuModel, MenuSection, MenuTrigger, menu_trigger};
 use fx_design::styled::px_len;
 use fx_design::theme::Spacing;
@@ -25,7 +25,15 @@ fn models(agent: &Agent) -> Vec<(String, String)> {
     if let Some(current) = &agent.configuration.model_id
         && !models.iter().any(|(id, _)| id == current)
     {
-        models.push((current.clone(), current.clone()));
+        if let Some(model) = crate::provider_catalog::model(provider(agent), current) {
+            if let Some(choice) = models.iter_mut().find(|(id, _)| id == &model.id) {
+                choice.0 = current.clone();
+            } else {
+                models.push((current.clone(), model.display_name));
+            }
+        } else {
+            models.push((current.clone(), current.clone()));
+        }
     }
     models
 }
@@ -40,16 +48,9 @@ fn efforts(agent: &Agent) -> Vec<String> {
         } else {
             DEFAULT_CODEX_MODEL_ID
         });
-    crate::provider_catalog::models(provider(agent))
-        .into_iter()
-        .find(|m| m.id == id)
+    crate::provider_catalog::model(provider(agent), id)
         .map(|m| m.supported_efforts)
-        .unwrap_or_else(|| {
-            ["low", "medium", "high"]
-                .into_iter()
-                .map(str::to_owned)
-                .collect()
-        })
+        .unwrap_or_default()
 }
 
 fn provider_is_locked(state: &mut AppState, id: uuid::Uuid) -> bool {
@@ -130,19 +131,6 @@ pub fn bar(state: &Entity<AppState>, cx: &mut App) -> AnyElement {
                 .collect(),
         ),
         (
-            "mode",
-            agent.configuration.resolved_mode().label(),
-            true,
-            AgentMode::ALL
-                .iter()
-                .map(|mode| {
-                    MenuItem::new(mode.label(), mode.label())
-                        .subtitle(mode.explanation())
-                        .selected(*mode == agent.configuration.resolved_mode())
-                })
-                .collect(),
-        ),
-        (
             "access",
             agent
                 .configuration
@@ -171,8 +159,15 @@ pub fn bar(state: &Entity<AppState>, cx: &mut App) -> AnyElement {
             continue;
         }
         let owner = format!("configuration:{}:{field}", agent.id);
+        let mut sections = vec![MenuSection::new(field, items)];
+        if field == "model" {
+            sections.push(MenuSection::new(
+                "catalog",
+                vec![MenuItem::new("__refresh-models", "Refresh models")],
+            ));
+        }
         let trigger = MenuTrigger::new(
-            MenuModel::new(vec![MenuSection::new(field, items)]),
+            MenuModel::new(sections),
             SharedString::from(owner.clone()),
             SharedString::from(label.to_string()),
         )
@@ -233,6 +228,11 @@ pub fn apply(state: &Entity<AppState>, owner: &str, chosen: &str, cx: &mut App) 
             return;
         };
         match field {
+            "model" if chosen == "__refresh-models" => {
+                crate::provider_catalog::refresh_now(provider(agent));
+                cx.notify();
+                return;
+            }
             "provider" if ["codex", "claude"].contains(&chosen) => {
                 if provider(agent) == chosen {
                     return;
@@ -245,9 +245,7 @@ pub fn apply(state: &Entity<AppState>, owner: &str, chosen: &str, cx: &mut App) 
             "model" if models(agent).iter().any(|(id, _)| id == chosen) => {
                 agent.configuration.model_id = (chosen != "default").then(|| chosen.into());
                 agent.configuration.context_window_size =
-                    crate::provider_catalog::models(provider(agent))
-                        .into_iter()
-                        .find(|model| model.id == chosen)
+                    crate::provider_catalog::model(provider(agent), chosen)
                         .map(|model| model.context_window)
                         .filter(|size| *size > 0);
                 if agent
@@ -261,15 +259,6 @@ pub fn apply(state: &Entity<AppState>, owner: &str, chosen: &str, cx: &mut App) 
             }
             "effort" if efforts(agent).iter().any(|id| id == chosen) => {
                 agent.configuration.effort = Some(chosen.into())
-            }
-            "mode" => {
-                let Some(mode) = AgentMode::ALL
-                    .into_iter()
-                    .find(|mode| mode.label() == chosen)
-                else {
-                    return;
-                };
-                agent.configuration.agent_mode = Some(mode);
             }
             "access" => {
                 let Some(access) = AgentAccess::ALL
@@ -319,20 +308,8 @@ mod tests {
             );
             apply(
                 &state,
-                &format!("configuration:{}:mode", second.id),
-                "Plan",
-                cx,
-            );
-            apply(
-                &state,
                 &format!("configuration:{}:access", second.id),
                 "Supervised",
-                cx,
-            );
-            apply(
-                &state,
-                &format!("configuration:{}:effort", second.id),
-                "high",
                 cx,
             );
             // A stale or forged selection cannot add a model we never offered.
@@ -350,9 +327,8 @@ mod tests {
         );
         let config = &saved.projects[0].agents[1].configuration;
         assert_eq!(config.provider_id.as_deref(), Some("claude"));
-        assert_eq!(config.agent_mode, Some(AgentMode::Plan));
         assert_eq!(config.agent_access, Some(AgentAccess::Supervised));
-        assert_eq!(config.effort.as_deref(), Some("high"));
+        assert!(config.effort.is_none());
         assert!(config.model_id.is_none());
     }
 

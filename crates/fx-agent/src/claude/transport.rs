@@ -43,7 +43,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use fx_core::{AgentAccess, AgentMode};
+use fx_core::AgentAccess;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
@@ -201,7 +201,6 @@ pub struct TurnRequest {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub system_prompt: Option<String>,
-    pub mode: AgentMode,
     /// `None` means the caller has no access mode to express, which is a
     /// different thing from every mode there is.
     pub access: Option<AgentAccess>,
@@ -245,22 +244,17 @@ impl TurnRequest {
             arguments.push("--append-system-prompt".into());
             arguments.push(system_prompt);
         }
-        match (self.mode, self.access) {
-            // Plan mode wins, exactly as in the Swift original: it is the one
-            // mode that must not be talked out of by an access level.
-            (AgentMode::Plan, _) => push_permission_mode(&mut arguments, "plan"),
-            (_, Some(AgentAccess::AcceptEdits)) => {
-                push_permission_mode(&mut arguments, "acceptEdits")
-            }
+        match self.access {
+            Some(AgentAccess::AcceptEdits) => push_permission_mode(&mut arguments, "acceptEdits"),
             // Full Access is `manual`, and deliberately not
             // `--dangerously-skip-permissions`: with permissions skipped Claude
             // answers `AskUserQuestion` itself and never emits a `can_use_tool`,
             // so FlowX cannot show the question. The caller auto-approves the
             // ordinary tool calls instead.
-            (_, Some(AgentAccess::Supervised)) | (_, Some(AgentAccess::FullAccess)) => {
+            Some(AgentAccess::Supervised) | Some(AgentAccess::FullAccess) => {
                 push_permission_mode(&mut arguments, "manual")
             }
-            (_, None) => {}
+            None => {}
         }
         if let Some(session) = non_empty(self.resume_session_id.as_deref()) {
             arguments.push("--resume".into());
@@ -1145,7 +1139,6 @@ mod tests {
             access: Some(AgentAccess::Supervised),
             resume_session_id: Some("session-9".into()),
             attachment_directory: Some("/tmp/attachments".into()),
-            ..request()
         }
         .arguments();
         assert_eq!(&full[..bare.len()], &bare[..], "a default flag moved");
@@ -1206,18 +1199,28 @@ mod tests {
     }
 
     #[test]
-    fn plan_mode_beats_an_access_level() {
-        // Plan mode is the one mode that must not be talked out of.
-        let arguments = TurnRequest {
-            mode: AgentMode::Plan,
-            access: Some(AgentAccess::AcceptEdits),
-            ..request()
+    fn execution_permissions_follow_only_the_selected_access() {
+        for (access, permission) in [
+            (AgentAccess::Supervised, "manual"),
+            (AgentAccess::AcceptEdits, "acceptEdits"),
+            (AgentAccess::FullAccess, "manual"),
+        ] {
+            let arguments = TurnRequest {
+                access: Some(access),
+                ..request()
+            }
+            .arguments();
+            assert!(
+                contains_pair(&arguments, "--permission-mode", permission),
+                "{arguments:?}"
+            );
+            assert!(!arguments.iter().any(|argument| argument == "plan"));
+            assert!(
+                !arguments
+                    .iter()
+                    .any(|argument| argument == "--append-system-prompt")
+            );
         }
-        .arguments();
-        assert!(
-            contains_pair(&arguments, "--permission-mode", "plan"),
-            "{arguments:?}"
-        );
     }
 
     #[test]
