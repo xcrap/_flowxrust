@@ -43,7 +43,7 @@ use fx_design::components::{
 use fx_design::icon::Icon;
 use fx_design::styled::{FxRefinement, FxStyled, px_len};
 use fx_design::theme::{
-    Colors, IconSize, Layout, Radii, Spacing, TextRole, Typography, WithAlpha, global,
+    BorderWidth, Colors, IconSize, Layout, Radii, Spacing, TextRole, Typography, WithAlpha, global,
 };
 use gpui::prelude::*;
 use gpui::{
@@ -58,6 +58,10 @@ use uuid::Uuid;
 /// identity, so a revision-dependent id would throw away the reader's position
 /// on every streamed delta.
 const SCROLL_ID: &str = "transcript.scroll";
+const COLUMN_SELECTOR: &str = "transcript.column";
+const EMPTY_SELECTOR: &str = "transcript.empty";
+const USER_SELECTOR: &str = "transcript.user";
+const ASSISTANT_SELECTOR: &str = "transcript.assistant";
 
 /// The name a result carries when the transcript never saw the call it belongs
 /// to.
@@ -132,16 +136,6 @@ impl ViewMemory {
 
 thread_local! {
     static MEMORY: RefCell<ViewMemory> = RefCell::new(ViewMemory::default());
-}
-
-/// A fill that paints nothing, so a row can have a background or not.
-fn no_fill() -> gpui::Rgba {
-    gpui::Rgba {
-        r: 0.0,
-        g: 0.0,
-        b: 0.0,
-        a: 0.0,
-    }
 }
 
 fn scroll_handle(conversation: Uuid) -> ScrollHandle {
@@ -465,20 +459,29 @@ pub fn view(conversation: &crate::Conversation, window: &mut Window, cx: &mut Ap
     let frame = MEMORY.with(|memory| memory.borrow_mut().next_frame());
     request_caret_frame(conversation, frame, window);
     let streaming = streaming_tail(conversation, frame);
+    let is_empty = rows.is_empty() && streaming.is_none() && conversation.error().is_none();
     let focus = viewport_focus(conversation.id, cx);
     let for_keys = handle.clone();
 
     let mut column = div()
+        .debug_selector(|| COLUMN_SELECTOR.to_string())
         .w_full()
+        .min_w_0()
         .flex()
         .flex_col()
+        .flex_shrink_0()
         .max_w(px(Layout::READABLE_CONTENT_WIDTH))
         .px(px_len(Spacing::XXL))
         .pt(px_len(Spacing::XXL))
         .pb(px_len(Spacing::XXL));
 
-    if rows.is_empty() && streaming.is_none() {
-        column = column.child(empty_transcript_notice());
+    if is_empty {
+        // Give the empty state the same viewport as a populated conversation.
+        // Padding alone leaves it stranded at the top of a tall window.
+        column = column
+            .h_full()
+            .justify_center()
+            .child(empty_transcript_notice());
     }
 
     for row in &rows {
@@ -496,7 +499,9 @@ pub fn view(conversation: &crate::Conversation, window: &mut Window, cx: &mut Ap
     }
 
     div()
+        .w_full()
         .flex_1()
+        .min_w_0()
         .min_h_0()
         .flex()
         .flex_col()
@@ -510,6 +515,7 @@ pub fn view(conversation: &crate::Conversation, window: &mut Window, cx: &mut Ap
                 // 0.2.2 scrolling is an interaction, and interactions live on
                 // the stateful element.
                 .id(SCROLL_ID)
+                .debug_selector(|| SCROLL_ID.to_string())
                 .overflow_y_scroll()
                 // Reading the offset back through the handle is what makes the
                 // follow-the-bottom decision observable at all: without it this
@@ -535,6 +541,9 @@ pub fn view(conversation: &crate::Conversation, window: &mut Window, cx: &mut Ap
                 })
                 .w_full()
                 .flex()
+                // The column keeps its natural height as history grows. Flex's
+                // default cross-axis stretch would squash rows to the viewport.
+                .items_start()
                 .justify_center()
                 .child(column),
         )
@@ -679,27 +688,36 @@ fn message_row(message: &ConversationMessage) -> AnyElement {
         );
     }
 
-    let mut bubble = div().flex().flex_col().gap(px_len(Spacing::XXS));
+    let mut bubble = div().min_w_0().flex().flex_col().gap(px_len(Spacing::SM));
     if is_user {
         bubble = bubble
-            .px(px_len(Spacing::LG))
+            .debug_selector(|| USER_SELECTOR.to_string())
+            .px(px_len(Spacing::XL))
             .py(px_len(Spacing::MD))
             .max_w(px(Layout::USER_MESSAGE_MAX_WIDTH))
             .rounded(px_len(Radii::XL))
             .bg(Colors::accent_muted(&theme))
             // The accent at low strength, which is a wash over the muted fill
             // rather than a second surface colour.
-            .border_1()
+            .border(px_len(BorderWidth::HAIRLINE))
             .border_color(Colors::accent(&theme).with_alpha(0.2));
     } else {
-        bubble = bubble.py(px_len(Spacing::XS));
+        bubble = bubble
+            .debug_selector(|| ASSISTANT_SELECTOR.to_string())
+            .w_full()
+            .py(px_len(Spacing::XS));
     }
     let bubble = bubble.children(blocks);
 
     // The reader's prompt sits against the trailing edge and the model's answer
     // against the leading one, which is what makes a long exchange readable
     // without any role label on either side.
-    let column = div().w_full().flex().flex_col().pb(px_len(Spacing::XL));
+    let column = div()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .pb(px_len(Spacing::XXL));
     if is_user {
         column.items_end().child(bubble).into_any_element()
     } else {
@@ -716,6 +734,8 @@ fn content_block(block: &MessageContent) -> Option<AnyElement> {
             }
             Some(
                 div()
+                    .min_w_0()
+                    .whitespace_normal()
                     .fx_body()
                     .child(SharedString::from(text.clone()))
                     .into_any_element(),
@@ -752,20 +772,26 @@ fn content_block(block: &MessageContent) -> Option<AnyElement> {
 /// prose and collapsing it would bury the words the model just said.
 fn inline_tool_call(name: &str, input: &str) -> AnyElement {
     let theme = global::current();
-    let mut block = div().flex().flex_col().gap(px_len(Spacing::XXS)).child(
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px_len(Spacing::SM))
-            .child(tool_glyph(name))
-            .child(
-                div()
-                    .fx_body_medium()
-                    .text_color(Colors::accent_secondary(&theme))
-                    .child(SharedString::from(name.to_string())),
-            ),
-    );
+    let mut block = div()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap(px_len(Spacing::SM))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px_len(Spacing::SM))
+                .child(tool_glyph(name))
+                .child(
+                    div()
+                        .fx_role(TextRole::CaptionMedium)
+                        .text_color(Colors::accent_secondary(&theme))
+                        .child(SharedString::from(name.to_string())),
+                ),
+        );
     if !input.is_empty() && input != "{}" {
         block = block.child(mono_panel("Input", input, BlockTone::Standard));
     }
@@ -781,22 +807,18 @@ fn inline_tool_call(name: &str, input: &str) -> AnyElement {
 fn inline_tool_result(content: &str, is_error: bool) -> AnyElement {
     let theme = global::current();
     div()
+        .w_full()
+        .min_w_0()
         .flex()
         .flex_col()
-        .gap(px_len(Spacing::XXS))
+        .gap(px_len(Spacing::SM))
         .rounded(px_len(Radii::MD))
         .px(px_len(Spacing::MD))
         .py(px_len(Spacing::SM))
-        .bg(if is_error {
-            Colors::error_muted(&theme)
-        } else {
-            no_fill()
-        })
-        .border_l_2()
-        .border_color(if is_error {
-            Colors::error(&theme)
-        } else {
-            no_fill()
+        .when(is_error, |this| {
+            this.bg(Colors::error_muted(&theme))
+                .border_l(px_len(BorderWidth::STRONG))
+                .border_color(Colors::error(&theme))
         })
         .child(
             div()
@@ -819,7 +841,7 @@ fn inline_tool_result(content: &str, is_error: bool) -> AnyElement {
                 })
                 .child(
                     div()
-                        .fx_body_medium()
+                        .fx_role(TextRole::CaptionMedium)
                         .child(SharedString::from(if is_error {
                             "Tool failed"
                         } else {
@@ -852,11 +874,12 @@ fn attachment_notice(detail: &str) -> AnyElement {
         .px(px_len(Spacing::MD))
         .py(px_len(Spacing::SM))
         .bg(Colors::bg_surface(&theme))
-        .border_1()
+        .border(px_len(BorderWidth::HAIRLINE))
         .border_color(Colors::border_subtle(&theme))
         .child(Icon::PHOTO.render(IconSize::Regular, Colors::fg_tertiary(&theme), &theme))
         .child(
             div()
+                .min_w_0()
                 .fx_caption()
                 .text_color(Colors::fg_secondary(&theme))
                 .child(SharedString::from(detail.to_string())),
@@ -866,8 +889,8 @@ fn attachment_notice(detail: &str) -> AnyElement {
 
 fn asset_notice(reference: &ConversationImageAssetReference) -> AnyElement {
     attachment_notice(&format!(
-        "Image attachment ({} bytes of {}, stored beside the transcript)",
-        reference.byte_count, reference.mime_type
+        "Image attachment ({}, {} bytes)",
+        reference.mime_type, reference.byte_count
     ))
 }
 
@@ -877,16 +900,18 @@ fn asset_notice(reference: &ConversationImageAssetReference) -> AnyElement {
 fn empty_transcript_notice() -> AnyElement {
     let theme = global::current();
     div()
+        .debug_selector(|| EMPTY_SELECTOR.to_string())
         .w_full()
-        .py(px_len(Spacing::HUGE))
+        .min_w_0()
+        .text_center()
         .child(empty_state(
             Icon::BUBBLE_LEFT_AND_BUBBLE_RIGHT.render(
-                IconSize::Large,
+                IconSize::Illustration,
                 Colors::fg_tertiary(&theme),
                 &theme,
             ),
-            "Nothing here yet",
-            "Send a prompt and the conversation will appear here.",
+            "Start a conversation",
+            "Ask a question, explore an idea, or start building.",
         ))
         .into_any_element()
 }
@@ -904,9 +929,11 @@ fn streaming_tail(conversation: &crate::Conversation, frame: u32) -> Option<AnyE
         return Some(
             div()
                 .w_full()
+                .min_w_0()
                 .flex()
                 .flex_col()
-                .pb(px_len(Spacing::XL))
+                .py(px_len(Spacing::XS))
+                .pb(px_len(Spacing::XXL))
                 .child(
                     div()
                         .flex()
@@ -954,19 +981,14 @@ fn streaming_tail(conversation: &crate::Conversation, frame: u32) -> Option<AnyE
             .flex_row()
             .items_center()
             .gap(px_len(Spacing::SM))
-            .pb(px_len(Spacing::XL))
+            .pb(px_len(Spacing::XXL))
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap(px_len(Spacing::MD))
-                    .px(px_len(Spacing::LG))
-                    .py(px_len(Spacing::MD))
-                    .rounded(px_len(Radii::XL))
-                    .bg(Colors::bg_surface(&theme))
-                    .border_1()
-                    .border_color(Colors::border(&theme))
+                    .py(px_len(Spacing::SM))
                     .child(typing_indicator(typing_phase(frame), false))
                     .child(
                         div()
@@ -1062,8 +1084,9 @@ fn activity_group(
         .flex_row()
         .items_center()
         .gap(px_len(Spacing::SM))
-        .py(px_len(Spacing::XXS))
-        .rounded(px_len(Radii::XS))
+        .px(px_len(Spacing::SM))
+        .py(px_len(Spacing::SM))
+        .rounded(px_len(Radii::SM))
         .cursor(CursorStyle::PointingHand)
         .child(chevron)
         .child(status)
@@ -1092,21 +1115,25 @@ fn activity_group(
 
     let mut column = div()
         .w_full()
+        .min_w_0()
         .flex()
         .flex_col()
-        .pb(px_len(Spacing::SM))
+        .pb(px_len(Spacing::MD))
         .child(header);
 
     if expanded {
         let mut details = div()
+            .w_full()
+            .min_w_0()
             .flex()
             .flex_col()
             .gap(px_len(Spacing::SM))
-            .pl(px_len(Spacing::XL))
-            .pt(px_len(Spacing::XXS))
+            .pl(px_len(Spacing::XXL))
+            .pr(px_len(Spacing::SM))
+            .py(px_len(Spacing::SM))
             // The leading rule is what ties a call to the group it belongs to.
             // Without it a long list of rows reads as more transcript.
-            .border_l_1()
+            .border_l(px_len(BorderWidth::HAIRLINE))
             .border_color(Colors::border_subtle(&theme));
         for call in &group.calls {
             details = details.child(tool_row(call, group.is_active, conversation, frame));
@@ -1146,25 +1173,27 @@ fn tool_row(
         .items_center()
         .gap(px_len(Spacing::SM))
         .py(px_len(Spacing::XXXS))
-        .child(tool_glyph(call.name))
+        .child(div().flex_shrink_0().child(tool_glyph(call.name)))
         .child(
             div()
                 .fx_role(TextRole::CaptionMedium)
+                .flex_shrink_0()
                 .text_color(Colors::fg_secondary(&theme))
                 .whitespace_nowrap()
                 .child(SharedString::from(tool_title(call))),
         )
-        .child(div().flex_1().min_w_0())
         .child(if let Some(detail) = tool_detail(call) {
             div()
+                .flex_1()
                 .min_w_0()
                 .truncate()
-                .fx_caption()
+                .text_right()
+                .fx_role(TextRole::MonoSmall)
                 .text_color(Colors::fg_tertiary(&theme))
                 .child(SharedString::from(detail))
                 .into_any_element()
         } else {
-            div().w(px(0.0)).h(px(0.0)).into_any_element()
+            div().flex_1().min_w_0().into_any_element()
         })
         .child(div().flex_shrink_0().child(status));
 
@@ -1313,11 +1342,13 @@ enum BlockTone {
 fn mono_panel(label: &str, body: &str, tone: BlockTone) -> AnyElement {
     let theme = global::current();
     div()
+        .w_full()
+        .min_w_0()
         .flex()
         .flex_col()
         .rounded(px_len(Radii::MD))
         .overflow_hidden()
-        .border_1()
+        .border(px_len(BorderWidth::HAIRLINE))
         .border_color(Colors::border_subtle(&theme))
         .bg(Colors::bg_surface(&theme))
         .child(
@@ -1343,8 +1374,9 @@ fn mono_panel(label: &str, body: &str, tone: BlockTone) -> AnyElement {
         )
         .child(
             div()
+                .min_w_0()
                 .px(px_len(Spacing::MD))
-                .py(px_len(Spacing::SM))
+                .py(px_len(Spacing::MD))
                 .fx_role(TextRole::MonoSmall)
                 .text_color(match tone {
                     BlockTone::Standard => Colors::fg_secondary(&theme),
@@ -1787,7 +1819,7 @@ fn pretty_arguments(input: &serde_json::Value) -> String {
     serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string())
 }
 
-/// Why the tray has no buttons yet.
+/// Direct the reader to the dialog that owns the provider response.
 fn awaiting_response_note() -> AnyElement {
     let theme = global::current();
     div()
@@ -1797,18 +1829,14 @@ fn awaiting_response_note() -> AnyElement {
         .gap(px_len(Spacing::SM))
         .fx_caption()
         .text_color(Colors::fg_tertiary(&theme))
-        .child(
-            Icon::HOURGLASS_BOTTOMHALF_FILLED
-                .render(IconSize::Micro, Colors::fg_tertiary(&theme), &theme),
-        )
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .child(SharedString::from(
-                    "Answering an approval or a question needs the provider response path, which is not ported yet.",
-                )),
-        )
+        .child(Icon::HOURGLASS_BOTTOMHALF_FILLED.render(
+            IconSize::Micro,
+            Colors::fg_tertiary(&theme),
+            &theme,
+        ))
+        .child(div().flex_1().min_w_0().child(SharedString::from(
+            "Waiting for your response in the dialog above.",
+        )))
         .into_any_element()
 }
 
@@ -1830,7 +1858,8 @@ mod tests {
     use super::*;
     use fx_agent::conversation::{Conversation, MAX_RETAINED_MESSAGES};
     use fx_agent::provider::{Lifecycle, ProviderEvent};
-    use gpui::{Context, Render, TestAppContext};
+    use gpui::{Bounds, Context, Pixels, Render, TestAppContext, VisualTestContext, size};
+    use std::ops::Deref;
 
     // ── Pure logic ──────────────────────────────────────────────────────────
 
@@ -2265,7 +2294,11 @@ mod tests {
 
     impl Render for Harness {
         fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            view(&self.conversation, window, cx)
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .child(view(&self.conversation, window, cx))
         }
     }
 
@@ -2294,6 +2327,109 @@ mod tests {
     #[test]
     fn an_empty_conversation_paints() {
         paint(Conversation::new(Uuid::nil()));
+    }
+
+    fn measured_transcript(
+        conversation: Conversation,
+        width: f32,
+        height: f32,
+        selectors: &[&'static str],
+    ) -> Vec<Bounds<Pixels>> {
+        let mut test = TestAppContext::single();
+        let window = test.add_window(move |_window, _cx| Harness { conversation });
+        let mut visual = VisualTestContext::from_window(*window.deref(), &test);
+        visual.simulate_resize(size(px(width), px(height)));
+        test.refresh()
+            .expect("the transcript painted at its new size");
+        selectors
+            .iter()
+            .map(|selector| visual.debug_bounds(selector).expect("measured element"))
+            .collect()
+    }
+
+    #[test]
+    fn the_empty_state_is_centered_in_the_available_viewport() {
+        for (width, height) in [(460.0, 480.0), (900.0, 800.0)] {
+            let measured = measured_transcript(
+                Conversation::new(Uuid::new_v4()),
+                width,
+                height,
+                &[SCROLL_ID, EMPTY_SELECTOR],
+            );
+            let (viewport, notice) = (measured[0], measured[1]);
+            assert_eq!(viewport.size, size(px(width), px(height)));
+            assert!(
+                (notice.center().y - viewport.center().y).abs() <= px(1.0),
+                "empty state is not vertically centered: {notice:?} in {viewport:?}"
+            );
+            assert!(
+                (notice.center().x - viewport.center().x).abs() <= px(1.0),
+                "empty state is not horizontally centered: {notice:?} in {viewport:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn messages_keep_their_reading_measure_and_fit_narrow_columns() {
+        for width in [320.0, Layout::MINIMUM_CONVERSATION_WIDTH, 1_100.0] {
+            let mut conversation = Conversation::new(Uuid::new_v4());
+            conversation.append(text(
+                MessageRole::User,
+                &"A prompt with enough words to wrap on a narrow window. ".repeat(8),
+            ));
+            conversation.append(text(
+                MessageRole::Assistant,
+                &"An answer with enough words to wrap and remain comfortably readable. ".repeat(8),
+            ));
+            let measured = measured_transcript(
+                conversation,
+                width,
+                1_100.0,
+                &[COLUMN_SELECTOR, USER_SELECTOR, ASSISTANT_SELECTOR],
+            );
+            let (column, user, assistant) = (measured[0], measured[1], measured[2]);
+            let inset = px(Spacing::XXL);
+            assert_eq!(
+                column.size.width,
+                px(width.min(Layout::READABLE_CONTENT_WIDTH))
+            );
+            assert_eq!(assistant.origin.x, column.origin.x + inset);
+            assert_eq!(assistant.right(), column.right() - inset);
+            assert!(
+                user.origin.x >= assistant.origin.x,
+                "user bubble escaped at {width}: {user:?}"
+            );
+            assert_eq!(user.right(), assistant.right());
+            assert!(user.size.width <= px(Layout::USER_MESSAGE_MAX_WIDTH));
+            assert!(assistant.origin.y >= user.bottom() + px(Spacing::XXL));
+        }
+    }
+
+    #[test]
+    fn a_populated_transcript_grows_and_scrolls_instead_of_compressing_its_rows() {
+        let mut conversation = Conversation::new(Uuid::new_v4());
+        let id = conversation.id;
+        for index in 0..30 {
+            conversation.append(text(
+                MessageRole::Assistant,
+                &format!("Message {index} stays at its natural reading height."),
+            ));
+        }
+        let measured = measured_transcript(
+            conversation,
+            Layout::MINIMUM_CONVERSATION_WIDTH,
+            400.0,
+            &[SCROLL_ID, COLUMN_SELECTOR],
+        );
+        let (viewport, column) = (measured[0], measured[1]);
+        let handle = scroll_handle(id);
+        assert_eq!(viewport.size.height, px(400.0));
+        assert!(column.size.height > viewport.size.height * 2.0);
+        assert!(handle.max_offset().height > viewport.size.height);
+        assert!(
+            (handle.offset().y + handle.max_offset().height).abs() <= px(1.0),
+            "a newly opened transcript should remain pinned to its newest content"
+        );
     }
 
     #[test]

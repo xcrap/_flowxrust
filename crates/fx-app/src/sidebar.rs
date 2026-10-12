@@ -2,12 +2,13 @@
 
 use fx_core::{Agent, AgentMode, Project};
 use fx_design::components::{
-    BadgeTone, DividerAxis, IconButtonProps, MenuItem, MenuItemTone, MenuModel, MenuSection,
-    divider_with_axis, empty_state, icon_button,
+    ActivityState, BadgeTone, ButtonStyle, DividerAxis, IconButtonProps, MenuItem, MenuItemTone,
+    MenuModel, MenuSection, activity_dot, button_with_icon, divider_with_axis, empty_state,
+    icon_button,
 };
 use fx_design::icon::Icon;
 use fx_design::styled::{FxRefinement, FxStyled, px_len};
-use fx_design::theme::{Colors, Layout, Radii, Spacing, global};
+use fx_design::theme::{BorderWidth, Colors, IconSize, Layout, Radii, Spacing, TextRole, global};
 use gpui::prelude::*;
 use gpui::{AnyElement, App, Entity, Rgba, SharedString, Window, div, px};
 use uuid::Uuid;
@@ -15,11 +16,11 @@ use uuid::Uuid;
 use crate::state::AppState;
 
 /// Height of a project row.
-const PROJECT_ROW_HEIGHT: f32 = 30.0;
+const PROJECT_ROW_HEIGHT: f32 = Layout::SIDEBAR_ROW_HEIGHT;
 /// Height of a thread row.
-const THREAD_ROW_HEIGHT: f32 = 26.0;
+const THREAD_ROW_HEIGHT: f32 = Layout::SIDEBAR_ROW_HEIGHT;
 /// Height of the sidebar's own header.
-const SIDEBAR_HEADER_HEIGHT: f32 = 36.0;
+const SIDEBAR_HEADER_HEIGHT: f32 = Layout::PANE_HEADER_HEIGHT;
 
 /// A fill that paints nothing, so a row can have a background or not.
 fn no_fill() -> Rgba {
@@ -50,7 +51,7 @@ pub fn view(state: Entity<AppState>, _window: &mut Window, cx: &mut App) -> AnyE
         .flex()
         .flex_col()
         .bg(Colors::bg_elevated(&theme))
-        .border_r_1()
+        .border_r(px_len(BorderWidth::HAIRLINE))
         .border_color(Colors::border_subtle(&theme))
         .child(header(state.clone(), cx))
         .child(divider_with_axis(DividerAxis::Horizontal))
@@ -73,8 +74,8 @@ fn header(state: Entity<AppState>, _cx: &mut App) -> AnyElement {
                 .flex_1()
                 .min_w_0()
                 .whitespace_nowrap()
-                .fx_overline()
-                .text_color(Colors::fg_tertiary(&theme))
+                .fx_role(TextRole::CaptionMedium)
+                .text_color(Colors::fg_secondary(&theme))
                 .child(SharedString::from("Projects")),
         )
         .child(icon_button(
@@ -86,7 +87,7 @@ fn header(state: Entity<AppState>, _cx: &mut App) -> AnyElement {
             },
         ))
         .child(icon_button(
-            IconButtonProps::new(Icon::ELLIPSIS_CIRCLE, "App menu")
+            IconButtonProps::new(Icon::GEARSHAPE, "Workspace actions")
                 .small()
                 .ghost(),
             move |event, _window, cx| {
@@ -109,6 +110,9 @@ fn body(state: Entity<AppState>, cx: &mut App) -> AnyElement {
         return div()
             .flex_1()
             .min_h_0()
+            .flex()
+            .flex_col()
+            .items_center()
             .p(px_len(Spacing::LG))
             .child(empty_state(
                 Icon::FOLDER.render(
@@ -118,6 +122,13 @@ fn body(state: Entity<AppState>, cx: &mut App) -> AnyElement {
                 ),
                 "No projects yet",
                 "Add a folder to keep its threads together.",
+            ))
+            .child(button_with_icon(
+                "Add project",
+                Some(Icon::PLUS),
+                ButtonStyle::Secondary,
+                true,
+                move |_, window, cx| crate::state::open_project_picker(state.clone(), window, cx),
             ))
             .into_any_element();
     }
@@ -131,24 +142,36 @@ fn body(state: Entity<AppState>, cx: &mut App) -> AnyElement {
         // element needs an id before it can scroll.
         .id("sidebar.projects")
         .overflow_y_scroll()
-        .py(px_len(Spacing::XXS));
+        .p(px_len(Spacing::SM))
+        .gap(px_len(Spacing::SM));
     for record in &snapshot.projects {
         let Some(project) = record.project.as_ref() else {
             continue;
         };
         let id = project.id;
         let selected = Some(id) == snapshot.active_project_id;
-        list = list.child(project_row(
-            state.clone(),
-            id,
-            project.clone(),
-            selected,
-            record.is_expanded,
-            cx,
-        ));
-        if selected && record.is_expanded {
-            list = list.child(threads(&state, id, snapshot.active_agent_id, cx));
+        let mut group = div()
+            .flex()
+            .flex_col()
+            .gap(px_len(Spacing::XXXS))
+            .child(project_row(
+                state.clone(),
+                id,
+                project.clone(),
+                selected,
+                record.is_expanded,
+                cx,
+            ));
+        if record.is_expanded {
+            let agents = project
+                .agent_order
+                .iter()
+                .filter_map(|id| record.agents.iter().find(|agent| agent.id == *id))
+                .cloned()
+                .collect();
+            group = group.child(threads(&state, id, agents, snapshot.active_agent_id, cx));
         }
+        list = list.child(group);
     }
     list.into_any_element()
 }
@@ -177,14 +200,11 @@ fn project_row(
         .flex_shrink_0()
         .flex()
         .items_center()
-        .gap(px_len(Spacing::SM))
-        .px(px_len(Spacing::MD))
+        .gap(px_len(Spacing::XXS))
+        .pl(px_len(Spacing::XS))
+        .pr(px_len(Spacing::XXXS))
         .cursor_pointer()
-        .bg(if selected {
-            Colors::bg_selected(&theme)
-        } else {
-            no_fill()
-        })
+        .rounded(px_len(Radii::SM))
         .hover(|s| s.fx_background(Colors::bg_hover(&theme)))
         .on_click({
             let state = state.clone();
@@ -207,13 +227,22 @@ fn project_row(
         })
         .child(
             div()
-                .w(px(12.0))
+                .w(px_len(Spacing::LG))
                 .flex_shrink_0()
                 .flex()
                 .justify_center()
-                .fx_caption()
-                .text_color(Colors::fg_tertiary(&theme))
-                .child(SharedString::from(if expanded { "▾" } else { "▸" })),
+                .child(
+                    if expanded {
+                        Icon::CHEVRON_DOWN
+                    } else {
+                        Icon::CHEVRON_RIGHT
+                    }
+                    .render(
+                        IconSize::Micro,
+                        Colors::fg_tertiary(&theme),
+                        &theme,
+                    ),
+                ),
         )
         .child(
             div()
@@ -222,7 +251,7 @@ fn project_row(
                 .overflow_hidden()
                 .whitespace_nowrap()
                 .text_ellipsis()
-                .fx_body()
+                .fx_role(TextRole::CaptionMedium)
                 .text_color(if selected {
                     Colors::fg(&theme)
                 } else {
@@ -230,6 +259,22 @@ fn project_row(
                 })
                 .child(SharedString::from(label)),
         )
+        .child(icon_button(
+            IconButtonProps::new(Icon::PLUS, "New thread")
+                .tiny()
+                .ghost(),
+            {
+                let state = state.clone();
+                move |_, _, cx| {
+                    cx.stop_propagation();
+                    state.update(cx, |state, cx| {
+                        state.save_all(cx);
+                        state.apply_menu_choice(&format!("project:{id}"), "new-thread");
+                        cx.notify();
+                    });
+                }
+            },
+        ))
         .child(icon_button(
             IconButtonProps::new(Icon::ELLIPSIS_CIRCLE, "Project actions")
                 .tiny()
@@ -252,12 +297,25 @@ fn project_row(
 fn threads(
     state: &Entity<AppState>,
     project_id: Uuid,
+    agents: Vec<Agent>,
     active_agent: Option<Uuid>,
     cx: &mut App,
 ) -> AnyElement {
-    let agents = state.read(cx).active_agents();
-
-    let mut column = div().flex().flex_col().pb(px_len(Spacing::XXS));
+    let mut column = div()
+        .flex()
+        .flex_col()
+        .gap(px_len(Spacing::XXXS))
+        .pb(px_len(Spacing::XXS));
+    if agents.is_empty() {
+        column = column.child(
+            div()
+                .pl(px_len(Spacing::XXL))
+                .py(px_len(Spacing::SM))
+                .fx_caption()
+                .text_color(Colors::fg_tertiary(&global::current()))
+                .child("No threads yet"),
+        );
+    }
     for agent in agents {
         column = column.child(thread_row(
             state.clone(),
@@ -275,24 +333,26 @@ fn thread_row(
     project_id: Uuid,
     agent: Agent,
     selected: bool,
-    _cx: &mut App,
+    cx: &mut App,
 ) -> AnyElement {
     let theme = global::current();
     let agent_id = agent.id;
     let title = thread_title(&agent);
     let mode = agent.configuration.resolved_mode();
+    let busy = state.read(cx).runners.contains_key(&agent_id);
 
     div()
         .id(SharedString::from(format!("thread:{agent_id}")))
         .h(px(THREAD_ROW_HEIGHT))
+        .flex_shrink_0()
         .flex()
         .items_center()
         .gap(px_len(Spacing::SM))
         // Past the project row's disclosure triangle and gutter.
-        .pl(px_len(Spacing::XXL))
+        .pl(px_len(Spacing::SM))
         .pr(px_len(Spacing::SM))
         .cursor_pointer()
-        .rounded(px_len(Radii::XS))
+        .rounded(px_len(Radii::SM))
         .bg(if selected {
             Colors::bg_selected(&theme)
         } else {
@@ -301,12 +361,26 @@ fn thread_row(
         .hover(|s| s.fx_background(Colors::bg_hover(&theme)))
         .on_click(move |_, _window, cx| {
             state.update(cx, |state, cx| {
+                state.select_project(project_id);
                 state.select_agent(agent_id);
                 // Read the transcript on first selection rather than at launch.
                 state.conversation(project_id, agent_id);
                 cx.notify();
             });
         })
+        .child(activity_dot(
+            if busy || selected {
+                Colors::accent(&theme)
+            } else {
+                Colors::fg_tertiary(&theme)
+            },
+            if busy {
+                ActivityState::Running
+            } else {
+                ActivityState::Idle
+            },
+            0.0,
+        ))
         .child(
             div()
                 .flex_1()
@@ -350,7 +424,6 @@ fn project_menu(name: &str) -> MenuModel {
             vec![
                 MenuItem::new("new-thread", "New thread"),
                 MenuItem::new("reveal", "Reveal in Finder").subtitle(name),
-                MenuItem::new("rename", "Rename…").enabled(false),
             ],
         ),
         MenuSection::new(

@@ -1,9 +1,8 @@
 //! The sheet that turns a typed folder path into a project.
 //!
-//! This is the modal behind "Add project". It exists because the sidebar's
-//! affordance had to stay disabled for want of *any* way to name a folder, and
-//! a native folder picker is a phase-2 decision (see the browser split in
-//! AGENTS.md). Until then a path field is the whole feature.
+//! The modal behind "Add project" accepts a typed path or a folder chosen in
+//! the native directory picker. Both go through the same validation and leave
+//! the final Add action to the reader.
 //!
 //! # Two halves, deliberately separated
 //!
@@ -26,7 +25,9 @@
 use std::path::{Path, PathBuf};
 
 use fx_design::components::surface::banner;
-use fx_design::components::{BadgeTone, ButtonStyle, badge, button, panel};
+use fx_design::components::{
+    BadgeTone, ButtonStyle, IconButtonProps, badge, button, divider, icon_button, panel,
+};
 use fx_design::icon::Icon;
 use fx_design::styled::{FxStyled, px_len};
 use fx_design::theme::{Colors, IconSize, Layout, Shadow, Spacing, TextRole, Theme, global};
@@ -201,6 +202,8 @@ pub struct ProjectPicker {
     checked: String,
     /// The last verdict, or `None` while the field holds nothing to judge.
     verdict: Option<Result<ProjectCandidate, PickerError>>,
+    browsing: bool,
+    browse_error: Option<String>,
     /// Set once either callback has fired.
     ///
     /// Without it a Return that lands just before the sheet is unmounted adds
@@ -236,6 +239,8 @@ impl ProjectPicker {
                 on_cancel,
                 checked: String::new(),
                 verdict: None,
+                browsing: false,
+                browse_error: None,
                 settled: false,
                 _observation: None,
             };
@@ -288,12 +293,65 @@ impl ProjectPicker {
         if raw == self.checked {
             return;
         }
+        self.browse_error = None;
         self.checked = raw;
         self.verdict = if self.checked.trim().is_empty() {
             None
         } else {
             Some(validate_project_path(&self.checked))
         };
+        cx.notify();
+    }
+
+    fn browse(&mut self, cx: &mut Context<Self>) {
+        if self.browsing || self.settled {
+            return;
+        }
+        self.browsing = true;
+        self.browse_error = None;
+        let response = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Choose project folder".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let result = response
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result.map_err(|error| error.to_string()));
+            let _ = this.update(cx, |picker, cx| picker.finish_browse(result, cx));
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn finish_browse(
+        &mut self,
+        result: Result<Option<Vec<PathBuf>>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.browsing = false;
+        if self.settled {
+            return;
+        }
+        match result {
+            Ok(Some(paths)) => {
+                if let Some(path) = paths.into_iter().next() {
+                    if let Some(path) = path.to_str() {
+                        self.field.update(cx, |field, cx| field.set_value(path, cx));
+                        self.revalidate(cx);
+                    } else {
+                        self.browse_error =
+                            Some("This folder has a name FlowX cannot display.".into());
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.browse_error = Some(format!("Could not open the folder picker: {error}"))
+            }
+        }
         cx.notify();
     }
 
@@ -323,7 +381,7 @@ impl ProjectPicker {
 }
 
 impl Render for ProjectPicker {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = global::current();
         let this = cx.entity();
 
@@ -364,9 +422,18 @@ impl Render for ProjectPicker {
             .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
                 cx.stop_propagation();
             })
-            .child(panel(self.body(&theme, &this)));
+            .child(panel(
+                self.body(
+                    &theme,
+                    &this,
+                    (window.viewport_size().height - px(Spacing::HUGE * 4.0))
+                        .max(px(Spacing::HUGE * 2.0)),
+                ),
+            ));
 
         div()
+            .id("project-picker-overlay")
+            .occlude()
             .absolute()
             .size_full()
             .child(backdrop)
@@ -384,27 +451,18 @@ impl Render for ProjectPicker {
                     .capture_key_down({
                         let this = this.clone();
                         move |event: &KeyDownEvent, window, cx| {
-                            if event.keystroke.key != "enter" || !this.read(cx).can_add() {
+                            let cancel = event.keystroke.key == "escape";
+                            let confirm = event.keystroke.key == "enter" && this.read(cx).can_add();
+                            if !cancel && !confirm {
                                 return;
                             }
                             cx.stop_propagation();
                             this.update(cx, |picker, cx| {
-                                picker.confirm(window, cx);
-                                cx.notify();
-                            });
-                        }
-                    })
-                    // Escape is not an editing key, so the field leaves it
-                    // alone and it arrives here on the way up.
-                    .on_key_down({
-                        let this = this.clone();
-                        move |event: &KeyDownEvent, window, cx| {
-                            if event.keystroke.key != "escape" {
-                                return;
-                            }
-                            cx.stop_propagation();
-                            this.update(cx, |picker, cx| {
-                                picker.cancel(window, cx);
+                                if cancel {
+                                    picker.cancel(window, cx);
+                                } else {
+                                    picker.confirm(window, cx);
+                                }
                                 cx.notify();
                             });
                         }
@@ -418,34 +476,114 @@ impl Render for ProjectPicker {
 impl ProjectPicker {
     /// The panel's contents: what is being asked for, the field, the verdict,
     /// and the two ways out.
-    fn body(&self, theme: &Theme, this: &Entity<ProjectPicker>) -> impl IntoElement {
+    fn body(
+        &self,
+        theme: &Theme,
+        this: &Entity<ProjectPicker>,
+        max_body_height: gpui::Pixels,
+    ) -> impl IntoElement {
         let for_cancel = this.clone();
         let for_add = this.clone();
+        let for_close = this.clone();
+        let for_browse = this.clone();
 
         div()
+            .w_full()
             .flex()
             .flex_col()
-            .gap(px_len(Spacing::MD))
-            .p(px_len(Spacing::LG))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px_len(Spacing::XXS))
-                    .child(div().fx_title2().child(SharedString::from("Add project")))
-                    .child(div().fx_caption().child(SharedString::from(
-                        "The folder that holds the code. Its threads, transcripts and diffs live here.",
-                    ))),
-            )
-            .child(div().w_full().flex().child(self.field.clone()))
-            .child(self.verdict_row(theme))
             .child(
                 div()
                     .w_full()
                     .flex()
-                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px_len(Spacing::MD))
+                    .px(px_len(Spacing::XXL))
+                    .py(px_len(Spacing::XL))
+                    .flex_shrink_0()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px_len(Spacing::XXS))
+                            .child(div().fx_title2().child("Add project"))
+                            .child(
+                                div()
+                                    .fx_caption()
+                                    .text_color(Colors::fg_secondary(theme))
+                                    .child("Choose a local folder for this project."),
+                            ),
+                    )
+                    .child(icon_button(
+                        IconButtonProps::new(Icon::XMARK, "Close project picker"),
+                        move |_, window, cx| {
+                            for_close.update(cx, |picker, cx| {
+                                picker.cancel(window, cx);
+                                cx.notify();
+                            });
+                        },
+                    )),
+            )
+            .child(divider())
+            .child(
+                div()
+                    .id("project-picker-content")
+                    .w_full()
+                    .min_h_0()
+                    .max_h(max_body_height)
+                    .overflow_y_scroll()
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_col()
+                            .gap(px_len(Spacing::MD))
+                            .p(px_len(Spacing::XXL))
+                            .child(div().fx_body_medium().child("Folder path"))
+                            .child(
+                                div()
+                                    .w_full()
+                                    .min_w_0()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px_len(Spacing::SM))
+                                    .child(div().flex_1().min_w_0().child(self.field.clone()))
+                                    .child(button(
+                                        "Browse…",
+                                        ButtonStyle::Secondary,
+                                        !self.browsing,
+                                        move |_, _, cx| for_browse.update(cx, |picker, cx| picker.browse(cx)),
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .fx_caption()
+                                    .text_color(Colors::fg_secondary(theme))
+                                    .child("Browse for a folder or enter its full path. Git repositories are detected automatically."),
+                            )
+                            .when_some(self.browse_error.as_ref(), |body, error| {
+                                body.child(banner(
+                                    Colors::error_muted(theme),
+                                    Colors::fg(theme),
+                                    div().fx_caption().child(SharedString::from(error.clone())),
+                                ))
+                            })
+                            .child(self.verdict_row(theme)),
+                    ),
+            )
+            .child(divider())
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
                     .justify_end()
                     .gap(px_len(Spacing::SM))
+                    .px(px_len(Spacing::XXL))
+                    .py(px_len(Spacing::LG))
+                    .flex_shrink_0()
                     .child(button(
                         "Cancel",
                         ButtonStyle::Secondary,
@@ -898,6 +1036,64 @@ mod tests {
 
         assert!(mounted.can_add());
         assert_eq!(mounted.shown_error(), None);
+    }
+
+    #[test]
+    fn browsing_selects_and_validates_a_folder_without_adding_it() {
+        let temp = tempfile::tempdir().expect("a project folder");
+        let mut mounted = mount();
+        mounted.picker.update(&mut mounted.test, |picker, cx| {
+            picker.browsing = true;
+            picker.finish_browse(Ok(Some(vec![temp.path().to_path_buf()])), cx);
+            assert!(!picker.browsing);
+            assert_eq!(picker.field.read(cx).value(), temp.path().to_str().unwrap());
+        });
+        mounted.test.refresh().unwrap();
+        assert!(mounted.can_add());
+        assert_eq!(mounted.shown_error(), None);
+        assert!(
+            mounted.added().is_empty(),
+            "Browse must preserve Add confirmation"
+        );
+        mounted.press("enter");
+        assert_eq!(
+            mounted.added(),
+            vec![resolved(temp.path()).to_string_lossy().into_owned()]
+        );
+    }
+
+    #[test]
+    fn cancelling_native_browse_preserves_the_typed_path_and_validation() {
+        let temp = tempfile::tempdir().expect("a project folder");
+        let mut mounted = mount();
+        mounted.type_into(temp.path().to_str().unwrap());
+        mounted.picker.update(&mut mounted.test, |picker, cx| {
+            picker.browsing = true;
+            picker.finish_browse(Ok(None), cx);
+            assert!(!picker.browsing);
+            assert_eq!(picker.field.read(cx).value(), temp.path().to_str().unwrap());
+        });
+        assert!(mounted.can_add());
+        assert_eq!(mounted.shown_error(), None);
+        assert!(mounted.added().is_empty());
+        assert_eq!(
+            mounted.cancelled(),
+            0,
+            "canceling Browse must leave Add project open"
+        );
+    }
+
+    #[test]
+    fn a_late_native_choice_cannot_change_a_closed_project_dialog() {
+        let mut mounted = mount();
+        mounted.type_into("/existing-draft");
+        mounted.press("escape");
+        mounted.picker.update(&mut mounted.test, |picker, cx| {
+            picker.finish_browse(Ok(Some(vec![PathBuf::from("/new-choice")])), cx);
+            assert_eq!(picker.field.read(cx).value(), "/existing-draft");
+        });
+        assert_eq!(mounted.cancelled(), 1);
+        assert!(mounted.added().is_empty());
     }
 
     #[test]

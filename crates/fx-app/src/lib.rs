@@ -30,7 +30,7 @@ use fx_core::Agent;
 use fx_design::components::{MenuItem, MenuLayer, MenuModel, MenuSection};
 use fx_design::icon::Icon;
 use fx_design::styled::{FxStyled, px_len};
-use fx_design::theme::{Colors, Layout, Spacing, TextRole, global};
+use fx_design::theme::{Colors, Layout, Spacing, global};
 use gpui::AnyView;
 use gpui::prelude::*;
 use gpui::{
@@ -77,6 +77,7 @@ pub struct FlowX {
     autosave: Option<gpui::Task<()>>,
     focus: Option<gpui::FocusHandle>,
     focused_thread: Option<uuid::Uuid>,
+    resizing_inspector: bool,
 }
 
 impl FlowX {
@@ -90,6 +91,7 @@ impl FlowX {
             autosave: None,
             focus: None,
             focused_thread: None,
+            resizing_inspector: false,
         }
     }
 
@@ -215,6 +217,36 @@ impl Render for FlowX {
             // and only the root can afford to see every click.
             .id("flowx.root")
             .track_focus(self.focus.as_ref().expect("workspace focus"))
+            .on_mouse_move(
+                cx.listener(|this, event: &gpui::MouseMoveEvent, window, cx| {
+                    if !this.resizing_inspector {
+                        return;
+                    }
+                    if event.pressed_button != Some(MouseButton::Left) {
+                        this.resizing_inspector = false;
+                        this.state.update(cx, |state, _| state.save());
+                        return;
+                    }
+                    let requested = f32::from(window.viewport_size().width - event.position.x);
+                    this.state.update(cx, |state, cx| {
+                        state.set_right_panel_width(visible_inspector_width(
+                            window.viewport_size().width.into(),
+                            state.sidebar_visible,
+                            requested,
+                        ));
+                        cx.notify();
+                    });
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.resizing_inspector {
+                        this.resizing_inspector = false;
+                        this.state.update(cx, |state, _| state.save());
+                    }
+                }),
+            )
             .on_action(|_: &ShowSettings, window, cx| {
                 if let Some(handle) = AppHandle::get(cx) {
                     workspace_ui::open_settings(handle.0, window, cx);
@@ -289,7 +321,7 @@ impl Render for FlowX {
                             .min_h_0()
                             .child(sidebar::view(self.state.clone(), window, cx))
                             .child(center_column(self.state.clone(), window, cx))
-                            .child(inspector::view(self.state.clone(), cx)),
+                            .child(inspector_column(self.state.clone(), window, cx)),
                     ),
             )
             // Above everything, so an open menu is never clipped by the
@@ -324,29 +356,32 @@ impl Render for FlowX {
 /// first control underneath them.
 fn title_bar(state: Entity<AppState>, cx: &mut Context<FlowX>) -> AnyElement {
     let theme = global::current();
-    let (sidebar_visible, show_inspector) = {
-        let state = state.read(cx);
-        (state.sidebar_visible, state.snapshot.right_panel_visible)
-    };
-    // One handle per closure: both toggles are `move` closures, so sharing one
-    // would hand it to whichever ran first.
+    let snapshot = state.read(cx);
+    let sidebar_visible = snapshot.sidebar_visible;
+    let show_inspector = snapshot.snapshot.right_panel_visible;
+    let title = snapshot.active_thread_title();
+    let project = snapshot
+        .active_project()
+        .map(|project| project.name.clone());
+    let has_project = project.is_some();
+    let busy = snapshot.is_busy();
     let for_sidebar = state.clone();
     let for_inspector = state.clone();
+    let for_new = state.clone();
 
     div()
         .h(px(Layout::TITLE_BAR_HEIGHT))
         .flex_shrink_0()
         .flex()
         .items_center()
-        .gap(px_len(Spacing::XXS))
+        .gap(px_len(Spacing::SM))
         .pl(px(TRAFFIC_LIGHT_GUTTER))
         .pr(px_len(Spacing::MD))
-        .border_b_1()
+        .border_b(px(fx_design::theme::BorderWidth::HAIRLINE))
         .border_color(Colors::border_subtle(&theme))
-        .bg(Colors::bg_elevated(&theme))
+        .bg(Colors::sidebar_bg(&theme))
         .child(fx_design::components::icon_button(
-            fx_design::components::IconButtonProps::new(Icon::SIDEBAR_LEFT, "Toggle sidebar")
-                .small()
+            fx_design::components::IconButtonProps::new(Icon::SIDEBAR_LEFT, "Toggle sidebar · ⌘B")
                 .ghost()
                 .selected(sidebar_visible),
             move |_, _window, cx| {
@@ -359,32 +394,129 @@ fn title_bar(state: Entity<AppState>, cx: &mut Context<FlowX>) -> AnyElement {
         ))
         .child(
             div()
+                .id("workspace.title")
                 .flex_1()
                 .min_w_0()
+                .h_full()
                 .flex()
+                .flex_col()
                 .justify_center()
-                .fx_role(TextRole::Body)
-                .text_color(Colors::fg_secondary(&theme))
-                .child(SharedString::from("FlowX")),
+                .px(px_len(Spacing::SM))
+                .on_mouse_down(MouseButton::Left, |event, window, _| {
+                    if event.click_count == 2 {
+                        window.zoom_window();
+                    } else {
+                        window.start_window_move();
+                    }
+                })
+                .child(
+                    div()
+                        .fx_body_medium()
+                        .text_color(Colors::fg(&theme))
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .child(SharedString::from(title)),
+                )
+                .children(project.map(|name| {
+                    div()
+                        .fx_caption()
+                        .text_color(Colors::fg_secondary(&theme))
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .child(SharedString::from(name))
+                })),
         )
+        .children(busy.then(|| {
+            fx_design::components::activity_dot(
+                Colors::accent(&theme),
+                fx_design::components::ActivityState::Running,
+                0.0,
+            )
+        }))
         .child(fx_design::components::icon_button(
-            fx_design::components::IconButtonProps::new(Icon::SIDEBAR_RIGHT, "Toggle inspector")
-                .small()
+            fx_design::components::IconButtonProps::new(Icon::PLUS, "New conversation · ⌘N")
                 .ghost()
-                .selected(show_inspector),
-            move |_, _window, cx| {
+                .enabled(has_project),
+            move |_, _, cx| {
+                for_new.update(cx, |state, cx| {
+                    state.create_thread();
+                    state.save();
+                    cx.notify();
+                })
+            },
+        ))
+        .child(fx_design::components::icon_button(
+            fx_design::components::IconButtonProps::new(
+                Icon::SIDEBAR_RIGHT,
+                "Files and changes · ⌘G",
+            )
+            .ghost()
+            .selected(show_inspector),
+            move |_, _, cx| {
                 for_inspector.update(cx, |state, cx| {
                     state.toggle_inspector();
                     state.save();
                     cx.notify();
-                });
+                })
             },
         ))
         .into_any_element()
 }
 
+/// Keep a useful conversation column even when restoring a wider inspector.
+fn visible_inspector_width(window_width: f32, sidebar: bool, requested: f32) -> f32 {
+    let sidebar_width = if sidebar { Layout::SIDEBAR_WIDTH } else { 0.0 };
+    let available = (window_width - sidebar_width - Layout::MINIMUM_CONVERSATION_WIDTH).max(0.0);
+    requested
+        .clamp(Layout::RIGHT_PANEL_MIN_WIDTH, Layout::RIGHT_PANEL_MAX_WIDTH)
+        .min(available)
+}
+
+fn inspector_column(
+    state: Entity<AppState>,
+    window: &mut Window,
+    cx: &mut Context<FlowX>,
+) -> AnyElement {
+    let width = if state.read(cx).snapshot.right_panel_visible {
+        visible_inspector_width(
+            window.viewport_size().width.into(),
+            state.read(cx).sidebar_visible,
+            state.read(cx).right_panel_width(),
+        )
+    } else {
+        0.0
+    };
+    div()
+        .relative()
+        .w(px(width))
+        .h_full()
+        .min_w_0()
+        .flex_shrink_0()
+        .overflow_hidden()
+        .child(inspector::view(state, cx))
+        .children((width > 0.0).then(|| {
+            div()
+                .absolute()
+                .left_0()
+                .top_0()
+                .h_full()
+                .w(px(Spacing::XS))
+                .cursor(gpui::CursorStyle::ResizeLeftRight)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.resizing_inspector = true;
+                        cx.stop_propagation();
+                    }),
+                )
+        }))
+        .into_any_element()
+}
+
 /// Left inset reserved for the traffic lights.
-const TRAFFIC_LIGHT_GUTTER: f32 = 72.0;
+const TRAFFIC_LIGHT_GUTTER: f32 = 88.0;
 
 /// The conversation column.
 fn center_column(
@@ -397,7 +529,6 @@ fn center_column(
     // read inside a render.
     let conversation = state.update(cx, |state, _| state.active_conversation());
     let has_thread = conversation.is_some();
-    let title = state.read(cx).active_thread_title();
 
     div()
         .flex_1()
@@ -405,38 +536,7 @@ fn center_column(
         .h_full()
         .flex()
         .flex_col()
-        .bg(Colors::bg(&theme))
-        .child(
-            div()
-                .h(px(CENTER_HEADER_HEIGHT))
-                .flex_shrink_0()
-                .flex()
-                .items_center()
-                .gap(px_len(Spacing::SM))
-                .px(px_len(Spacing::LG))
-                .border_b_1()
-                .border_color(Colors::border_subtle(&theme))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .whitespace_nowrap()
-                        .fx_body_medium()
-                        .text_color(Colors::fg(&theme))
-                        .child(SharedString::from(title)),
-                )
-                .child(fx_design::components::activity_dot(
-                    Colors::accent(&theme),
-                    if state.read(cx).is_busy() {
-                        fx_design::components::ActivityState::Running
-                    } else {
-                        fx_design::components::ActivityState::Idle
-                    },
-                    0.0,
-                )),
-        )
+        .bg(Colors::content_bg(&theme))
         .children(state.read(cx).last_error.clone().map(|error| {
             fx_design::components::surface::banner(
                 Colors::error_muted(&theme),
@@ -476,21 +576,53 @@ fn center_column(
                     .into_any_element(),
             }
         } else {
+            let has_project = state.read(cx).active_project().is_some();
+            let for_action = state.clone();
             div()
                 .flex_1()
                 .min_h_0()
                 .flex()
+                .flex_col()
                 .items_center()
                 .justify_center()
+                .gap(px_len(Spacing::LG))
                 .p(px_len(Spacing::XXL))
                 .child(fx_design::components::empty_state(
-                    Icon::BUBBLE_LEFT_AND_BUBBLE_RIGHT.render(
-                        fx_design::theme::IconSize::Large,
+                    Icon::FOLDER.render(
+                        fx_design::theme::IconSize::Hero,
                         Colors::fg_tertiary(&theme),
                         &theme,
                     ),
-                    "No conversation selected",
-                    "Pick a thread in the sidebar to see its transcript here.",
+                    if has_project {
+                        "Start a conversation"
+                    } else {
+                        "Open your workspace"
+                    },
+                    if has_project {
+                        "Create a conversation to start working with your project."
+                    } else {
+                        "Choose a project folder to chat, explore files, and review changes."
+                    },
+                ))
+                .child(fx_design::components::button(
+                    if has_project {
+                        "New conversation"
+                    } else {
+                        "Open project…"
+                    },
+                    fx_design::components::ButtonStyle::Primary,
+                    true,
+                    move |_, window, cx| {
+                        if has_project {
+                            for_action.update(cx, |state, cx| {
+                                state.create_thread();
+                                state.save();
+                                cx.notify();
+                            });
+                        } else {
+                            state::open_project_picker(for_action.clone(), window, cx);
+                        }
+                    },
                 ))
                 .into_any_element()
         })
@@ -502,8 +634,6 @@ fn center_column(
         ))
         .into_any_element()
 }
-
-const CENTER_HEADER_HEIGHT: f32 = 44.0;
 
 /// The composer, below the transcript.
 fn composer_row(
@@ -576,13 +706,8 @@ fn composer_row(
         _ => {}
     });
 
-    div()
-        .flex_shrink_0()
-        .px(px_len(Spacing::LG))
-        .pb(px_len(Spacing::LG))
-        .child(configuration::bar(&state, cx))
-        .child(composer::view(&field, &mut chrome, window, cx))
-        .into_any_element()
+    let configuration = configuration::bar(&state, cx);
+    composer::view_with_controls(&field, &mut chrome, Some(configuration), window, cx)
 }
 
 /// Send a prompt: record the user's row, then run the turn in the background.
@@ -717,10 +842,11 @@ pub fn open_window(
     cx.open_window(
         WindowOptions {
             window_bounds: Some(bounds),
+            window_min_size: Some(size(px(1000.0), px(640.0))),
             titlebar: Some(TitlebarOptions {
                 title: Some(SharedString::from("FlowX")),
                 appears_transparent: true,
-                traffic_light_position: None,
+                traffic_light_position: Some(gpui::point(px(16.0), px(19.0))),
             }),
             window_background: WindowBackgroundAppearance::Transparent,
             ..Default::default()
@@ -968,6 +1094,27 @@ mod tests {
     }
 
     #[test]
+    fn restoring_the_old_inspector_default_adopts_the_compact_layout() {
+        let test = gpui::TestAppContext::single();
+        let (_dir, paths) = fresh_paths();
+        fx_store::Store::new(paths.clone())
+            .save_app(&PersistedApp {
+                right_panel_width: 760.0,
+                min_right_panel_width: 560.0,
+                max_right_panel_width: 1100.0,
+                ..Default::default()
+            })
+            .unwrap();
+        let state = test.update(|cx| cx.new(|cx| AppState::restore(paths, cx)));
+        test.read(|cx| {
+            assert_eq!(
+                state.read(cx).right_panel_width(),
+                Layout::RIGHT_PANEL_DEFAULT_WIDTH
+            );
+        });
+    }
+
+    #[test]
     fn a_restored_project_reports_its_threads_in_saved_order() {
         let test = gpui::TestAppContext::single();
         let (_dir, state) = test.update(seeded);
@@ -1128,10 +1275,26 @@ mod tests {
 
     #[test]
     fn the_default_window_fits_the_sidebar_the_inspector_and_a_centre() {
-        // Sidebar 260 + inspector 760 leaves 260 for the conversation at 1280.
-        // A constant, so it fails to compile rather than failing a test: this is
-        // a statement about the metrics, not about any behaviour.
-        const { assert!(Layout::SIDEBAR_WIDTH + Layout::RIGHT_PANEL_DEFAULT_WIDTH + 240.0 <= 1280.0) };
+        const {
+            assert!(
+                Layout::SIDEBAR_WIDTH
+                    + Layout::RIGHT_PANEL_DEFAULT_WIDTH
+                    + Layout::MINIMUM_CONVERSATION_WIDTH
+                    <= 1280.0
+            )
+        };
+    }
+
+    #[test]
+    fn inspector_preserves_the_conversation_when_the_window_shrinks() {
+        for sidebar in [true, false] {
+            for width in [1000.0, 1280.0, 1920.0] {
+                let panel = visible_inspector_width(width, sidebar, 1100.0);
+                let reserved = if sidebar { Layout::SIDEBAR_WIDTH } else { 0.0 };
+                assert!(width - reserved - panel >= Layout::MINIMUM_CONVERSATION_WIDTH);
+                assert!(panel <= Layout::RIGHT_PANEL_MAX_WIDTH);
+            }
+        }
     }
 
     /// Paints a transcript through the real render path.

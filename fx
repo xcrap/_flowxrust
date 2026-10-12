@@ -7,8 +7,8 @@
 
 set -euo pipefail
 
-BUNDLE_ID="com.flowx.app"
-DEV_BUNDLE_ID="com.flowx.app.dev"
+BUNDLE_ID="com.flowx.rust"
+DEV_BUNDLE_ID="com.flowx.rust.dev"
 CONFIG="${FX_CONFIG:-debug}"
 
 case "$CONFIG" in

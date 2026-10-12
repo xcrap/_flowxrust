@@ -884,6 +884,9 @@ impl Colors {
         Self::bg_elevated(t)
     }
     pub fn content_bg(t: &Theme) -> Rgba {
+        Self::bg(t)
+    }
+    pub fn composer_bg(t: &Theme) -> Rgba {
         Self::bg_elevated(t)
     }
     pub fn panel_bg(t: &Theme) -> Rgba {

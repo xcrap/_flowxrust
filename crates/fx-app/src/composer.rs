@@ -294,15 +294,24 @@ pub fn view(
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
+    view_with_controls(field, chrome, None, window, cx)
+}
+
+/// The app supplies its thread configuration inside the same input surface.
+pub fn view_with_controls(
+    field: &Entity<TextField>,
+    chrome: &mut ComposerChrome,
+    configuration: Option<AnyElement>,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
     let theme = global::current();
     // Two decisions taken outside the element tree: whether Send would do
     // anything, and whether the field has focus. Both are reads of the field,
     // and a view that re-read them per draw would answer with a different
     // answer on either side of a keystroke.
     let can_send = chrome.can_send(field.read(cx).value());
-    // The only reason `window` is here. The field draws its own accent edge when
-    // focused, so the card strengthens its *neutral* edge rather than going
-    // accent too — two accent lines round one field read as two things.
+    // The outer card owns focus styling for the app's borderless input.
     let focused = field.read(cx).focus_handle().is_focused(window);
 
     div()
@@ -320,10 +329,23 @@ pub fn view(
                 // On the transcript's measure, so the card lines up with the
                 // rows above it rather than running the width of the window.
                 .max_w(px(Layout::READABLE_CONTENT_WIDTH))
-                .px(px_len(Spacing::XXL))
+                .px(px_len(Spacing::LG))
                 .pt(px_len(Spacing::SM))
-                .pb(px_len(Spacing::XXL))
-                .child(composer_card(field, chrome, focused, can_send)),
+                .pb(px_len(Spacing::MD))
+                .child(composer_card(
+                    field,
+                    chrome,
+                    focused,
+                    can_send,
+                    configuration,
+                ))
+                .child(
+                    div()
+                        .pt(px_len(Spacing::SM))
+                        .fx_caption()
+                        .text_color(Colors::fg_tertiary(&theme))
+                        .child("⌘ Return to send · Return for a new line"),
+                ),
         )
         .into_any_element()
 }
@@ -334,38 +356,25 @@ fn composer_card(
     chrome: &ComposerChrome,
     focused: bool,
     can_send: bool,
+    configuration: Option<AnyElement>,
 ) -> AnyElement {
     let theme = global::current();
-    // The card's edge tracks the field's focus, in the same neutral token pair
-    // `TextField` uses for its own border: focused is the regular weight, at rest
-    // is the hairline. Strengthening rather than tinting, because the accent
-    // belongs to the field inside it and a second accent line round the same
-    // field reads as two controls.
+    // Keep the input and its controls on one surface with a single focus edge.
     let border = if focused {
         Colors::border(&theme)
     } else {
         Colors::border_subtle(&theme)
     };
-    // Mirrors what the field does with its own fill: a composer that cannot be
-    // typed into reads as part of the page rather than as an input.
     let mut card = div()
         .w_full()
         .flex()
         .flex_col()
         .rounded(px_len(Radii::XL))
-        .bg(if chrome.enabled {
-            Colors::bg_surface(&theme)
-        } else {
-            Colors::bg(&theme)
-        })
-        .border(px_len(if focused {
-            BorderWidth::REGULAR
-        } else {
-            BorderWidth::HAIRLINE
-        }))
+        .bg(Colors::composer_bg(&theme))
+        .border(px_len(BorderWidth::REGULAR))
         .border_color(border)
         .debug_selector(|| CARD_SELECTOR.to_string())
-        .p(px_len(Spacing::SM));
+        .p(px_len(Spacing::MD));
 
     if chrome.has_queued() {
         card = card.child(queued_strip(chrome));
@@ -374,16 +383,22 @@ fn composer_card(
     card.child(
         div()
             .w_full()
-            .pt(px_len(Spacing::XXXS))
+            .px(px_len(Spacing::XXS))
+            .pt(px_len(Spacing::XXS))
+            .min_h(px(Layout::COMPOSER_MIN_HEIGHT + Spacing::LG))
             .pb(px_len(Spacing::SM))
             .child(field.clone().into_any_element()),
     )
-    .child(control_row(chrome, can_send))
+    .child(control_row(chrome, can_send, configuration))
     .into_any_element()
 }
 
 /// The row of controls under the prompt, with the primary action at the end.
-fn control_row(chrome: &ComposerChrome, can_send: bool) -> AnyElement {
+fn control_row(
+    chrome: &ComposerChrome,
+    can_send: bool,
+    configuration: Option<AnyElement>,
+) -> AnyElement {
     let handler = chrome.handler();
     // A picker cannot change anything mid-turn: the provider session it would
     // retarget is already committed to the running one, which is why the
@@ -410,13 +425,19 @@ fn control_row(chrome: &ComposerChrome, can_send: bool) -> AnyElement {
         .flex_wrap()
         .gap(px_len(Spacing::SM));
 
-    controls = controls.child(icon_button(
-        IconButtonProps::new(Icon::PAPERCLIP, "Attach images")
-            .small()
-            .ghost()
-            .enabled(chrome.enabled && chrome.attachments_enabled && handler.is_some()),
-        fire(handler.clone(), ComposerAction::Attach),
-    ));
+    if chrome.attachments_enabled {
+        controls = controls.child(icon_button(
+            IconButtonProps::new(Icon::PAPERCLIP, "Attach images")
+                .small()
+                .ghost()
+                .enabled(chrome.enabled && chrome.attachments_enabled && handler.is_some()),
+            fire(handler.clone(), ComposerAction::Attach),
+        ));
+    }
+
+    if let Some(configuration) = configuration {
+        controls = controls.child(configuration);
+    }
 
     if let Some(model) =
         picker_control(&chrome.model, ComposerPicker::Model, &handler, pickers_live)
@@ -439,7 +460,7 @@ fn control_row(chrome: &ComposerChrome, can_send: bool) -> AnyElement {
         .w_full()
         .flex()
         .flex_row()
-        .items_center()
+        .items_end()
         .gap(px_len(Spacing::SM))
         .child(controls)
         .child(primary_action(chrome, can_send))
@@ -1271,9 +1292,9 @@ mod tests {
         at_width(Layout::READABLE_CONTENT_WIDTH, |card, primary| {
             let inset = f32::from(card.origin.x + card.size.width)
                 - f32::from(primary.origin.x + primary.size.width);
-            // The card's own padding and hairline, and nothing else: any larger
+            // The card's own padding and border, and nothing else: any larger
             // gap means the control is not on this row's trailing edge at all.
-            let expected = Spacing::SM + BorderWidth::HAIRLINE;
+            let expected = Spacing::MD + BorderWidth::REGULAR;
             assert!(
                 (inset - expected).abs() < 1.0,
                 "the primary control sits {inset}pt inside the card, not {expected}pt"

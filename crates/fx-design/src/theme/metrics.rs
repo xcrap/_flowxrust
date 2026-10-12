@@ -141,18 +141,22 @@ pub struct Layout;
 
 impl Layout {
     // Shell
-    pub const TITLE_BAR_HEIGHT: f32 = 44.0;
-    pub const SIDEBAR_WIDTH: f32 = 260.0;
-    pub const SETTINGS_PANEL_WIDTH: f32 = 420.0;
+    pub const TITLE_BAR_HEIGHT: f32 = 52.0;
+    pub const SIDEBAR_WIDTH: f32 = 248.0;
+    pub const SETTINGS_PANEL_WIDTH: f32 = 560.0;
+    pub const CONTROL_HEIGHT: f32 = 30.0;
+    pub const CONTROL_COMPACT_HEIGHT: f32 = 28.0;
+    pub const SIDEBAR_ROW_HEIGHT: f32 = 30.0;
+    pub const PANE_HEADER_HEIGHT: f32 = 44.0;
     pub const COMMAND_PALETTE_WIDTH: f32 = 560.0;
     pub const DIALOG_WIDTH: f32 = 440.0;
     /// Row action menus: context menus and the "…" and "+" dropdowns beside them.
     pub const MENU_WIDTH: f32 = 220.0;
 
     // Right inspector
-    pub const RIGHT_PANEL_DEFAULT_WIDTH: f32 = 760.0;
-    pub const RIGHT_PANEL_MIN_WIDTH: f32 = 560.0;
-    pub const RIGHT_PANEL_MAX_WIDTH: f32 = 1100.0;
+    pub const RIGHT_PANEL_DEFAULT_WIDTH: f32 = 360.0;
+    pub const RIGHT_PANEL_MIN_WIDTH: f32 = 280.0;
+    pub const RIGHT_PANEL_MAX_WIDTH: f32 = 600.0;
 
     // Content and panels
     /// The comfortable measure for a transcript column.
@@ -273,9 +277,9 @@ mod tests {
 
     #[test]
     fn panel_width_clamps_to_the_documented_range() {
-        assert_eq!(Layout::clamp_right_panel_width(10.0), 560.0);
-        assert_eq!(Layout::clamp_right_panel_width(9999.0), 1100.0);
-        assert_eq!(Layout::clamp_right_panel_width(760.0), 760.0);
+        assert_eq!(Layout::clamp_right_panel_width(10.0), 280.0);
+        assert_eq!(Layout::clamp_right_panel_width(9999.0), 600.0);
+        assert_eq!(Layout::clamp_right_panel_width(360.0), 360.0);
     }
 
     #[test]

@@ -124,6 +124,7 @@ pub struct TextField {
     enabled: bool,
     max_len: usize,
     secret: bool,
+    bare: bool,
     /// The caret is drawn only on alternate phases while the field has focus, so
     /// this is the phase rather than a "should I draw" flag.
     caret_on: bool,
@@ -152,6 +153,7 @@ impl TextField {
             enabled: true,
             max_len: 0,
             secret: false,
+            bare: false,
             caret_on: true,
             focused: false,
             dragging: false,
@@ -164,6 +166,12 @@ impl TextField {
     /// The current text.
     pub fn value(&self) -> &str {
         &self.value
+    }
+
+    /// Use the surrounding composer surface instead of drawing another input box.
+    pub fn bare(mut self) -> Self {
+        self.bare = true;
+        self
     }
 
     /// Keep secrets out of painted glyphs and clipboard actions while retaining the original answer.
@@ -468,7 +476,9 @@ impl TextField {
         let style = Typography::style(TextRole::Body, theme);
         // A focused field uses the focused border weight from the token layer, so
         // the caret and the focus ring read as one decision.
-        let border_width = if focused {
+        let border_width = if self.bare {
+            0.0
+        } else if focused {
             BorderWidth::REGULAR
         } else {
             BorderWidth::HAIRLINE
@@ -483,8 +493,16 @@ impl TextField {
             },
             font_size: px(style.size),
             line_height: px(style.size * TextRole::Body.line_height_multiplier()),
-            inset_x: px(FIELD_PADDING_X + border_width),
-            inset_y: px(FIELD_PADDING_Y + border_width),
+            inset_x: px(if self.bare {
+                0.0
+            } else {
+                FIELD_PADDING_X + border_width
+            }),
+            inset_y: px(if self.bare {
+                Spacing::XXS
+            } else {
+                FIELD_PADDING_Y + border_width
+            }),
             wrap: self.multiline.is_some(),
             max_visible_rows: self.multiline.unwrap_or(1.0),
             border_width,
@@ -619,7 +637,7 @@ impl Render for TextField {
 
         // A placeholder is shaped on its own rather than through the layout,
         // because it is not part of the value: no rows, no caret, no selection.
-        let placeholder = if self.value.is_empty() && !focused && !self.placeholder.is_empty() {
+        let placeholder = if self.value.is_empty() && !self.placeholder.is_empty() {
             Some(ShapedText::Single(Box::new(shape_one_line(
                 window,
                 &self.placeholder,
@@ -652,35 +670,39 @@ impl Render for TextField {
         // GPUI lays the border inside the box, so the height the div is given is
         // the text area plus its padding plus its border. Getting this wrong by
         // half a point would clip the bottom of the last line.
-        let outer_height =
-            f32::from(content_height) + (FIELD_PADDING_Y + metrics.border_width) * 2.0;
+        let outer_height = f32::from(content_height + metrics.inset_y * 2.0);
         let element = div()
             .flex()
             .w_full()
             .min_w_0()
-            .px(px_len(FIELD_PADDING_X))
-            .py(px_len(FIELD_PADDING_Y))
+            .px(metrics.inset_x - px(metrics.border_width))
+            .py(metrics.inset_y - px(metrics.border_width))
             .h(px_len(outer_height))
-            .rounded(px_len(Radii::SM))
-            .bg(if self.enabled {
-                Colors::input_bg(&theme)
-            } else {
-                Colors::bg(&theme)
+            .when(!self.bare, |element| {
+                element
+                    .rounded(px_len(Radii::SM))
+                    .bg(if self.enabled {
+                        Colors::input_bg(&theme)
+                    } else {
+                        Colors::bg(&theme)
+                    })
+                    .border(px_len(metrics.border_width))
+                    .border_color(border_color)
             })
-            .border(px_len(metrics.border_width))
-            .border_color(border_color)
             .cursor(if self.enabled {
                 CursorStyle::IBeam
             } else {
                 CursorStyle::Arrow
             })
             .track_focus(&self.focus_handle)
-            .hover(move |style| {
-                if focused {
-                    style
-                } else {
-                    style.fx_border_color(hover_color)
-                }
+            .when(!self.bare, |element| {
+                element.hover(move |style| {
+                    if focused {
+                        style
+                    } else {
+                        style.fx_border_color(hover_color)
+                    }
+                })
             })
             .on_mouse_down(
                 MouseButton::Left,

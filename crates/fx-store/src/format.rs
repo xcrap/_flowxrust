@@ -92,13 +92,13 @@ fn default_true() -> bool {
     true
 }
 fn default_panel_width() -> f32 {
-    760.0
+    360.0
 }
 fn default_min_panel_width() -> f32 {
-    560.0
+    280.0
 }
 fn default_max_panel_width() -> f32 {
-    1100.0
+    600.0
 }
 
 /// Which tab the inspector shows.
@@ -465,11 +465,11 @@ mod tests {
     #[test]
     fn a_valid_geometry_is_left_alone() {
         let mut app = PersistedApp {
-            right_panel_width: 760.0,
+            right_panel_width: 420.0,
             ..Default::default()
         };
         app.normalize();
-        assert_eq!(app.right_panel_width, 760.0);
+        assert_eq!(app.right_panel_width, 420.0);
     }
 
     #[test]

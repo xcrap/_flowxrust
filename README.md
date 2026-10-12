@@ -11,7 +11,10 @@ not complete.** The remaining work is listed below.
 ## Current milestone
 
 - Native three-column workspace with projects, threads, shared menus, keyboard
-  shortcuts, theme controls and correctly embedded SVG icons.
+  shortcuts, theme controls and correctly embedded SVG icons. A single title
+  bar, inset sidebar rows and a resizable inspector preserve room for the chat.
+- Unified composer with inline configuration menus, native SF Rounded and
+  SF Mono typography, compact settings/dialogs and consistent light/dark surfaces.
 - Codex and Claude turns using the user's installed command-line tools, with
   streaming output, cancellation, provider session continuation and independent
   running turns in different threads.
@@ -68,6 +71,9 @@ FX_CONFIG=release ./fx bundle
 
 This produces `target/release/bundle/FlowX.app`. The helper does not sign or
 notarize distribution builds.
+
+The Rust bundles use `com.flowx.rust` and `com.flowx.rust.dev` so macOS can
+distinguish them from the Swift application during development.
 
 Zig and the Ghostty terminal integration are deferred work; the current
 workspace does not require Zig to build.

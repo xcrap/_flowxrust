@@ -111,6 +111,13 @@ impl AppState {
             }
         };
 
+        // Migrate the oversized port default while retaining custom widths.
+        if snapshot.right_panel_width == 760.0 && snapshot.min_right_panel_width == 560.0 {
+            snapshot.right_panel_width = Layout::RIGHT_PANEL_DEFAULT_WIDTH;
+        }
+        snapshot.min_right_panel_width = Layout::RIGHT_PANEL_MIN_WIDTH;
+        snapshot.max_right_panel_width = Layout::RIGHT_PANEL_MAX_WIDTH;
+
         // Falling back to the first project and its first thread means opening
         // the app lands on something rather than on an empty centre column.
         if snapshot.active_project_id.is_none() {
@@ -404,8 +411,9 @@ impl AppState {
             .unwrap_or_default();
         let field = cx.new(|cx| {
             let mut field = TextField::new(cx)
-                .placeholder("Ask anything…")
-                .multiline(140.0)
+                .bare()
+                .placeholder("Ask anything, or describe a task…")
+                .multiline(8.0)
                 .max_len(32_000);
             field.set_value(initial, cx);
             field
@@ -954,6 +962,12 @@ pub fn default_theme() -> Theme {
 /// `Entity<AppState>` to write through, and in GPUI 0.2.2 there is no way to get
 /// the current entity from inside `App`.
 pub fn open_project_picker(state: Entity<AppState>, window: &mut gpui::Window, cx: &mut App) {
+    let menu = state.read(cx).menu_layer.clone();
+    menu.update(cx, |menu, cx| {
+        if menu.dismiss().is_some() {
+            cx.notify();
+        }
+    });
     let for_add = state.clone();
     let for_cancel = state.clone();
     let picker = crate::project_picker::ProjectPicker::open(

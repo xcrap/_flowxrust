@@ -29,7 +29,8 @@ use std::path::{Path, PathBuf};
 use fx_core::services::runtime::{BinaryHealth, BinarySpec, expand_glob};
 use fx_design::components::segmented::{SegmentedOption, segmented_control};
 use fx_design::components::{
-    BadgeTone, ButtonStyle, badge, button, button_with_icon, divider, panel, section_header,
+    BadgeTone, ButtonStyle, IconButtonProps, badge, button, button_with_icon, card, divider,
+    icon_button, panel, section_header, tooltip,
 };
 use fx_design::icon::Icon;
 use fx_design::styled::{FxStyled, px_len};
@@ -588,7 +589,7 @@ impl SettingsSheet {
 }
 
 impl Render for SettingsSheet {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = global::current();
         let this = cx.entity();
 
@@ -629,9 +630,17 @@ impl Render for SettingsSheet {
             .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
                 cx.stop_propagation();
             })
-            .child(panel(self.body(&this)));
+            .child(panel(
+                self.body(
+                    &this,
+                    (window.viewport_size().height - px(Spacing::HUGE * 4.0))
+                        .max(px(Spacing::HUGE * 2.0)),
+                ),
+            ));
 
         div()
+            .id("settings-overlay")
+            .occlude()
             .absolute()
             .size_full()
             .child(backdrop)
@@ -645,7 +654,7 @@ impl Render for SettingsSheet {
                     // `track_focus` and `on_key_down` in GPUI 0.2.2.
                     .id(SHEET_ID)
                     .track_focus(&self.focus)
-                    .on_key_down({
+                    .capture_key_down({
                         let this = this.clone();
                         move |event: &KeyDownEvent, window, cx| {
                             // Return is the dialog's default action here, and
@@ -685,56 +694,98 @@ enum Action {
 }
 
 impl SettingsSheet {
-    /// The panel's contents: what is being asked for, the three sections, and
-    /// the two ways out.
-    fn body(&self, this: &Entity<SettingsSheet>) -> impl IntoElement {
+    /// Fixed header and footer surround the only scrolling region.
+    fn body(
+        &self,
+        this: &Entity<SettingsSheet>,
+        max_body_height: gpui::Pixels,
+    ) -> impl IntoElement {
+        let theme = global::current();
         let for_reset = this.clone();
         let for_done = this.clone();
-        let can_reset = self.can_reset();
-
+        let for_close = this.clone();
         div()
+            .w_full()
             .flex()
             .flex_col()
-            .gap(px_len(Spacing::LG))
-            .p(px_len(Spacing::LG))
             .child(
                 div()
+                    .w_full()
                     .flex()
-                    .flex_col()
-                    .gap(px_len(Spacing::XXS))
-                    .child(div().fx_title2().child(SharedString::from("Settings")))
-                    .child(div().fx_caption().child(SharedString::from(
-                        "The CLIs FlowX drives, and how this window looks.",
-                    ))),
+                    .items_center()
+                    .justify_between()
+                    .gap(px_len(Spacing::MD))
+                    .px(px_len(Spacing::XXL))
+                    .py(px_len(Spacing::XL))
+                    .flex_shrink_0()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px_len(Spacing::XXS))
+                            .child(div().fx_title2().child("Settings"))
+                            .child(
+                                div()
+                                    .fx_caption()
+                                    .text_color(Colors::fg_secondary(&theme))
+                                    .child("Appearance and AI providers"),
+                            ),
+                    )
+                    .child(icon_button(
+                        IconButtonProps::new(Icon::XMARK, "Close settings"),
+                        move |_, window, cx| {
+                            for_close.update(cx, |sheet, cx| {
+                                sheet.dismiss(window, cx);
+                                cx.notify();
+                            });
+                        },
+                    )),
             )
-            .child(self.provider_section(this))
             .child(divider())
-            .child(self.appearance_section(this))
-            .child(divider())
-            .child(self.text_section(this))
+            .child(
+                div()
+                    .id("settings-content")
+                    .w_full()
+                    .min_h_0()
+                    .max_h(max_body_height)
+                    .overflow_y_scroll()
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_col()
+                            .gap(px_len(Spacing::XXL))
+                            .p(px_len(Spacing::XXL))
+                            .child(self.appearance_section(this))
+                            .child(self.provider_section(this)),
+                    ),
+            )
             .child(divider())
             .child(
                 div()
                     .w_full()
                     .flex()
-                    .flex_row()
-                    .justify_between()
                     .items_center()
+                    .justify_between()
+                    .gap(px_len(Spacing::MD))
+                    .px(px_len(Spacing::XXL))
+                    .py(px_len(Spacing::LG))
+                    .flex_shrink_0()
                     .child(button(
-                        "Reset",
-                        ButtonStyle::Secondary,
-                        can_reset,
-                        move |_event, _window, cx| {
+                        "Reset changes",
+                        ButtonStyle::Ghost,
+                        self.can_reset(),
+                        move |_, _, cx| {
                             for_reset.update(cx, |sheet, cx| sheet.reset(cx));
                         },
                     ))
                     .child(button(
                         "Done",
                         ButtonStyle::Primary,
-                        // Always offered. An unchanged draft still has to be a
-                        // way out of the sheet.
                         true,
-                        move |_event, window, cx| {
+                        move |_, window, cx| {
                             for_done.update(cx, |sheet, cx| {
                                 sheet.confirm(window, cx);
                                 cx.notify();
@@ -758,7 +809,7 @@ impl SettingsSheet {
             );
         }
         for row in &self.rows {
-            rows = rows.child(provider_row(row, &theme));
+            rows = rows.child(card(provider_row(row, &theme), Spacing::MD));
         }
 
         div()
@@ -771,9 +822,9 @@ impl SettingsSheet {
                     .flex_row()
                     .items_center()
                     .gap(px_len(Spacing::SM))
-                    .child(div().flex_1().min_w_0().child(section_header("Provider")))
+                    .child(div().flex_1().min_w_0().child(section_header("Providers")))
                     .child(button_with_icon(
-                        "Re-check",
+                        "Check again",
                         Some(Icon::ARROW_CLOCKWISE),
                         ButtonStyle::Ghost,
                         // Never disabled: someone who has just installed a CLI
@@ -791,59 +842,38 @@ impl SettingsSheet {
             .into_any_element()
     }
 
-    /// Base tone, appearance, and accent.
+    /// Appearance choices share one horizontal label/control rhythm.
     fn appearance_section(&self, this: &Entity<SettingsSheet>) -> AnyElement {
-        let tones = tone_choices();
-        let appearances = appearance_choices();
-        let accents = accent_choices();
-
         div()
+            .w_full()
             .flex()
             .flex_col()
             .gap(px_len(Spacing::MD))
             .child(section_header("Appearance"))
             .child(choice_row(
-                "Tone",
-                &tones,
-                &self.draft.base_tone,
-                this,
-                SettingsSheet::set_tone,
-            ))
-            // "Slate" alone tells a reader nothing; the design system's own
-            // one-liner does.
-            .child(
-                div()
-                    .fx_caption()
-                    .child(SharedString::from(self.draft.base_tone.description())),
-            )
-            .child(choice_row(
-                "Appearance",
-                &appearances,
+                "Theme",
+                &appearance_choices(),
                 &self.draft.appearance,
                 this,
                 SettingsSheet::set_appearance,
             ))
             .child(choice_row(
+                "Base color",
+                &tone_choices(),
+                &self.draft.base_tone,
+                this,
+                SettingsSheet::set_tone,
+            ))
+            .child(choice_row(
                 "Accent",
-                &accents,
+                &accent_choices(),
                 &self.draft.accent,
                 this,
                 SettingsSheet::set_accent,
             ))
-            .into_any_element()
-    }
-
-    /// Text size, which is not a colour and so sits in its own section.
-    fn text_section(&self, this: &Entity<SettingsSheet>) -> AnyElement {
-        let sizes = text_size_choices();
-        div()
-            .flex()
-            .flex_col()
-            .gap(px_len(Spacing::MD))
-            .child(section_header("Text"))
             .child(choice_row(
-                "Size",
-                &sizes,
+                "Text size",
+                &text_size_choices(),
                 &self.draft.text_size,
                 this,
                 SettingsSheet::set_text_size,
@@ -854,19 +884,35 @@ impl SettingsSheet {
 
 /// One provider: its name, its badge, where it was found, and what to do.
 fn provider_row(row: &HealthRow, theme: &Theme) -> AnyElement {
-    let mut column = div().flex().flex_col().gap(px_len(Spacing::XXXS)).child(
-        div()
-            .fx_body_medium()
-            .child(SharedString::from(row.title.clone())),
-    );
+    let mut column = div()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap(px_len(Spacing::XXXS))
+        .child(
+            div()
+                .fx_body_medium()
+                .child(SharedString::from(row.title.clone())),
+        );
 
     if let Some(path) = &row.path {
+        let path_selector = format!("provider-path-{}", row.id);
+        let full_path = SharedString::from(path.clone());
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let shown_path = runtime_path_label(path, home.as_deref());
         column = column.child(
             div()
+                .id(SharedString::from(format!("provider-path-{}", row.id)))
+                .debug_selector(move || path_selector.clone())
+                .w_full()
+                .min_w_0()
                 .fx_role(TextRole::MonoSmall)
                 .text_color(Colors::fg_secondary(theme))
-                .truncate()
-                .child(SharedString::from(path.clone())),
+                .whitespace_nowrap()
+                .overflow_hidden()
+                .child(SharedString::from(shown_path))
+                .tooltip(move |window, cx| tooltip(full_path.clone(), window, cx)),
         );
     }
 
@@ -896,6 +942,37 @@ fn provider_row(row: &HealthRow, theme: &Theme) -> AnyElement {
         .into_any_element()
 }
 
+/// Keep path labels stable across GPUI's intrinsic and final width passes.
+/// The tooltip always retains the full path; the row favors the installation
+/// root and the final two components over unhelpful intermediate directories.
+fn runtime_path_label(path: &str, home: Option<&Path>) -> String {
+    const MAX_CHARS: usize = 42;
+    let shown = home
+        .and_then(|home| Path::new(path).strip_prefix(home).ok())
+        .map(|relative| format!("~/{}", relative.display()))
+        .unwrap_or_else(|| path.to_string());
+    if shown.chars().count() <= MAX_CHARS {
+        return shown;
+    }
+    let parts: Vec<_> = shown.split('/').collect();
+    let prefix = parts.iter().take(2).copied().collect::<Vec<_>>().join("/");
+    for keep in [2, 1] {
+        if parts.len() > keep + 2 {
+            let suffix = parts[parts.len() - keep..].join("/");
+            let label = format!("{prefix}/…/{suffix}");
+            if label.chars().count() <= MAX_CHARS {
+                return label;
+            }
+        }
+    }
+    // A single unusually long filename still needs a bounded label. Work in
+    // characters, so shortening a Unicode path never splits a code point.
+    let chars: Vec<_> = shown.chars().collect();
+    let prefix: String = chars.iter().take(12).collect();
+    let suffix: String = chars[chars.len() - (MAX_CHARS - 13)..].iter().collect();
+    format!("{prefix}…{suffix}")
+}
+
 /// A labelled group of exclusive choices.
 ///
 /// `select` is a plain function pointer so one body serves all four groups: the
@@ -917,10 +994,18 @@ fn choice_row<T: Clone + PartialEq + 'static>(
     let for_select = this.clone();
 
     div()
+        .w_full()
         .flex()
-        .flex_col()
-        .gap(px_len(Spacing::XXS))
-        .child(div().fx_caption().child(SharedString::from(label)))
+        .items_center()
+        .justify_between()
+        .gap(px_len(Spacing::MD))
+        .child(
+            div()
+                .flex_shrink_0()
+                .fx_body()
+                .text_color(Colors::fg_secondary(&global::current()))
+                .child(SharedString::from(label)),
+        )
         .child(segmented_control(
             &options,
             selected,
@@ -1842,6 +1927,79 @@ mod tests {
         let rows = mounted.read(|sheet| sheet.rows().to_vec());
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].tone, RowTone::Idle);
+    }
+
+    #[test]
+    fn runtime_paths_keep_readable_width_in_a_narrow_settings_window() {
+        let mut mounted = mount();
+        mounted.choose(|sheet| {
+            sheet.rows = vec![
+                HealthRow {
+                    id: "codex".into(),
+                    title: "Codex".into(),
+                    tone: RowTone::Ok,
+                    badge: "Ready".into(),
+                    detail: "Codex is installed.".into(),
+                    path: Some("/Users/example/.codex/packages/standalone/releases/0.155.1-aarch64-apple-darwin/bin/codex".into()),
+                },
+                HealthRow {
+                    id: "claude".into(),
+                    title: "Claude Code".into(),
+                    tone: RowTone::Ok,
+                    badge: "Ready".into(),
+                    detail: "Claude Code is installed.".into(),
+                    path: Some("/Users/example/.local/share/claude/versions/2.1.283".into()),
+                },
+            ];
+        });
+        let mut visual = VisualTestContext::from_window(mounted.window, &mounted.test);
+        visual.simulate_resize(gpui::size(px(1_000.0), px(640.0)));
+        mounted
+            .test
+            .refresh()
+            .expect("the narrow settings sheet painted");
+        for selector in ["provider-path-codex", "provider-path-claude"] {
+            let bounds = visual
+                .debug_bounds(selector)
+                .expect("runtime path measured");
+            assert!(
+                bounds.size.width > px(100.0),
+                "{selector} collapsed to {bounds:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_path_labels_preserve_the_install_root_and_executable() {
+        assert_eq!(
+            runtime_path_label(
+                "/Users/example/.codex/packages/standalone/releases/0.155.1-aarch64-apple-darwin/bin/codex",
+                Some(Path::new("/Users/example")),
+            ),
+            "~/.codex/…/bin/codex",
+        );
+        assert_eq!(
+            runtime_path_label("/opt/homebrew/bin/codex", None),
+            "/opt/homebrew/bin/codex",
+        );
+        assert_eq!(
+            runtime_path_label(
+                "/Users/example2/bin/codex",
+                Some(Path::new("/Users/example"))
+            ),
+            "/Users/example2/bin/codex",
+            "a different home must not be abbreviated",
+        );
+    }
+
+    #[test]
+    fn runtime_path_labels_bound_long_unicode_filenames_without_splitting_them() {
+        let path = format!("/Users/example/.local/{}-codex", "工具".repeat(30));
+        let label = runtime_path_label(&path, Some(Path::new("/Users/example")));
+        assert!(label.chars().count() <= 42);
+        assert!(label.starts_with("~/.local/"));
+        assert!(label.contains('…'));
+        assert!(label.ends_with("-codex"));
     }
 
     #[test]

@@ -1,6 +1,9 @@
 //! Native layout regressions for layered design-system controls.
 
-use fx_design::components::{ActivityState, activity_dot, context_ring_icon};
+use fx_design::components::{
+    ActivityState, ButtonStyle, MenuItem, MenuModel, MenuSection, activity_dot, button_with_icon,
+    context_ring_icon, menu_surface,
+};
 use fx_design::icon::Icon;
 use fx_design::theme::{Colors, IconSize, Typography, global};
 use gpui::prelude::*;
@@ -64,4 +67,65 @@ fn activity_ring_and_identity_dot_overlay_instead_of_becoming_neighbors() {
     assert_eq!(dot.size, gpui::size(px(7.0), px(7.0)));
     assert_eq!(ring.center(), outer.center());
     assert_eq!(dot.center(), outer.center());
+}
+
+struct RecheckProbe;
+
+impl Render for RecheckProbe {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().flex().items_start().child(button_with_icon(
+            "Re-check",
+            Some(Icon::ARROW_CLOCKWISE),
+            ButtonStyle::Secondary,
+            true,
+            |_, _, _| {},
+        ))
+    }
+}
+
+#[test]
+fn labelled_controls_keep_icon_and_label_in_one_compact_row() {
+    let mut test = gpui::TestAppContext::single();
+    let window = test.add_window(|_, _| RecheckProbe);
+    test.refresh().unwrap();
+    let mut visual = gpui::VisualTestContext::from_window(window.into(), &test);
+    let button = visual.debug_bounds("button-content").unwrap();
+    let icon = visual.debug_bounds("button-icon").unwrap();
+    let label = visual.debug_bounds("button-label").unwrap();
+    assert!(
+        button.size.height >= px(28.0) && button.size.height <= px(32.0),
+        "{button:?}"
+    );
+    assert_eq!(icon.center().y, label.center().y);
+    assert!(icon.right() < label.left());
+    assert!(label.right() < button.right());
+}
+
+struct MenuProbe;
+
+impl Render for MenuProbe {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        menu_surface(
+            &MenuModel::new(vec![MenuSection::new(
+                "choices",
+                vec![MenuItem::new("one", "Supervised").subtitle("Ask before making changes")],
+            )]),
+            |_, _, _, _| {},
+            |_, _, _| {},
+        )
+    }
+}
+
+#[test]
+fn menu_rows_grow_to_fit_their_supporting_label() {
+    let mut test = gpui::TestAppContext::single();
+    let window = test.add_window(|_, _| MenuProbe);
+    test.refresh().unwrap();
+    let mut visual = gpui::VisualTestContext::from_window(window.into(), &test);
+    let row = visual.debug_bounds("menu-row").unwrap();
+    let title = visual.debug_bounds("menu-title").unwrap();
+    let subtitle = visual.debug_bounds("menu-subtitle").unwrap();
+    assert!(title.bottom() < subtitle.top());
+    assert!(subtitle.bottom() < row.bottom());
+    assert!(row.size.height > px(28.0));
 }

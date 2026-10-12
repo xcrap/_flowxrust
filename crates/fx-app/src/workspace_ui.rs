@@ -4,11 +4,12 @@ use std::sync::mpsc;
 
 use fx_agent::provider::{ProviderEvent, UserResponse};
 use fx_core::services::runtime::{BinaryHealth, BinarySpec, RuntimeDiscovery, all_specs};
-use fx_design::components::{ButtonStyle, button, panel};
+use fx_design::components::{ButtonStyle, button, card, choice_row, divider, panel};
+use fx_design::icon::Icon;
 use fx_design::styled::{FxStyled, px_len};
-use fx_design::theme::{Colors, Layout, Spacing, global};
+use fx_design::theme::{Colors, IconSize, Layout, Shadow, Spacing, global};
 use gpui::prelude::*;
-use gpui::{App, Context, Entity, SharedString, Subscription, Window, div};
+use gpui::{App, Context, Entity, SharedString, Subscription, Window, div, px};
 use uuid::Uuid;
 
 use crate::settings::{self, ProviderReport, SettingsDraft, SettingsSheet};
@@ -102,6 +103,7 @@ fn apply_settings(
 }
 
 pub fn open_settings(state: Entity<AppState>, window: &mut Window, cx: &mut App) {
+    dismiss_popup(&state, cx);
     let ui = handle(cx);
     let apply_ui = ui.clone();
     let dismiss_ui = ui.clone();
@@ -128,6 +130,15 @@ pub fn open_settings(state: Entity<AppState>, window: &mut Window, cx: &mut App)
     ui.update(cx, |ui, cx| {
         ui.settings = Some(sheet);
         ui.recheck(cx);
+    });
+}
+
+fn dismiss_popup(state: &Entity<AppState>, cx: &mut App) {
+    let menu = state.read(cx).menu_layer.clone();
+    menu.update(cx, |menu, cx| {
+        if menu.dismiss().is_some() {
+            cx.notify();
+        }
     });
 }
 
@@ -241,6 +252,9 @@ impl WorkspaceUi {
         }
         if self.request.is_some() {
             window.blur();
+        }
+        if pending.is_some() {
+            dismiss_popup(state, cx);
         }
         self.request_key = key;
         self.request =
@@ -373,38 +387,82 @@ impl Render for RequestPanel {
             .find(|agent| agent.id == self.agent)
             .map(|agent| agent.title.clone())
             .unwrap_or_else(|| "Conversation".into());
-        let mut body = div()
+        let (heading, icon) = match &self.event {
+            ProviderEvent::Approval(_) => ("Allow this action?", Icon::LOCK_SHIELD_FILL),
+            ProviderEvent::UserInput(request) if request.questions.len() > 1 => {
+                ("A few questions", Icon::QUESTIONMARK_BUBBLE_FILL)
+            }
+            _ => ("A quick question", Icon::QUESTIONMARK_BUBBLE_FILL),
+        };
+        let header = div()
+            .w_full()
             .flex()
-            .flex_col()
+            .items_center()
             .gap(px_len(Spacing::MD))
-            .p(px_len(Spacing::LG))
+            .px(px_len(Spacing::XXL))
+            .py(px_len(Spacing::XL))
+            .flex_shrink_0()
+            .child(icon.render(IconSize::Large, Colors::fg_secondary(&theme), &theme))
             .child(
                 div()
-                    .fx_caption()
-                    .text_color(Colors::fg_secondary(&theme))
-                    .child(SharedString::from(title)),
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px_len(Spacing::XXS))
+                    .child(div().fx_title2().child(heading))
+                    .child(
+                        div()
+                            .fx_caption()
+                            .text_color(Colors::fg_secondary(&theme))
+                            .child(SharedString::from(title)),
+                    ),
             );
+        let mut body = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px_len(Spacing::XL))
+            .p(px_len(Spacing::XXL));
+        let mut footer = div()
+            .w_full()
+            .flex()
+            .items_center()
+            .justify_end()
+            .gap(px_len(Spacing::SM))
+            .px(px_len(Spacing::XXL))
+            .py(px_len(Spacing::LG))
+            .flex_shrink_0();
         match &self.event {
             ProviderEvent::Approval(request) => {
                 body = body
                     .child(
                         div()
-                            .fx_title2()
-                            .child(SharedString::from(format!("Allow {}?", request.tool_name))),
+                            .flex()
+                            .flex_col()
+                            .gap(px_len(Spacing::XS))
+                            .child(div().fx_body_medium().child(SharedString::from(request.tool_name.clone())))
+                            .child(
+                                div()
+                                    .fx_caption()
+                                    .text_color(Colors::fg_secondary(&theme))
+                                    .child("Review the request before allowing the conversation to continue."),
+                            ),
                     )
-                    .child(
+                    .child(card(
                         div()
+                            .id("approval-details")
+                            .w_full()
+                            .min_w_0()
+                            .overflow_x_scroll()
                             .fx_mono()
                             .text_color(Colors::fg_secondary(&theme))
                             .child(SharedString::from(
-                                request
-                                    .input
-                                    .to_string()
-                                    .chars()
-                                    .take(4_000)
-                                    .collect::<String>(),
+                                serde_json::to_string_pretty(&request.input)
+                                    .unwrap_or_else(|_| request.input.to_string()),
                             )),
-                    );
+                        Spacing::MD,
+                    ));
                 let allow = UserResponse::Approval {
                     id: request.id.clone(),
                     approved: true,
@@ -413,28 +471,36 @@ impl Render for RequestPanel {
                     id: request.id.clone(),
                     approved: false,
                 };
-                body = body.child(
-                    div()
-                        .flex()
-                        .gap(px_len(Spacing::SM))
-                        .child(button(
-                            "Deny",
-                            ButtonStyle::Secondary,
-                            !self.sent,
-                            cx.listener(move |this, _, _, cx| this.respond(deny.clone(), cx)),
-                        ))
-                        .child(button(
-                            "Allow once",
-                            ButtonStyle::Primary,
-                            !self.sent,
-                            cx.listener(move |this, _, _, cx| this.respond(allow.clone(), cx)),
-                        )),
-                );
+                footer = footer
+                    .child(button(
+                        "Deny",
+                        ButtonStyle::Secondary,
+                        !self.sent,
+                        cx.listener(move |this, _, _, cx| this.respond(deny.clone(), cx)),
+                    ))
+                    .child(button(
+                        "Allow once",
+                        ButtonStyle::Primary,
+                        !self.sent,
+                        cx.listener(move |this, _, _, cx| this.respond(allow.clone(), cx)),
+                    ));
             }
             ProviderEvent::UserInput(request) => {
-                body = body.child(div().fx_title2().child("Your answer is needed"));
                 for (index, question) in request.questions.iter().enumerate() {
-                    let mut section = div().flex().flex_col().gap(px_len(Spacing::XS)).child(
+                    let mut section = div().w_full().flex().flex_col().gap(px_len(Spacing::MD));
+                    if request.questions.len() > 1 || !question.header.is_empty() {
+                        section = section.child(
+                            div()
+                                .fx_caption()
+                                .text_color(Colors::fg_tertiary(&theme))
+                                .child(SharedString::from(if question.header.is_empty() {
+                                    format!("Question {}", index + 1)
+                                } else {
+                                    question.header.clone()
+                                })),
+                        );
+                    }
+                    section = section.child(
                         div()
                             .fx_body_medium()
                             .child(SharedString::from(question.question.clone())),
@@ -442,54 +508,76 @@ impl Render for RequestPanel {
                     for option in &question.options {
                         let field = self.fields[index].clone();
                         let value = option.label.clone();
-                        section = section.child(button(
+                        let selected = field.read(cx).value() == option.label;
+                        section = section.child(choice_row(
                             SharedString::from(option.label.clone()),
-                            ButtonStyle::Secondary,
+                            SharedString::from(option.description.clone()),
+                            selected,
                             !self.sent,
                             move |_, _, cx| {
                                 field.update(cx, |field, cx| field.set_value(value.clone(), cx))
                             },
                         ));
-                        if !option.description.is_empty() {
-                            section = section.child(
+                    }
+                    section = section
+                        .when(!question.options.is_empty(), |section| {
+                            section.child(
                                 div()
                                     .fx_caption()
                                     .text_color(Colors::fg_secondary(&theme))
-                                    .child(SharedString::from(option.description.clone())),
-                            );
-                        }
-                    }
-                    section = section.child(self.fields[index].clone());
+                                    .child("Choose an option above or enter your answer."),
+                            )
+                        })
+                        .child(self.fields[index].clone());
                     body = body.child(section);
+                    if index + 1 < request.questions.len() {
+                        body = body.child(divider());
+                    }
                 }
                 let answers = self.answers(cx);
                 let cancel = UserResponse::CancelQuestions {
                     id: request.id.clone(),
                 };
-                body = body.child(
-                    div()
-                        .flex()
-                        .gap(px_len(Spacing::SM))
-                        .child(button(
-                            "Cancel",
-                            ButtonStyle::Secondary,
-                            !self.sent,
-                            cx.listener(move |this, _, _, cx| this.respond(cancel.clone(), cx)),
-                        ))
-                        .child(button(
-                            "Send answers",
-                            ButtonStyle::Primary,
-                            !self.sent && answers.is_some(),
-                            cx.listener(move |this, _, _, cx| {
-                                if let Some(answer) = this.answers(cx) {
-                                    this.respond(answer, cx);
-                                }
-                            }),
-                        )),
-                );
+                footer = footer
+                    .child(button(
+                        "Cancel",
+                        ButtonStyle::Secondary,
+                        !self.sent,
+                        cx.listener(move |this, _, _, cx| this.respond(cancel.clone(), cx)),
+                    ))
+                    .child(button(
+                        "Send answers",
+                        ButtonStyle::Primary,
+                        !self.sent && answers.is_some(),
+                        cx.listener(move |this, _, _, cx| {
+                            if let Some(answer) = this.answers(cx) {
+                                this.respond(answer, cx);
+                            }
+                        }),
+                    ));
             }
             _ => {}
         }
+        let content = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .child(header)
+            .child(divider())
+            .child(
+                div()
+                    .id("provider-request-content")
+                    .w_full()
+                    .min_h_0()
+                    .max_h(
+                        (window.viewport_size().height - px(Spacing::HUGE * 4.0))
+                            .max(px(Spacing::HUGE * 2.0)),
+                    )
+                    .overflow_y_scroll()
+                    .child(body),
+            )
+            .child(divider())
+            .child(footer);
         div()
             .id("provider-request-overlay")
             .track_focus(&self.focus)
@@ -505,10 +593,9 @@ impl Render for RequestPanel {
                 div()
                     .w(px_len(Layout::SETTINGS_PANEL_WIDTH))
                     .max_w_full()
-                    .max_h_full()
-                    .id("provider-request")
-                    .overflow_y_scroll()
-                    .child(panel(body)),
+                    .p(px_len(Spacing::SM))
+                    .fx_shadow(Shadow::dialog(Colors::overlay(&theme)))
+                    .child(panel(content)),
             )
     }
 }

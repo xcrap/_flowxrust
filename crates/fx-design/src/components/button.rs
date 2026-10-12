@@ -6,7 +6,9 @@ use gpui::{
 
 use crate::icon::Icon;
 use crate::styled::{FxRefinement, FxStyled, px_len};
-use crate::theme::{Colors, IconSize, Radii, Spacing, TextRole, WithAlpha, global};
+use crate::theme::{
+    BorderWidth, Colors, IconSize, Layout, Radii, Spacing, TextRole, WithAlpha, global,
+};
 
 /// Visual weight of a labelled button.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -113,51 +115,7 @@ pub fn button(
     enabled: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    let theme = global::current();
-    let label = label.into();
-    let button_id: SharedString = format!("button:{label}").into();
-    let palette = button_palette(style, false, &theme);
-
-    let mut content = div().flex().flex_col().justify_center();
-    content = content
-        .px(px_len(Spacing::MD))
-        .py(px_len(Spacing::XS))
-        .flex_row()
-        .items_center()
-        .gap(px_len(Spacing::XS))
-        .rounded(px_len(Radii::SM))
-        .border_1()
-        .border_color(palette.border)
-        .bg(palette.background)
-        .text_color(palette.foreground)
-        .fx_role(TextRole::BodyMedium)
-        .child(label);
-
-    div()
-        .flex()
-        .flex_col()
-        .opacity(if enabled { 1.0 } else { DISABLED_OPACITY })
-        .child(
-            content
-                // `.id` upgrades the element to `Stateful<Div>`, which is what
-                // carries `on_click`, `active`, and `tooltip` in GPUI 0.2.2.
-                .id(button_id)
-                .hover(|s: StyleRefinement| {
-                    let p = button_palette(style, true, &theme);
-                    s.fx_background(p.background).fx_text_color(p.foreground)
-                })
-                .active(|s: StyleRefinement| s.fx_opacity(PRESSED_OPACITY))
-                .cursor(if enabled {
-                    CursorStyle::PointingHand
-                } else {
-                    CursorStyle::default()
-                })
-                .on_click(move |event, window, cx| {
-                    if enabled {
-                        on_click(event, window, cx);
-                    }
-                }),
-        )
+    button_with_icon(label, None, style, enabled, on_click)
 }
 
 /// A labelled button with a leading glyph.
@@ -172,42 +130,69 @@ pub fn button_with_icon(
     let label = label.into();
     let button_id: SharedString = format!("button:{label}").into();
     let palette = button_palette(style, false, &theme);
-    let icon_element = icon.map(|i| i.render(IconSize::Regular, palette.foreground, &theme));
+    let icon_element = icon.map(|i| i.render(IconSize::Control, palette.foreground, &theme));
 
-    let mut content = div().flex_row().items_center().gap(px_len(Spacing::XS));
+    let mut content = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_center()
+        .flex_shrink_0()
+        .min_h(px_len(Layout::CONTROL_HEIGHT))
+        .gap(px_len(Spacing::XS))
+        .debug_selector(|| "button-content".into());
     if let Some(el) = icon_element {
-        content = content.child(el);
+        content = content.child(
+            div()
+                .flex()
+                .flex_shrink_0()
+                .debug_selector(|| "button-icon".into())
+                .child(el),
+        );
     }
     content = content
-        .child(div().fx_role(TextRole::BodyMedium).child(label))
+        .child(
+            div()
+                .whitespace_nowrap()
+                .fx_role(TextRole::BodyMedium)
+                .debug_selector(|| "button-label".into())
+                .child(label),
+        )
         .px(px_len(Spacing::MD))
-        .py(px_len(Spacing::XS))
+        .py(px_len(Spacing::XXS))
         .rounded(px_len(Radii::SM))
-        .border_1()
+        .border(px_len(BorderWidth::HAIRLINE))
         .border_color(palette.border)
         .bg(palette.background)
         .text_color(palette.foreground);
 
-    div()
+    content
         .opacity(if enabled { 1.0 } else { DISABLED_OPACITY })
-        .child(
-            content
-                .id(button_id)
-                .hover(|s: StyleRefinement| {
-                    let p = button_palette(style, true, &theme);
-                    s.fx_background(p.background).fx_text_color(p.foreground)
-                })
-                .cursor(if enabled {
-                    CursorStyle::PointingHand
-                } else {
-                    CursorStyle::default()
-                })
-                .on_click(move |event, window, cx| {
-                    if enabled {
-                        on_click(event, window, cx);
-                    }
-                }),
-        )
+        .id(button_id)
+        .hover(|s: StyleRefinement| {
+            if !enabled {
+                return s;
+            }
+            let p = button_palette(style, true, &theme);
+            s.fx_background(p.background).fx_text_color(p.foreground)
+        })
+        .active(|s: StyleRefinement| {
+            if enabled {
+                s.fx_opacity(PRESSED_OPACITY)
+            } else {
+                s
+            }
+        })
+        .cursor(if enabled {
+            CursorStyle::PointingHand
+        } else {
+            CursorStyle::default()
+        })
+        .on_click(move |event, window, cx| {
+            if enabled {
+                on_click(event, window, cx);
+            }
+        })
 }
 
 /// How much chrome an icon button shows at rest.
@@ -222,11 +207,11 @@ pub enum IconButtonVariant {
 }
 
 /// Default edge length for an icon button.
-pub const ICON_BUTTON_SIZE: f32 = 28.0;
+pub const ICON_BUTTON_SIZE: f32 = Layout::CONTROL_HEIGHT;
 /// Compact toolbar size.
-const SMALL_ICON_BUTTON_SIZE: f32 = 24.0;
-/// Row-trailing size; its hit target is padded to `TINY_ICON_BUTTON_HIT`.
-const TINY_ICON_BUTTON_SIZE: f32 = 16.0;
+const SMALL_ICON_BUTTON_SIZE: f32 = Layout::CONTROL_COMPACT_HEIGHT;
+/// Row-trailing controls keep a compact target with a smaller glyph.
+const TINY_ICON_BUTTON_SIZE: f32 = Layout::CONTROL_COMPACT_HEIGHT;
 
 /// The colors an icon button resolves to.
 #[derive(Debug, Clone, Copy)]
@@ -331,7 +316,7 @@ impl IconButtonProps {
             enabled: true,
             variant: IconButtonVariant::default(),
             size: ICON_BUTTON_SIZE,
-            icon_size: IconSize::Small,
+            icon_size: IconSize::Control,
         }
     }
 
@@ -368,15 +353,14 @@ impl IconButtonProps {
     /// The compact size, for a toolbar beside text.
     pub fn small(mut self) -> Self {
         self.size = SMALL_ICON_BUTTON_SIZE;
-        self.icon_size = IconSize::Small;
+        self.icon_size = IconSize::Control;
         self
     }
 
     /// The row-trailing size, for a disclosure or per-row action.
     ///
-    /// Smaller than [`Self::small`] because it sits at the end of a row that
-    /// already has a label; at the small size it reads as a second control
-    /// rather than as part of the row.
+    /// Keeps the compact hit target with a smaller glyph, so a trailing action
+    /// does not compete with the row label.
     pub fn tiny(mut self) -> Self {
         self.size = TINY_ICON_BUTTON_SIZE;
         self.icon_size = IconSize::Small;
@@ -398,9 +382,8 @@ impl IconButtonProps {
 
 /// Hit target for a row-trailing icon button.
 ///
-/// Below this the control stops meeting the platform minimum for a pointer
-/// target, so the row is what absorbs the miss.
-const TINY_ICON_BUTTON_HIT: f32 = 22.0;
+/// The whole minimum-sized control owns click handling, including its padding.
+const TINY_ICON_BUTTON_HIT: f32 = Layout::CONTROL_COMPACT_HEIGHT;
 
 /// A square icon-only control.
 pub fn icon_button(
@@ -422,6 +405,7 @@ pub fn icon_button(
     } = props;
 
     let palette = icon_button_palette(variant, selected, false, enabled, tint, &theme);
+    let debug_label = format!("icon-button:{label}");
     let corner = if variant == IconButtonVariant::Ghost {
         Radii::SM
     } else {
@@ -429,14 +413,15 @@ pub fn icon_button(
     };
 
     let control = div()
+        .debug_selector(move || debug_label.clone())
         .flex()
-        .size(px_len(size))
+        .size(px_len(size.max(TINY_ICON_BUTTON_HIT)))
         .flex_shrink_0()
         .flex_col()
         .items_center()
         .justify_center()
         .rounded(px_len(corner))
-        .border_1()
+        .border(px_len(BorderWidth::HAIRLINE))
         .border_color(palette.border)
         .bg(palette.background)
         .child(icon.render(icon_size, palette.foreground, &theme))
@@ -446,6 +431,13 @@ pub fn icon_button(
         .hover(|s: StyleRefinement| {
             let p = icon_button_palette(variant, selected, true, enabled, tint, &theme);
             s.fx_background(p.background).fx_border_color(p.border)
+        })
+        .active(|s| {
+            if enabled {
+                s.fx_opacity(PRESSED_OPACITY)
+            } else {
+                s
+            }
         })
         .cursor(if enabled {
             CursorStyle::PointingHand
@@ -458,20 +450,6 @@ pub fn icon_button(
                 on_click(event, window, cx);
             }
         });
-
-    if size < TINY_ICON_BUTTON_HIT {
-        // The painted control stays small so it does not crowd a row, but the
-        // target grows to the platform minimum. A 16px target in a 26px row is
-        // genuinely hard to hit.
-        return div()
-            .flex()
-            .size(px_len(TINY_ICON_BUTTON_HIT))
-            .flex_shrink_0()
-            .items_center()
-            .justify_center()
-            .child(control)
-            .into_any_element();
-    }
 
     control.into_any_element()
 }
@@ -486,16 +464,27 @@ pub fn compact_action_button(
     let label = label.into();
     let button_id: SharedString = format!("compact-action:{label}").into();
 
-    let mut content = div().flex_row().items_center().gap(px_len(Spacing::XXS));
+    let mut content = div()
+        .flex()
+        .flex_row()
+        .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .gap(px_len(Spacing::XXS));
     if let Some(i) = icon {
         content = content.child(i.render(IconSize::Micro, Colors::fg_secondary(&theme), &theme));
     }
     content = content
-        .child(div().fx_role(TextRole::CaptionMedium).child(label))
+        .child(
+            div()
+                .whitespace_nowrap()
+                .fx_role(TextRole::CaptionMedium)
+                .child(label),
+        )
         .px(px_len(Spacing::SM))
-        .h(px_len(24.0))
+        .min_h(px_len(Layout::CONTROL_COMPACT_HEIGHT))
         .rounded(px_len(Radii::SM))
-        .border_1()
+        .border(px_len(BorderWidth::HAIRLINE))
         .border_color(Colors::border_subtle(&theme))
         .bg(Colors::bg_elevated(&theme))
         .text_color(Colors::fg_secondary(&theme));
@@ -506,8 +495,110 @@ pub fn compact_action_button(
             s.fx_background(Colors::bg_hover(&theme))
                 .fx_text_color(Colors::fg(&theme))
         })
+        .active(|s| s.fx_opacity(PRESSED_OPACITY))
         .cursor(CursorStyle::PointingHand)
         .on_click(on_click)
+}
+
+/// A selectable answer or preference, with enough room for its explanation.
+/// Unlike toolbar buttons, both labels wrap within the available panel width.
+pub fn choice_row(
+    label: impl Into<SharedString>,
+    description: impl Into<SharedString>,
+    selected: bool,
+    enabled: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let theme = global::current();
+    let label = label.into();
+    let description = description.into();
+    let mut labels = div()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_w_0()
+        .gap(px_len(Spacing::XXS))
+        .child(
+            div()
+                .fx_role(TextRole::BodyMedium)
+                .text_color(Colors::fg(&theme))
+                .child(label.clone()),
+        );
+    if !description.is_empty() {
+        labels = labels.child(
+            div()
+                .fx_role(TextRole::Caption)
+                .text_color(Colors::fg_secondary(&theme))
+                .child(description),
+        );
+    }
+    div()
+        .id(SharedString::from(format!("choice:{label}")))
+        .w_full()
+        .min_w_0()
+        .flex()
+        .items_start()
+        .gap(px_len(Spacing::SM))
+        .p(px_len(Spacing::MD))
+        .rounded(px_len(Radii::SM))
+        .border(px_len(BorderWidth::REGULAR))
+        .border_color(if selected {
+            Colors::accent(&theme)
+        } else {
+            Colors::border_subtle(&theme)
+        })
+        .bg(if selected {
+            Colors::bg_selected(&theme)
+        } else {
+            Colors::bg_elevated(&theme)
+        })
+        .opacity(if enabled { 1.0 } else { DISABLED_OPACITY })
+        .cursor(if enabled {
+            CursorStyle::PointingHand
+        } else {
+            CursorStyle::default()
+        })
+        .hover(move |s| {
+            if enabled && !selected {
+                s.fx_background(Colors::bg_hover(&theme))
+            } else {
+                s
+            }
+        })
+        .active(move |s| {
+            if enabled {
+                s.fx_opacity(PRESSED_OPACITY)
+            } else {
+                s
+            }
+        })
+        .on_click(move |event, window, cx| {
+            if enabled {
+                on_click(event, window, cx)
+            }
+        })
+        .child(
+            div()
+                .flex_shrink_0()
+                .pt(px_len(Spacing::XXXS))
+                .child(if selected {
+                    Icon::CHECKMARK_CIRCLE_FILL.render(
+                        IconSize::Medium,
+                        Colors::accent(&theme),
+                        &theme,
+                    )
+                } else {
+                    div()
+                        .size(px_len(
+                            crate::theme::Typography::icon(IconSize::Medium, &theme).size,
+                        ))
+                        .rounded_full()
+                        .border(px_len(BorderWidth::REGULAR))
+                        .border_color(Colors::border_medium(&theme))
+                        .into_any_element()
+                }),
+        )
+        .child(labels)
 }
 
 #[cfg(test)]

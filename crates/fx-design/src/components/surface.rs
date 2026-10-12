@@ -16,10 +16,10 @@ pub enum DividerAxis {
 /// A one-point rule in the border color.
 pub fn divider_with_axis(axis: DividerAxis) -> impl IntoElement {
     let theme = global::current();
-    let rule = div().bg(Colors::border(&theme));
+    let rule = div().flex_shrink_0().bg(Colors::border_subtle(&theme));
     match axis {
-        DividerAxis::Horizontal => rule.h(px_len(1.0)).w_full(),
-        DividerAxis::Vertical => rule.w(px_len(1.0)).h_full(),
+        DividerAxis::Horizontal => rule.h(px_len(BorderWidth::HAIRLINE)).w_full(),
+        DividerAxis::Vertical => rule.w(px_len(BorderWidth::HAIRLINE)).h_full(),
     }
 }
 
@@ -40,7 +40,7 @@ pub fn card(content: impl IntoElement, padding: f32) -> impl IntoElement {
         .p(px_len(padding))
         .bg(Colors::bg_surface(&theme))
         .rounded(px_len(Radii::LG))
-        .border_1()
+        .border(px_len(BorderWidth::HAIRLINE))
         .border_color(Colors::border(&theme))
         .child(content)
 }
@@ -57,7 +57,7 @@ pub fn panel(content: impl IntoElement) -> impl IntoElement {
     div()
         .bg(Colors::bg_surface(&theme))
         .rounded(px_len(Radii::XL))
-        .border_1()
+        .border(px_len(BorderWidth::HAIRLINE))
         .border_color(Colors::border_medium(&theme))
         .child(content)
 }
@@ -74,6 +74,7 @@ pub fn empty_state(
         .flex_col()
         .items_center()
         .justify_center()
+        .text_center()
         .gap(px_len(Spacing::SM))
         .py(px_len(Spacing::XXL))
         .px(px_len(Spacing::LG))
@@ -98,6 +99,7 @@ pub fn empty_state(
 /// banner shows through and the banner reads as a wash rather than a slab.
 pub fn banner(tint: gpui::Rgba, ink: gpui::Rgba, content: impl IntoElement) -> impl IntoElement {
     div()
+        .flex()
         .flex_row()
         .items_start()
         .gap(px_len(Spacing::SM))
@@ -114,6 +116,7 @@ pub fn banner(tint: gpui::Rgba, ink: gpui::Rgba, content: impl IntoElement) -> i
 /// A single-line notice used above a panel or inside a header.
 pub fn inline_notice(ink: gpui::Rgba, content: impl IntoElement) -> impl IntoElement {
     div()
+        .flex()
         .flex_row()
         .items_center()
         .text_color(ink)

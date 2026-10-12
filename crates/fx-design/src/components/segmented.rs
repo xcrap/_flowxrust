@@ -4,10 +4,10 @@ use gpui::prelude::*;
 use gpui::{App, CursorStyle, IntoElement, ParentElement, SharedString, Styled, Window, div};
 
 use crate::styled::{FxRefinement, FxStyled, px_len};
-use crate::theme::{Colors, Radii, Spacing, TextRole, global};
+use crate::theme::{Colors, Layout, Radii, Spacing, TextRole, global};
 
 /// Height of a segment.
-const SEGMENT_HEIGHT: f32 = 24.0;
+const SEGMENT_HEIGHT: f32 = Layout::CONTROL_COMPACT_HEIGHT - Spacing::XXS;
 
 /// The callback every segment of a segmented control shares.
 ///
@@ -50,10 +50,13 @@ pub fn segmented_control<T: PartialEq + Clone + 'static>(
         let is_selected = &option.value == selected;
         let value = option.value.clone();
         div()
+            .flex()
+            .flex_shrink_0()
             .px(px_len(Spacing::SM))
             .h(px_len(SEGMENT_HEIGHT))
             .flex_col()
             .justify_center()
+            .whitespace_nowrap()
             .rounded(px_len(Radii::XS))
             .bg(if is_selected {
                 Colors::bg_selected(&theme)
@@ -93,7 +96,9 @@ pub fn segmented_control<T: PartialEq + Clone + 'static>(
     });
 
     div()
+        .debug_selector(|| "segmented-control".into())
         .flex()
+        .flex_shrink_0()
         .flex_row()
         .gap(px_len(Spacing::XXXS))
         .p(px_len(Spacing::XXXS))

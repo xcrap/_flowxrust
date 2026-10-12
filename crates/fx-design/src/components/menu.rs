@@ -257,11 +257,14 @@ fn row(
     let on_press = on_hover.clone();
 
     let mut content = div()
+        .debug_selector(|| "menu-row".into())
         .flex()
         .flex_row()
         .items_center()
         .gap(px_len(Spacing::XXS))
-        .h(px_len(Layout::MENU_ROW_HEIGHT))
+        .min_h(px_len(Layout::MENU_ROW_HEIGHT))
+        .flex_shrink_0()
+        .py(px_len(Spacing::XXS))
         .px(px_len(Spacing::SM))
         .bg(palette.background)
         .rounded(px_len(Radii::SM));
@@ -271,8 +274,11 @@ fn row(
     content = content.child(
         div()
             .w(px_len(Layout::MENU_CHECK_GUTTER))
+            .flex()
+            .flex_shrink_0()
             .flex_col()
             .items_center()
+            .justify_center()
             .child(if item.selected {
                 Icon::CHECKMARK.render(crate::theme::IconSize::Small, palette.check, &theme)
             } else {
@@ -280,10 +286,18 @@ fn row(
             }),
     );
 
-    let mut labels = div().flex().flex_col().items_start().gap(px_len(1.0));
+    let mut labels = div()
+        .flex()
+        .flex_1()
+        .min_w_0()
+        .flex_col()
+        .items_start()
+        .gap(px_len(Spacing::XXXS));
     labels = labels.child(
         div()
-            .fx_role(TextRole::Body)
+            .w_full()
+            .debug_selector(|| "menu-title".into())
+            .fx_role(TextRole::CaptionMedium)
             .text_color(palette.title)
             .truncate()
             .child(item.title.clone()),
@@ -291,6 +305,8 @@ fn row(
     if let Some(subtitle) = &item.subtitle {
         labels = labels.child(
             div()
+                .w_full()
+                .debug_selector(|| "menu-subtitle".into())
                 .fx_role(TextRole::Caption)
                 .text_color(palette.subtitle)
                 .truncate()
@@ -597,7 +613,9 @@ pub fn menu_trigger(trigger: MenuTrigger, layer: &Entity<MenuLayer>) -> AnyEleme
         panel_width: _,
     } = trigger;
 
-    let label_color = if expanded {
+    let label_color = if !enabled {
+        Colors::fg_tertiary(&theme)
+    } else if expanded {
         Colors::fg(&theme)
     } else {
         Colors::fg_secondary(&theme)
@@ -606,10 +624,12 @@ pub fn menu_trigger(trigger: MenuTrigger, layer: &Entity<MenuLayer>) -> AnyEleme
     let content = div()
         .flex()
         .flex_row()
+        .min_w_0()
+        .max_w_full()
         .items_center()
-        .gap(px_len(Spacing::XXS))
+        .gap(px_len(Spacing::XS))
         .px(px_len(Spacing::SM))
-        .h(px_len(Layout::MENU_ROW_HEIGHT))
+        .h(px_len(Layout::CONTROL_COMPACT_HEIGHT))
         .rounded(px_len(Radii::SM))
         .bg(if expanded {
             Colors::bg_selected(&theme)
@@ -622,8 +642,18 @@ pub fn menu_trigger(trigger: MenuTrigger, layer: &Entity<MenuLayer>) -> AnyEleme
             }
         })
         .text_color(label_color)
-        .fx_role(TextRole::BodyMedium)
-        .child(label.clone());
+        .fx_role(TextRole::CaptionMedium)
+        .child(div().min_w_0().truncate().child(label.clone()))
+        .child(
+            div()
+                .flex()
+                .flex_shrink_0()
+                .child(Icon::CHEVRON_DOWN.render(
+                    crate::theme::IconSize::Micro,
+                    label_color,
+                    &theme,
+                )),
+        );
 
     let mut element = content
         .id(SharedString::from(format!("menu-trigger:{owner}")))

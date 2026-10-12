@@ -13,17 +13,18 @@ use fx_design::components::{
 };
 use fx_design::icon::Icon;
 use fx_design::styled::{FxRefinement, FxStyled, px_len};
-use fx_design::theme::{Colors, Spacing, TextRole, global};
+use fx_design::theme::{BorderWidth, Colors, IconSize, Layout, Radii, Spacing, TextRole, global};
 use fx_store::RightPanelTab;
 use gpui::prelude::*;
 use gpui::{
     AnyElement, AnyView, App, ClipboardItem, Context, Entity, SharedString, Task, Window, div, px,
+    relative,
 };
 
 use crate::state::AppState;
 use repository::{LineKind, Preview, Selection, Snapshot};
 
-const INSPECTOR_HEADER_HEIGHT: f32 = 44.0;
+const INSPECTOR_HEADER_HEIGHT: f32 = Layout::PANE_HEADER_HEIGHT;
 
 #[derive(Clone)]
 struct InspectorHandle(Entity<Inspector>);
@@ -46,6 +47,7 @@ struct Inspector {
     read_task: Option<Task<()>>,
     preview_task: Option<Task<()>>,
     poll_task: Option<Task<()>>,
+    preview_scroll: gpui::ScrollHandle,
 }
 
 /// The child view owns asynchronous reads and receives GPUI notifications
@@ -90,6 +92,7 @@ impl Inspector {
             read_task: None,
             preview_task: None,
             poll_task: None,
+            preview_scroll: gpui::ScrollHandle::new(),
         }
     }
 
@@ -143,6 +146,8 @@ impl Inspector {
         self.preview_error = None;
         self.preview_loading = false;
         self.preview_task = None;
+        self.preview_scroll
+            .set_offset(gpui::point(px(0.0), px(0.0)));
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
@@ -214,6 +219,8 @@ impl Inspector {
         let ticket = (self.generation, self.selection_generation);
         if self.selected.as_ref() != Some(&selection) {
             self.preview = None;
+            self.preview_scroll
+                .set_offset(gpui::point(px(0.0), px(0.0)));
         }
         self.selected = Some(selection.clone());
         self.preview_error = None;
@@ -250,32 +257,19 @@ impl Inspector {
     }
 
     fn header(&self, cx: &Context<Self>) -> AnyElement {
-        let theme = global::current();
         let options = [
             SegmentedOption::new(RightPanelTab::Changes, "Changes"),
             SegmentedOption::new(RightPanelTab::Files, "Files"),
         ];
         let for_tabs = self.state.clone();
         let for_hide = self.state.clone();
-        let heading = self
-            .snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.repository.as_ref())
-            .map(|repo| repo.branch.clone())
-            .filter(|branch| !branch.is_empty())
-            .unwrap_or_else(|| {
-                self.state
-                    .read(cx)
-                    .active_project()
-                    .map(|project| project.name.clone())
-                    .unwrap_or_else(|| "No project".into())
-            });
         div()
             .h(px(INSPECTOR_HEADER_HEIGHT))
+            .debug_selector(|| "inspector-header".into())
             .flex_shrink_0()
             .flex()
             .items_center()
-            .gap(px_len(Spacing::SM))
+            .gap(px_len(Spacing::XXS))
             .px(px_len(Spacing::MD))
             .child(segmented_control(&options, &self.tab, move |tab, _, cx| {
                 for_tabs.update(cx, |state, cx| {
@@ -283,15 +277,7 @@ impl Inspector {
                     cx.notify();
                 });
             }))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .fx_caption()
-                    .text_color(Colors::fg_secondary(&theme))
-                    .child(SharedString::from(heading)),
-            )
+            .child(div().flex_1())
             .child(icon_button(
                 IconButtonProps::new(Icon::ARROW_CLOCKWISE, "Refresh files and changes")
                     .small()
@@ -310,6 +296,75 @@ impl Inspector {
                     });
                 },
             ))
+            .into_any_element()
+    }
+
+    fn summary(&self, cx: &Context<Self>) -> AnyElement {
+        let theme = global::current();
+        let repository = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.repository.as_ref());
+        let heading = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.repository.as_ref())
+            .map(|repo| repo.branch.clone())
+            .filter(|branch| !branch.is_empty())
+            .unwrap_or_else(|| {
+                self.state
+                    .read(cx)
+                    .active_project()
+                    .map(|project| project.name.clone())
+                    .unwrap_or_else(|| "No project".into())
+            });
+        let count = self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| match self.tab {
+                RightPanelTab::Changes => repository
+                    .map(|repo| format!("{} changed", repo.files.len()))
+                    .unwrap_or_default(),
+                RightPanelTab::Files => format!("{} files", snapshot.files.len()),
+            })
+            .unwrap_or_else(|| {
+                if self.loading {
+                    "Reading…".into()
+                } else {
+                    String::new()
+                }
+            });
+        div()
+            .h(px(Layout::CONTROL_HEIGHT))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap(px_len(Spacing::SM))
+            .px(px_len(Spacing::MD))
+            .child(
+                if repository.is_some() {
+                    Icon::ARROW_TRIANGLE_BRANCH
+                } else {
+                    Icon::FOLDER
+                }
+                .render(IconSize::Small, Colors::fg_tertiary(&theme), &theme),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .fx_caption()
+                    .text_color(Colors::fg_secondary(&theme))
+                    .child(SharedString::from(heading)),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .fx_role(TextRole::Caption)
+                    .text_color(Colors::fg_tertiary(&theme))
+                    .child(SharedString::from(count)),
+            )
             .into_any_element()
     }
 
@@ -335,7 +390,11 @@ impl Inspector {
                     );
                 };
                 if repo.files.is_empty() {
-                    return note("Working tree is clean.", false);
+                    return inspector_empty(
+                        Icon::CHECKMARK_CIRCLE_FILL,
+                        "Working tree clean",
+                        "File changes will appear here as you work.",
+                    );
                 }
                 repo.files
                     .iter()
@@ -358,9 +417,12 @@ impl Inspector {
             .id("inspector.file-list")
             .min_h_0()
             .overflow_y_scroll()
-            .py(px_len(Spacing::XXS));
+            .px(px_len(Spacing::XS))
+            .py(px_len(Spacing::XXS))
+            .debug_selector(|| "inspector-file-list".into());
         list = if self.selected.is_some() {
-            list.max_h(px(220.0)).flex_shrink_0()
+            list.max_h(px(Layout::DIFF_NAVIGATOR_COMPACT_HEIGHT))
+                .flex_shrink_0()
         } else {
             list.flex_1()
         };
@@ -371,23 +433,46 @@ impl Inspector {
                 Selection::Change(status) => status.status(),
                 _ => String::new(),
             };
+            let (filename, parent) = split_file_path(&path);
+            let status_ink = if status.contains('U') {
+                Colors::warning(&theme)
+            } else if status.contains('D') {
+                Colors::error(&theme)
+            } else if status.contains('A') || status.contains('?') {
+                Colors::success(&theme)
+            } else {
+                Colors::fg_secondary(&theme)
+            };
+            let full_path = path.clone();
             let mut row = div()
                 .id(SharedString::from(format!("inspector-file:{path}")))
-                .h(px(28.0))
+                .debug_selector(|| "inspector-file-row".into())
+                .h(px(Layout::SIDEBAR_ROW_HEIGHT))
+                .flex_shrink_0()
                 .flex()
                 .items_center()
                 .gap(px_len(Spacing::SM))
-                .px(px_len(Spacing::MD))
+                .px(px_len(Spacing::XS))
+                .rounded(px_len(Radii::XS))
                 .cursor_pointer()
                 .hover(|style| style.fx_background(Colors::bg_hover(&theme)))
                 .on_click(cx.listener(move |this, _, _, cx| this.select(selection.clone(), cx)))
+                .tooltip(move |window, cx| {
+                    fx_design::components::tooltip(full_path.clone(), window, cx)
+                })
+                .child(div().flex().flex_shrink_0().child(Icon::DOC.render(
+                    IconSize::Small,
+                    Colors::fg_tertiary(&theme),
+                    &theme,
+                )))
                 .child(
                     div()
-                        .w(px(26.0))
-                        .flex_shrink_0()
-                        .fx_mono()
-                        .text_color(Colors::fg_tertiary(&theme))
-                        .child(SharedString::from(status)),
+                        .min_w_0()
+                        .max_w(relative(0.65))
+                        .truncate()
+                        .fx_caption()
+                        .text_color(Colors::fg(&theme))
+                        .child(SharedString::from(filename.to_string())),
                 )
                 .child(
                     div()
@@ -395,8 +480,16 @@ impl Inspector {
                         .min_w_0()
                         .truncate()
                         .fx_caption()
-                        .text_color(Colors::fg(&theme))
-                        .child(SharedString::from(path)),
+                        .text_color(Colors::fg_tertiary(&theme))
+                        .child(SharedString::from(parent.to_string())),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .min_w(px_len(Spacing::LG))
+                        .fx_role(TextRole::MonoSmall)
+                        .text_color(status_ink)
+                        .child(SharedString::from(status)),
                 );
             if selected {
                 row = row.bg(Colors::bg_selected(&theme));
@@ -429,10 +522,12 @@ impl Inspector {
             .child(
                 div()
                     .flex()
+                    .flex_shrink_0()
+                    .min_w_0()
                     .items_center()
-                    .gap(px_len(Spacing::XS))
+                    .gap(px_len(Spacing::XXXS))
                     .px(px_len(Spacing::MD))
-                    .py(px_len(Spacing::XXS))
+                    .h(px(Layout::PANE_HEADER_HEIGHT))
                     .child(
                         div()
                             .flex_1()
@@ -440,7 +535,9 @@ impl Inspector {
                             .truncate()
                             .fx_role(TextRole::CaptionMedium)
                             .text_color(Colors::fg(&theme))
-                            .child(SharedString::from(selected.path().to_string())),
+                            .child(SharedString::from(
+                                split_file_path(selected.path()).0.to_string(),
+                            )),
                     )
                     .child(icon_button(
                         IconButtonProps::new(Icon::DOC_ON_DOC, "Copy preview")
@@ -471,6 +568,18 @@ impl Inspector {
                         }),
                     )),
             );
+        if !split_file_path(selected.path()).1.is_empty() {
+            body = body.child(
+                div()
+                    .flex_shrink_0()
+                    .px(px_len(Spacing::MD))
+                    .pb(px_len(Spacing::SM))
+                    .truncate()
+                    .fx_caption()
+                    .text_color(Colors::fg_tertiary(&theme))
+                    .child(SharedString::from(selected.path().to_string())),
+            );
+        }
         if let Some(error) = &self.preview_error {
             return body.child(note(error, true)).into_any_element();
         }
@@ -483,42 +592,84 @@ impl Inspector {
             body = body.child(note(notice, false));
         }
         let mut lines = div()
-            .id("inspector.preview")
-            .flex_1()
-            .min_h_0()
-            .overflow_scroll()
+            .debug_selector(|| "preview-content".into())
             .flex()
-            .flex_col();
+            .flex_col()
+            .flex_shrink_0()
+            .min_w_full()
+            .pb(px_len(Spacing::MD));
         if preview.lines.is_empty() {
             lines = lines.child(note("Empty file.", false));
         }
-        for line in &preview.lines {
-            let (fg, bg) = match line.kind {
-                LineKind::Added => (Colors::diff_added_fg(&theme), Colors::diff_added_bg(&theme)),
-                LineKind::Removed => (
-                    Colors::diff_removed_fg(&theme),
-                    Colors::diff_removed_bg(&theme),
-                ),
-                LineKind::Header => (Colors::fg_secondary(&theme), Colors::bg_surface(&theme)),
-                LineKind::Context => (Colors::fg(&theme), Colors::diff_context_bg(&theme)),
+        for (index, line) in preview.lines.iter().enumerate() {
+            let style = preview_row_style(line, matches!(selected, Selection::Change(_)));
+            let (fg, bg) = match style {
+                PreviewRowStyle::Section => (Colors::fg(&theme), Colors::bg_elevated(&theme)),
+                PreviewRowStyle::Metadata => {
+                    (Colors::fg_tertiary(&theme), Colors::bg_elevated(&theme))
+                }
+                PreviewRowStyle::Hunk => (Colors::fg_secondary(&theme), Colors::bg_surface(&theme)),
+                PreviewRowStyle::Code => match line.kind {
+                    LineKind::Added => {
+                        (Colors::diff_added_fg(&theme), Colors::diff_added_bg(&theme))
+                    }
+                    LineKind::Removed => (
+                        Colors::diff_removed_fg(&theme),
+                        Colors::diff_removed_bg(&theme),
+                    ),
+                    _ => (Colors::fg(&theme), Colors::content_bg(&theme)),
+                },
             };
-            lines = lines.child(
-                div()
-                    .flex_shrink_0()
-                    .min_w_full()
-                    .px(px_len(Spacing::SM))
-                    .fx_mono()
-                    .whitespace_nowrap()
-                    .text_color(fg)
-                    .bg(bg)
-                    .child(SharedString::from(if line.text.is_empty() {
-                        " ".into()
-                    } else {
-                        line.text.clone()
-                    })),
-            );
+            let mut row = div()
+                .debug_selector(move || format!("preview-line:{index}"))
+                .flex_shrink_0()
+                .min_w_full()
+                .px(px_len(Spacing::MD))
+                .py(px_len(Spacing::XXXS))
+                .fx_role(if style == PreviewRowStyle::Section {
+                    TextRole::CaptionMedium
+                } else {
+                    TextRole::MonoSmall
+                })
+                .whitespace_nowrap()
+                .text_color(fg)
+                .bg(bg);
+            if style == PreviewRowStyle::Section {
+                row = row
+                    .py(px_len(Spacing::SM))
+                    .border_b(px_len(BorderWidth::HAIRLINE))
+                    .border_color(Colors::border_subtle(&theme));
+                if index > 0 {
+                    row = row.mt(px_len(Spacing::MD));
+                }
+            } else if style == PreviewRowStyle::Hunk {
+                row = row
+                    .py(px_len(Spacing::XS))
+                    .mt(px_len(Spacing::XXS))
+                    .border_y(px_len(BorderWidth::HAIRLINE))
+                    .border_color(Colors::border_subtle(&theme));
+            }
+            lines = lines.child(row.child(SharedString::from(if line.text.is_empty() {
+                " ".into()
+            } else {
+                line.text.clone()
+            })));
         }
-        body.child(lines).into_any_element()
+        body.child(
+            div()
+                .id("inspector.preview")
+                .debug_selector(|| "preview-viewport".into())
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .overflow_scroll()
+                .track_scroll(&self.preview_scroll)
+                .bg(Colors::content_bg(&theme))
+                .flex()
+                .items_start()
+                .child(lines),
+        )
+        .into_any_element()
     }
 }
 
@@ -526,16 +677,19 @@ impl Render for Inspector {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = global::current();
         let mut view = div()
-            .w(px(self.state.read(cx).right_panel_width()))
+            .w_full()
+            .debug_selector(|| "inspector-root".into())
+            .min_w_0()
             .h_full()
             .flex_shrink_0()
             .flex()
             .flex_col()
             .bg(Colors::bg_elevated(&theme))
-            .border_l_1()
+            .border_l(px_len(BorderWidth::HAIRLINE))
             .border_color(Colors::border_subtle(&theme))
             .child(self.header(cx))
-            .child(divider_with_axis(DividerAxis::Horizontal));
+            .child(divider_with_axis(DividerAxis::Horizontal))
+            .child(self.summary(cx));
         if let Some(error) = &self.error {
             view = view.child(note(error, true));
         }
@@ -550,10 +704,77 @@ impl Render for Inspector {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreviewRowStyle {
+    Section,
+    Metadata,
+    Hunk,
+    Code,
+}
+
+/// Git's transport metadata is quieter than the actual changed source. Keep
+/// plain file contents literal, even when source text resembles a diff header.
+fn preview_row_style(line: &repository::PreviewLine, diff: bool) -> PreviewRowStyle {
+    if !diff {
+        return PreviewRowStyle::Code;
+    }
+    if matches!(line.text.as_str(), "Staged changes" | "Unstaged changes") {
+        return PreviewRowStyle::Section;
+    }
+    if line.text.starts_with("@@") {
+        return PreviewRowStyle::Hunk;
+    }
+    if line.kind == LineKind::Header
+        || [
+            "index ",
+            "old mode ",
+            "new mode ",
+            "new file mode ",
+            "deleted file mode ",
+            "similarity index ",
+            "dissimilarity index ",
+            "rename from ",
+            "rename to ",
+            "copy from ",
+            "copy to ",
+        ]
+        .iter()
+        .any(|prefix| line.text.starts_with(prefix))
+    {
+        PreviewRowStyle::Metadata
+    } else {
+        PreviewRowStyle::Code
+    }
+}
+
+fn split_file_path(path: &str) -> (&str, &str) {
+    path.rsplit_once('/')
+        .map_or((path, ""), |(parent, name)| (name, parent))
+}
+
+fn inspector_empty(icon: Icon, title: &str, hint: &str) -> AnyElement {
+    let theme = global::current();
+    div()
+        .flex_1()
+        .min_h_0()
+        .flex()
+        .flex_col()
+        .justify_center()
+        .p(px_len(Spacing::MD))
+        .child(fx_design::components::empty_state(
+            icon.render(IconSize::Illustration, Colors::fg_tertiary(&theme), &theme),
+            SharedString::from(title.to_string()),
+            SharedString::from(hint.to_string()),
+        ))
+        .into_any_element()
+}
+
 fn note(text: &str, error: bool) -> AnyElement {
     let theme = global::current();
     div()
-        .p(px_len(Spacing::MD))
+        .flex_shrink_0()
+        .px(px_len(Spacing::MD))
+        .py(px_len(Spacing::SM))
         .fx_caption()
         .text_color(if error {
             Colors::error(&theme)
@@ -567,6 +788,124 @@ fn note(text: &str, error: bool) -> AnyElement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct NarrowInspector {
+        inner: Entity<Inspector>,
+        width: f32,
+    }
+
+    impl Render for NarrowInspector {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().w(px(self.width)).h_full().child(self.inner.clone())
+        }
+    }
+
+    #[test]
+    fn inspector_controls_fit_the_compact_panel_without_overlap() {
+        for width in [280.0, 360.0] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut test = gpui::TestAppContext::single();
+            let state = test.update(|cx| {
+                cx.new(|cx| AppState::restore(fx_store::AppPaths::at(temp.path()), cx))
+            });
+            let window = test.add_window(move |_, cx| NarrowInspector {
+                inner: cx.new(|_| Inspector::new(state)),
+                width,
+            });
+            test.refresh().unwrap();
+            let mut visual = gpui::VisualTestContext::from_window(window.into(), &test);
+            let root = visual.debug_bounds("inspector-root").unwrap();
+            let tabs = visual.debug_bounds("segmented-control").unwrap();
+            let refresh = visual
+                .debug_bounds("icon-button:Refresh files and changes")
+                .unwrap();
+            let hide = visual.debug_bounds("icon-button:Hide inspector").unwrap();
+            assert_eq!(root.size.width, px(width));
+            assert!(tabs.left() > root.left());
+            assert!(tabs.right() < refresh.left());
+            assert!(refresh.right() < hide.left());
+            assert!(hide.right() < root.right());
+            assert_eq!(tabs.center().y, hide.center().y);
+        }
+    }
+
+    #[test]
+    fn long_previews_keep_natural_line_height_and_scroll_in_both_directions() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut test = gpui::TestAppContext::single();
+        let state = test
+            .update(|cx| cx.new(|cx| AppState::restore(fx_store::AppPaths::at(temp.path()), cx)));
+        let inner = test.update(|cx| {
+            cx.new(|_| {
+                let mut inspector = Inspector::new(state);
+                inspector.selected = Some(Selection::Change(fx_core::GitFileStatus::new(
+                    "sample.txt",
+                    " ",
+                    "M",
+                )));
+                let mut lines = vec![
+                    repository::PreviewLine {
+                        text: "Unstaged changes".into(),
+                        kind: LineKind::Header,
+                    },
+                    repository::PreviewLine {
+                        text: "index 1111111..2222222 100644".into(),
+                        kind: LineKind::Context,
+                    },
+                    repository::PreviewLine {
+                        text: "@@ -1 +1,300 @@".into(),
+                        kind: LineKind::Header,
+                    },
+                ];
+                lines.extend((0..300).map(|index| repository::PreviewLine {
+                    text: format!("+{index} {}", "long source ".repeat(40)),
+                    kind: LineKind::Added,
+                }));
+                inspector.preview = Some(Arc::new(Preview {
+                    text: String::new(),
+                    lines,
+                    notice: None,
+                }));
+                inspector
+            })
+        });
+        let mounted = inner.clone();
+        let window = test.add_window(move |_, _| NarrowInspector {
+            inner: mounted,
+            width: 360.0,
+        });
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), &test);
+        visual.simulate_resize(gpui::size(px(360.0), px(400.0)));
+        test.refresh().unwrap();
+        let viewport = visual.debug_bounds("preview-viewport").unwrap();
+        let content = visual.debug_bounds("preview-content").unwrap();
+        let section = visual.debug_bounds("preview-line:0").unwrap();
+        let hunk = visual.debug_bounds("preview-line:2").unwrap();
+        let source = visual.debug_bounds("preview-line:3").unwrap();
+        assert!(
+            source.size.height >= px(20.0),
+            "source rows were compressed: {source:?}"
+        );
+        assert!(section.size.height > source.size.height);
+        assert!(hunk.size.height > source.size.height);
+        assert!(content.size.height > viewport.size.height * 10.0);
+        assert!(content.size.width > viewport.size.width * 2.0);
+        test.read(|cx| {
+            let scroll = &inner.read(cx).preview_scroll;
+            assert!(scroll.max_offset().height > px(1_000.0));
+            assert!(scroll.max_offset().width > px(100.0));
+        });
+    }
+
+    #[test]
+    fn git_metadata_is_quiet_without_reinterpreting_plain_file_contents() {
+        let line = repository::PreviewLine {
+            text: "index 1111111..2222222 100644".into(),
+            kind: LineKind::Context,
+        };
+        assert_eq!(preview_row_style(&line, true), PreviewRowStyle::Metadata);
+        assert_eq!(preview_row_style(&line, false), PreviewRowStyle::Code);
+    }
 
     #[test]
     fn selecting_a_painted_file_row_loads_and_paints_its_contents() {
@@ -589,7 +928,7 @@ mod tests {
         });
         test.refresh().unwrap();
         let mut visual = gpui::VisualTestContext::from_window(window.into(), &test);
-        let position = gpui::point(px(100.0), px(60.0));
+        let position = visual.debug_bounds("inspector-file-row").unwrap().center();
         visual.simulate_mouse_down(position, gpui::MouseButton::Left, Default::default());
         visual.simulate_mouse_up(position, gpui::MouseButton::Left, Default::default());
         // The bounded-stack reader is a real OS worker, outside GPUI's fake

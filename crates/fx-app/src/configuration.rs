@@ -165,8 +165,7 @@ pub fn bar(state: &Entity<AppState>, cx: &mut App) -> AnyElement {
         .flex()
         .flex_wrap()
         .items_center()
-        .gap(px_len(Spacing::XXS))
-        .pb(px_len(Spacing::XS));
+        .gap(px_len(Spacing::XXS));
     for (field, label, enabled, items) in fields {
         if items.is_empty() {
             continue;
@@ -186,6 +185,7 @@ pub fn bar(state: &Entity<AppState>, cx: &mut App) -> AnyElement {
     div()
         .flex()
         .flex_col()
+        .min_w_0()
         .child(row)
         .children(
             crate::provider_catalog::warning(provider(&agent)).map(|detail| {

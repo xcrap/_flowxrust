@@ -2173,6 +2173,7 @@ dependencies = [
  "resvg",
  "serde",
  "serde_json",
+ "zed-font-kit",
 ]
 
 [[package]]

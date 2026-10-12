@@ -8,12 +8,17 @@ use gpui::{FontWeight, SharedString};
 
 use super::color::Theme;
 
-/// SF Pro Rounded — crisp, modern, highly readable. The system font, so it
-/// ships with macOS and needs no bundled asset.
-pub const FAMILY_ROUNDED: &str = "SF Pro Rounded";
+/// The rounded system face used by AppKit's `.rounded` design.
+///
+/// The downloadable "SF Pro Rounded" family is not installed on a stock Mac.
+/// CoreText exposes the built-in design under this native family alias, which
+/// GPUI's font-kit loader can resolve without falling back to Helvetica.
+pub const FAMILY_ROUNDED: &str = ".AppleSystemUIFontRounded";
 
-/// Monospaced face for code, terminal output, and diff line numbers.
-pub const FAMILY_MONO: &str = "SF Mono";
+/// AppKit's monospaced system face for code, terminal output, and diff numbers.
+/// Like the rounded design, its built-in family is addressed by the native
+/// alias, not the separately installable "SF Mono" family name.
+pub const FAMILY_MONO: &str = ".AppleSystemUIFontMonospaced";
 
 /// A resolved text style. Build these with [`Typography::style`] rather than
 /// constructing them directly, so the text-size preset stays authoritative.
@@ -229,6 +234,45 @@ mod tests {
         let t = Theme::default();
         for role in [TextRole::Mono, TextRole::MonoSmall] {
             assert_eq!(Typography::style(role, &t).family, FAMILY_MONO);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_families_resolve_without_gpui_falling_back_to_a_different_face() {
+        // Use the same native loader as GPUI. TestAppContext's fake text system
+        // accepts missing families, hiding the fallback to proportional text.
+        let source = font_kit::source::SystemSource::new();
+        for family in [FAMILY_ROUNDED, FAMILY_MONO] {
+            let handles = source.select_family_by_name(family).unwrap();
+            let faces: Vec<_> = handles
+                .fonts()
+                .iter()
+                .map(|handle| handle.load().unwrap())
+                .collect();
+            let properties: Vec<_> = faces.iter().map(|face| face.properties()).collect();
+            for weight in [400.0, 500.0, 600.0] {
+                let index = font_kit::matching::find_best_match(
+                    &properties,
+                    &font_kit::properties::Properties {
+                        weight: font_kit::properties::Weight(weight),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                let face = &faces[index];
+                assert_eq!(
+                    face.family_name(),
+                    family,
+                    "{family} at weight {weight} silently fell back"
+                );
+                if family == FAMILY_MONO {
+                    assert!(face.is_monospace());
+                    let narrow = face.advance(face.glyph_for_char('i').unwrap()).unwrap();
+                    let wide = face.advance(face.glyph_for_char('W').unwrap()).unwrap();
+                    assert_eq!(narrow.x(), wide.x(), "code must use equal-width glyphs");
+                }
+            }
         }
     }
 
