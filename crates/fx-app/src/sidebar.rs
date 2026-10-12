@@ -3,8 +3,8 @@
 use fx_core::{Agent, Project};
 use fx_design::components::{
     ActivityState, ButtonStyle, DividerAxis, IconButtonProps, MenuItem, MenuItemTone, MenuModel,
-    MenuSection, activity_dot, button_with_icon, context_region, divider_with_axis, empty_state,
-    icon_button,
+    MenuSection, activity_dot, button_with_icon, collapsible, context_region, divider_with_axis,
+    empty_state, icon_button,
 };
 use fx_design::icon::Icon;
 use fx_design::styled::{FxRefinement, FxStyled, px_len};
@@ -43,9 +43,14 @@ pub fn view(state: Entity<AppState>, _window: &mut Window, cx: &mut App) -> AnyE
         return div().w(px(0.0)).h_full().flex_shrink_0().into_any_element();
     }
 
+    view_at_width(state.clone(), state.read(cx).sidebar_width(), cx)
+}
+
+/// A fixed-width body inside the shell's animated clipping region.
+pub(crate) fn view_at_width(state: Entity<AppState>, width: f32, cx: &mut App) -> AnyElement {
     let theme = global::current();
     div()
-        .w(px(Layout::SIDEBAR_WIDTH))
+        .w(px(width))
         .h_full()
         .flex_shrink_0()
         .flex()
@@ -151,10 +156,10 @@ fn body(state: Entity<AppState>, cx: &mut App) -> AnyElement {
         let id = project.id;
         let selected = Some(id) == snapshot.active_project_id;
         let mut group = div()
+            .debug_selector(move || format!("sidebar-project-group:{id}"))
             .flex()
             .flex_col()
             .flex_shrink_0()
-            .gap(px_len(Spacing::XXXS))
             .child(project_row(
                 state.clone(),
                 id,
@@ -163,7 +168,13 @@ fn body(state: Entity<AppState>, cx: &mut App) -> AnyElement {
                 record.is_expanded,
                 cx,
             ));
-        if record.is_expanded {
+        let mut content = div()
+            .flex()
+            .flex_col()
+            .flex_shrink_0()
+            .gap(px_len(Spacing::XXXS))
+            .pt(px_len(Spacing::XXXS));
+        {
             let native_status = state.read(cx).native_status(id);
             let loading = native_status.syncing && record.agents.is_empty();
             if loading || !native_status.warnings.is_empty() {
@@ -174,7 +185,7 @@ fn body(state: Entity<AppState>, cx: &mut App) -> AnyElement {
                     "Thread sync needs attention"
                 };
                 let retry_state = state.clone();
-                group = group.child(
+                content = content.child(
                     div()
                         .id(SharedString::from(format!("native-sync-status:{id}")))
                         .flex()
@@ -194,7 +205,7 @@ fn body(state: Entity<AppState>, cx: &mut App) -> AnyElement {
                                 IconButtonProps::new(Icon::ARROW_CLOCKWISE, "Retry thread sync")
                                     .tiny()
                                     .ghost()
-                                    .enabled(!native_status.syncing),
+                                    .enabled(record.is_expanded && !native_status.syncing),
                                 move |_, _, cx| {
                                     retry_state.update(cx, |state, cx| {
                                         state.request_native_refresh(id);
@@ -216,9 +227,21 @@ fn body(state: Entity<AppState>, cx: &mut App) -> AnyElement {
                 .cloned()
                 .collect();
             if !loading {
-                group = group.child(threads(&state, id, agents, snapshot.active_agent_id, cx));
+                content = content.child(threads(
+                    &state,
+                    id,
+                    agents,
+                    snapshot.active_agent_id,
+                    record.is_expanded,
+                    cx,
+                ));
             }
         }
+        group = group.child(collapsible(
+            format!("project-content:{id}"),
+            record.is_expanded,
+            content,
+        ));
         list = list.child(group);
     }
     list.into_any_element()
@@ -317,7 +340,7 @@ fn project_row(
         )
         .child(icon_button(
             IconButtonProps::new(Icon::PLUS, "New thread")
-                .tiny()
+                .small()
                 .ghost(),
             {
                 let state = state.clone();
@@ -332,8 +355,8 @@ fn project_row(
             },
         ))
         .child(icon_button(
-            IconButtonProps::new(Icon::ELLIPSIS_CIRCLE, "Project actions")
-                .tiny()
+            IconButtonProps::new(Icon::ELLIPSIS, "Project actions")
+                .small()
                 .ghost(),
             move |event, _window, cx| {
                 // The menu button is inside the selectable project row.
@@ -360,6 +383,7 @@ fn threads(
     project_id: Uuid,
     agents: Vec<Agent>,
     active_agent: Option<Uuid>,
+    interactive: bool,
     cx: &mut App,
 ) -> AnyElement {
     let mut column = div()
@@ -384,6 +408,7 @@ fn threads(
             project_id,
             agent.clone(),
             Some(agent.id) == active_agent,
+            interactive,
             cx,
         ));
     }
@@ -395,6 +420,7 @@ fn thread_row(
     project_id: Uuid,
     agent: Agent,
     selected: bool,
+    interactive: bool,
     cx: &mut App,
 ) -> AnyElement {
     let theme = global::current();
@@ -427,6 +453,9 @@ fn thread_row(
         .on_click({
             let state = state.clone();
             move |_, _window, cx| {
+                if !interactive {
+                    return;
+                }
                 state.update(cx, |state, cx| {
                     state.select_project(project_id);
                     state.select_agent(agent_id);
@@ -466,9 +495,10 @@ fn thread_row(
                 .child(SharedString::from(title)),
         )
         .child(icon_button(
-            IconButtonProps::new(Icon::ELLIPSIS_CIRCLE, "Thread actions")
-                .tiny()
-                .ghost(),
+            IconButtonProps::new(Icon::ELLIPSIS, "Thread actions")
+                .small()
+                .ghost()
+                .enabled(interactive),
             move |event, _, cx| {
                 cx.stop_propagation();
                 let layer = state.read(cx).menu_layer.clone();
@@ -483,6 +513,9 @@ fn thread_row(
                 });
             },
         ));
+    if !interactive {
+        return row.into_any_element();
+    }
     context_region(
         &registry,
         format!("thread:{agent_id}"),
@@ -670,6 +703,13 @@ mod tests {
                 cx.notify();
             })
         });
+        window
+            .update(&mut test, |view, _, cx| {
+                view.sidebar_transition =
+                    Some(fx_design::theme::animation::PanelTransition::new(false));
+                cx.notify();
+            })
+            .unwrap();
         test.refresh().unwrap();
         let toggle = visual
             .debug_bounds("icon-button:Toggle sidebar · ⌘B")
@@ -773,10 +813,72 @@ mod tests {
             });
         });
         test.refresh().unwrap();
+        test.read(|cx| {
+            assert!(
+                state
+                    .read(cx)
+                    .context_registry
+                    .read(cx)
+                    .regions()
+                    .iter()
+                    .all(|region| { !region.owner.starts_with("thread:") })
+            );
+        });
+        std::thread::sleep(fx_design::theme::animation::FxAnimation::PANEL);
+        test.refresh().unwrap();
+        test.update(|_| {});
         test.read(|cx| assert_eq!(state.read(cx).context_registry.read(cx).len(), 1));
         test.update(|cx| state.update(cx, |state, _| state.sidebar_visible = false));
         test.refresh().unwrap();
+        test.update(|_| {});
         test.read(|cx| assert!(state.read(cx).context_registry.read(cx).is_empty()));
+    }
+
+    #[test]
+    fn project_disclosure_animates_its_measured_height_and_restores_visible_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut test = TestAppContext::single();
+        let (state, _) = seeded(&mut test, AppPaths::at(temp.path()), 3, false);
+        let project_id = test.read(|cx| state.read(cx).snapshot.active_project_id.unwrap());
+        let selector: &'static str =
+            Box::leak(format!("sidebar-project-group:{project_id}").into_boxed_str());
+        let for_view = state.clone();
+        let window = test.add_window(move |_, _| SidebarProbe(for_view));
+        let mut visual = VisualTestContext::from_window(window.into(), &test);
+        test.refresh().unwrap();
+        test.update(|_| {});
+        let full_height = visual.debug_bounds(selector).unwrap().size.height;
+        assert!(full_height >= px(PROJECT_ROW_HEIGHT + THREAD_ROW_HEIGHT * 3.0));
+
+        test.update(|cx| {
+            state.update(cx, |state, _| state.toggle_project_expansion(project_id));
+        });
+        test.refresh().unwrap();
+        test.update(|_| {});
+        assert!(visual.debug_bounds(selector).unwrap().size.height > px(PROJECT_ROW_HEIGHT));
+        test.read(|cx| assert_eq!(state.read(cx).context_registry.read(cx).len(), 1));
+        std::thread::sleep(fx_design::theme::animation::FxAnimation::PANEL);
+        test.refresh().unwrap();
+        test.update(|_| {});
+        assert_eq!(
+            visual.debug_bounds(selector).unwrap().size.height,
+            px(PROJECT_ROW_HEIGHT)
+        );
+
+        test.update(|cx| {
+            state.update(cx, |state, _| state.toggle_project_expansion(project_id));
+        });
+        test.refresh().unwrap();
+        test.update(|_| {});
+        assert!(visual.debug_bounds(selector).unwrap().size.height < full_height);
+        std::thread::sleep(fx_design::theme::animation::FxAnimation::PANEL);
+        test.refresh().unwrap();
+        test.update(|_| {});
+        assert_eq!(
+            visual.debug_bounds(selector).unwrap().size.height,
+            full_height
+        );
+        test.read(|cx| assert_eq!(state.read(cx).context_registry.read(cx).len(), 4));
     }
 
     #[test]

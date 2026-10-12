@@ -53,6 +53,12 @@ pub struct PersistedApp {
     pub active_agent_id: Option<Uuid>,
     #[serde(default = "default_true")]
     pub sidebar_visible: bool,
+    #[serde(
+        rename = "sidebarWidth",
+        default = "default_sidebar_width",
+        deserialize_with = "deserialize_sidebar_width"
+    )]
+    pub sidebar_width: f32,
     #[serde(default)]
     pub right_panel_visible: bool,
     #[serde(rename = "rightPanelWidth", default = "default_panel_width")]
@@ -77,6 +83,7 @@ impl Default for PersistedApp {
             active_project_id: None,
             active_agent_id: None,
             sidebar_visible: default_true(),
+            sidebar_width: default_sidebar_width(),
             right_panel_visible: false,
             right_panel_width: default_panel_width(),
             min_right_panel_width: default_min_panel_width(),
@@ -88,6 +95,28 @@ impl Default for PersistedApp {
 
 fn default_true() -> bool {
     true
+}
+fn default_sidebar_width() -> f32 {
+    248.0
+}
+fn normalized_sidebar_width(width: f32) -> f32 {
+    if width.is_finite() {
+        width.clamp(200.0, 400.0)
+    } else {
+        default_sidebar_width()
+    }
+}
+fn deserialize_sidebar_width<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<f32, D::Error> {
+    // A malformed layout preference must not discard the project list.
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(normalized_sidebar_width(
+        value
+            .as_f64()
+            .map(|width| width as f32)
+            .unwrap_or_else(default_sidebar_width),
+    ))
 }
 fn default_panel_width() -> f32 {
     360.0
@@ -266,6 +295,7 @@ impl PersistedApp {
     /// A file edited by hand, or written by a build with different bounds, must
     /// not be able to open the inspector off-screen.
     pub fn normalize(&mut self) {
+        self.sidebar_width = normalized_sidebar_width(self.sidebar_width);
         let (min, max) = (self.min_right_panel_width, self.max_right_panel_width);
         self.right_panel_width = self.right_panel_width.clamp(min, max);
         for record in &mut self.projects {
@@ -456,6 +486,7 @@ mod tests {
         assert_eq!(decoded.min_right_panel_width, built.min_right_panel_width);
         assert_eq!(decoded.max_right_panel_width, built.max_right_panel_width);
         assert_eq!(decoded.sidebar_visible, built.sidebar_visible);
+        assert_eq!(decoded.sidebar_width, built.sidebar_width);
         assert_eq!(decoded.right_panel_visible, built.right_panel_visible);
         assert_eq!(decoded.right_panel_tab, built.right_panel_tab);
     }
@@ -536,6 +567,49 @@ mod tests {
         };
         app.normalize();
         assert_eq!(app.right_panel_width, 420.0);
+    }
+
+    #[test]
+    fn sidebar_geometry_repairs_invalid_preferences_without_losing_other_settings() {
+        for (value, expected) in [
+            ("-10", 200.0),
+            ("10000", 400.0),
+            ("320.5", 320.5),
+            ("1e100", 248.0),
+            ("null", 248.0),
+            ("\"broken\"", 248.0),
+            ("{}", 248.0),
+        ] {
+            let json = format!(
+                r#"{{"sidebarWidth":{value},"sidebar_visible":false,"rightPanelTab":"files"}}"#
+            );
+            let app: PersistedApp = serde_json::from_str(&json).unwrap();
+            assert_eq!(app.sidebar_width, expected, "value: {value}");
+            assert!(!app.sidebar_visible);
+            assert_eq!(app.right_panel_tab, RightPanelTab::Files);
+        }
+        for width in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut app = PersistedApp {
+                sidebar_width: width,
+                ..Default::default()
+            };
+            app.normalize();
+            assert_eq!(app.sidebar_width, 248.0);
+        }
+    }
+
+    #[test]
+    fn a_custom_sidebar_width_round_trips_under_its_stable_key() {
+        let app = PersistedApp {
+            sidebar_width: 320.5,
+            sidebar_visible: false,
+            ..Default::default()
+        };
+        let value = serde_json::to_value(app).unwrap();
+        assert_eq!(value["sidebarWidth"], 320.5);
+        let restored: PersistedApp = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.sidebar_width, 320.5);
+        assert!(!restored.sidebar_visible);
     }
 
     #[test]
@@ -753,6 +827,7 @@ mod tests {
         let app: PersistedApp = serde_json::from_str(json).unwrap();
         assert!(app.projects.is_empty());
         assert!(app.sidebar_visible, "the default should be visible");
+        assert_eq!(app.sidebar_width, 248.0);
         assert!(!app.right_panel_visible);
     }
 

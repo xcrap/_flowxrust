@@ -7,13 +7,57 @@
 //! so these presets are duration + easing pairs. The spring presets use a
 //! critically-damped curve rather than a physics solver: the GPUI 0.2 animation
 //! model has no spring integrator, and a damped curve is visually equivalent
-//! for the short, non-interruptible transitions these presets describe.
+//! for these short transitions. [`PanelTransition`] also preserves position
+//! when a panel's direction changes before the transition finishes.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::Animation;
 
 pub struct FxAnimation;
+
+/// Interruptible panel reveal. A reversal starts at the current position,
+/// rather than restarting at either endpoint. Initial state never animates.
+#[derive(Clone, Debug)]
+pub struct PanelTransition {
+    from: f32,
+    target: f32,
+    started: Instant,
+}
+
+impl PanelTransition {
+    pub fn new(expanded: bool) -> Self {
+        let value = if expanded { 1.0 } else { 0.0 };
+        Self {
+            from: value,
+            target: value,
+            started: Instant::now(),
+        }
+    }
+
+    pub fn set_expanded(&mut self, expanded: bool, now: Instant) {
+        let target = if expanded { 1.0 } else { 0.0 };
+        if self.target != target {
+            self.from = self.progress(now);
+            self.target = target;
+            self.started = now;
+        }
+    }
+
+    pub fn progress(&self, now: Instant) -> f32 {
+        let fraction = (now.saturating_duration_since(self.started).as_secs_f32()
+            / FxAnimation::PANEL.as_secs_f32())
+        .min(1.0);
+        if fraction == 1.0 {
+            return self.target;
+        }
+        self.from + (self.target - self.from) * FxAnimation::ease_out()(fraction)
+    }
+
+    pub fn is_animating(&self, now: Instant) -> bool {
+        self.from != self.target && now.saturating_duration_since(self.started) < FxAnimation::PANEL
+    }
+}
 
 impl FxAnimation {
     /// The default for state changes: quick, no overshoot.
@@ -159,6 +203,25 @@ impl FxAnimation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn panel_reversal_starts_at_its_current_position_and_settles() {
+        let now = Instant::now();
+        let mut panel = PanelTransition::new(true);
+        assert_eq!(panel.progress(now), 1.0);
+        assert!(!panel.is_animating(now));
+        panel.set_expanded(false, now);
+        let halfway = now + FxAnimation::PANEL / 2;
+        let position = panel.progress(halfway);
+        assert!(position > 0.0 && position < 1.0);
+        panel.set_expanded(true, halfway);
+        assert_eq!(panel.progress(halfway), position);
+        assert!(panel.progress(halfway + FxAnimation::PANEL / 2) > position);
+        assert_eq!(panel.progress(halfway + FxAnimation::PANEL), 1.0);
+        assert!(!panel.is_animating(halfway + FxAnimation::PANEL));
+        panel.set_expanded(false, halfway + FxAnimation::PANEL);
+        assert_eq!(panel.progress(halfway + FxAnimation::PANEL * 2), 0.0);
+    }
 
     #[test]
     fn every_easing_starts_at_zero_and_ends_at_one() {

@@ -34,6 +34,7 @@ use fx_core::Agent;
 use fx_design::components::{MenuItem, MenuLayer, MenuModel, MenuSection};
 use fx_design::icon::Icon;
 use fx_design::styled::{FxStyled, px_len};
+use fx_design::theme::animation::PanelTransition;
 use fx_design::theme::{Colors, Layout, Spacing, global};
 use gpui::AnyView;
 use gpui::prelude::*;
@@ -84,6 +85,9 @@ pub struct FlowX {
     focus: Option<gpui::FocusHandle>,
     focused_thread: Option<uuid::Uuid>,
     resizing_inspector: bool,
+    resizing_sidebar: bool,
+    sidebar_resize_offset: f32,
+    sidebar_transition: Option<PanelTransition>,
 }
 
 impl FlowX {
@@ -100,6 +104,9 @@ impl FlowX {
             focus: None,
             focused_thread: None,
             resizing_inspector: false,
+            resizing_sidebar: false,
+            sidebar_resize_offset: 0.0,
+            sidebar_transition: None,
         }
     }
 
@@ -245,6 +252,25 @@ impl Render for FlowX {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.observe_workspace(window, cx);
 
+        let now = std::time::Instant::now();
+        let sidebar_visible = self.state.read(cx).sidebar_visible;
+        let transition = self
+            .sidebar_transition
+            .get_or_insert_with(|| PanelTransition::new(sidebar_visible));
+        transition.set_expanded(sidebar_visible, now);
+        let sidebar_progress = transition.progress(now);
+        if transition.is_animating(now) {
+            let view = cx.entity().downgrade();
+            window.on_next_frame(move |_, cx| {
+                let _ = view.update(cx, |_, cx| cx.notify());
+            });
+        }
+        let sidebar_content_width = visible_sidebar_width(
+            window.viewport_size().width.into(),
+            self.state.read(cx).sidebar_width(),
+        );
+        let sidebar_width = sidebar_content_width * sidebar_progress;
+
         let layer = self.state.read(cx).menu_layer.clone();
         let registry = self.state.read(cx).context_registry.clone();
         let frame_registry = registry.clone();
@@ -266,21 +292,36 @@ impl Render for FlowX {
             .track_focus(self.focus.as_ref().expect("workspace focus"))
             .on_mouse_move(
                 cx.listener(|this, event: &gpui::MouseMoveEvent, window, cx| {
-                    if !this.resizing_inspector {
+                    if !this.resizing_inspector && !this.resizing_sidebar {
                         return;
                     }
                     if event.pressed_button != Some(MouseButton::Left) {
                         this.resizing_inspector = false;
+                        this.resizing_sidebar = false;
                         this.state.update(cx, |state, _| state.save());
                         return;
                     }
-                    let requested = f32::from(window.viewport_size().width - event.position.x);
+                    let resizing_sidebar = this.resizing_sidebar;
+                    let sidebar_resize_offset = this.sidebar_resize_offset;
                     this.state.update(cx, |state, cx| {
-                        state.set_right_panel_width(visible_inspector_width(
-                            window.viewport_size().width.into(),
-                            state.sidebar_visible,
-                            requested,
-                        ));
+                        let window_width = window.viewport_size().width.into();
+                        if resizing_sidebar {
+                            state.set_sidebar_width(visible_sidebar_width(
+                                window_width,
+                                f32::from(event.position.x) + sidebar_resize_offset,
+                            ));
+                        } else {
+                            let sidebar_width = if state.sidebar_visible {
+                                visible_sidebar_width(window_width, state.sidebar_width())
+                            } else {
+                                0.0
+                            };
+                            state.set_right_panel_width(visible_inspector_width(
+                                window_width,
+                                sidebar_width,
+                                f32::from(window.viewport_size().width - event.position.x),
+                            ));
+                        }
                         cx.notify();
                     });
                 }),
@@ -288,8 +329,9 @@ impl Render for FlowX {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
-                    if this.resizing_inspector {
+                    if this.resizing_inspector || this.resizing_sidebar {
                         this.resizing_inspector = false;
+                        this.resizing_sidebar = false;
                         this.state.update(cx, |state, _| state.save());
                     }
                 }),
@@ -363,15 +405,31 @@ impl Render for FlowX {
                     .flex()
                     .flex_col()
                     .size_full()
-                    .child(title_bar(self.state.clone(), cx))
+                    .child(title_bar(
+                        self.state.clone(),
+                        sidebar_content_width,
+                        sidebar_progress,
+                        cx,
+                    ))
                     .child(
                         div()
                             .flex()
                             .flex_1()
                             .min_h_0()
-                            .child(sidebar::view(self.state.clone(), window, cx))
+                            .child(sidebar_column(
+                                self.state.clone(),
+                                sidebar_width,
+                                sidebar_content_width,
+                                sidebar_progress == 1.0,
+                                cx,
+                            ))
                             .child(center_column(self.state.clone(), window, cx))
-                            .child(inspector_column(self.state.clone(), window, cx)),
+                            .child(inspector_column(
+                                self.state.clone(),
+                                sidebar_width,
+                                window,
+                                cx,
+                            )),
                     ),
             )
             // Above everything, so an open menu is never clipped by the
@@ -406,7 +464,12 @@ impl Render for FlowX {
 /// GPUI draws the traffic lights itself, so the bar reserves space for them
 /// rather than using a native titlebar. A view that starts at x=0 would put its
 /// first control underneath them.
-fn title_bar(state: Entity<AppState>, cx: &mut Context<FlowX>) -> AnyElement {
+fn title_bar(
+    state: Entity<AppState>,
+    sidebar_width: f32,
+    sidebar_progress: f32,
+    cx: &mut Context<FlowX>,
+) -> AnyElement {
     let theme = global::current();
     let snapshot = state.read(cx);
     let sidebar_visible = snapshot.sidebar_visible;
@@ -420,11 +483,9 @@ fn title_bar(state: Entity<AppState>, cx: &mut Context<FlowX>) -> AnyElement {
     let for_sidebar = state.clone();
     let for_inspector = state.clone();
     let for_new = state.clone();
-    let sidebar_controls_width = if sidebar_visible {
-        Layout::SIDEBAR_WIDTH
-    } else {
-        TRAFFIC_LIGHT_GUTTER + Layout::CONTROL_COMPACT_HEIGHT + Spacing::MD
-    };
+    let collapsed_width = TRAFFIC_LIGHT_GUTTER + Layout::CONTROL_COMPACT_HEIGHT + Spacing::MD;
+    let sidebar_controls_width =
+        collapsed_width + (sidebar_width - collapsed_width) * sidebar_progress;
 
     div()
         .h(px(Layout::TITLE_BAR_HEIGHT))
@@ -540,23 +601,78 @@ fn title_bar(state: Entity<AppState>, cx: &mut Context<FlowX>) -> AnyElement {
 }
 
 /// Keep a useful conversation column even when restoring a wider inspector.
-fn visible_inspector_width(window_width: f32, sidebar: bool, requested: f32) -> f32 {
-    let sidebar_width = if sidebar { Layout::SIDEBAR_WIDTH } else { 0.0 };
+fn visible_inspector_width(window_width: f32, sidebar_width: f32, requested: f32) -> f32 {
     let available = (window_width - sidebar_width - Layout::MINIMUM_CONVERSATION_WIDTH).max(0.0);
     requested
         .clamp(Layout::RIGHT_PANEL_MIN_WIDTH, Layout::RIGHT_PANEL_MAX_WIDTH)
         .min(available)
 }
 
+fn visible_sidebar_width(window_width: f32, requested: f32) -> f32 {
+    Layout::clamp_sidebar_width(requested)
+        .min((window_width - Layout::MINIMUM_CONVERSATION_WIDTH).max(0.0))
+}
+
+fn sidebar_column(
+    state: Entity<AppState>,
+    width: f32,
+    content_width: f32,
+    settled_open: bool,
+    cx: &mut Context<FlowX>,
+) -> AnyElement {
+    let theme = global::current();
+    div()
+        .id("sidebar.column")
+        .debug_selector(|| "sidebar-column".into())
+        .relative()
+        .w(px(width))
+        .h_full()
+        .flex_shrink_0()
+        .overflow_hidden()
+        .children((width > 0.0).then(|| sidebar::view_at_width(state.clone(), content_width, cx)))
+        .children(settled_open.then(|| {
+            div()
+                .id("sidebar.resize")
+                .debug_selector(|| "sidebar-resize-handle".into())
+                .absolute()
+                .right_0()
+                .top_0()
+                .h_full()
+                .w(px(Spacing::SM))
+                .cursor(gpui::CursorStyle::ResizeLeftRight)
+                .hover(|style| style.bg(Colors::bg_selected(&theme)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
+                        this.resizing_sidebar = event.click_count != 2;
+                        this.sidebar_resize_offset = visible_sidebar_width(
+                            window.viewport_size().width.into(),
+                            this.state.read(cx).sidebar_width(),
+                        ) - f32::from(event.position.x);
+                        if event.click_count == 2 {
+                            this.state.update(cx, |state, cx| {
+                                state.set_sidebar_width(Layout::SIDEBAR_WIDTH);
+                                state.save();
+                                cx.notify();
+                            });
+                        }
+                        cx.stop_propagation();
+                    }),
+                )
+        }))
+        .into_any_element()
+}
+
 fn inspector_column(
     state: Entity<AppState>,
+    sidebar_width: f32,
     window: &mut Window,
     cx: &mut Context<FlowX>,
 ) -> AnyElement {
     let width = if state.read(cx).snapshot.right_panel_visible {
         visible_inspector_width(
             window.viewport_size().width.into(),
-            state.read(cx).sidebar_visible,
+            sidebar_width,
             state.read(cx).right_panel_width(),
         )
     } else {
@@ -1430,14 +1546,97 @@ mod tests {
 
     #[test]
     fn inspector_preserves_the_conversation_when_the_window_shrinks() {
-        for sidebar in [true, false] {
+        for sidebar in [0.0, Layout::SIDEBAR_WIDTH, Layout::SIDEBAR_MAX_WIDTH] {
             for width in [1000.0, 1280.0, 1920.0] {
                 let panel = visible_inspector_width(width, sidebar, 1100.0);
-                let reserved = if sidebar { Layout::SIDEBAR_WIDTH } else { 0.0 };
-                assert!(width - reserved - panel >= Layout::MINIMUM_CONVERSATION_WIDTH);
+                assert!(width - sidebar - panel >= Layout::MINIMUM_CONVERSATION_WIDTH);
                 assert!(panel <= Layout::RIGHT_PANEL_MAX_WIDTH);
             }
         }
+    }
+
+    #[test]
+    fn dragging_the_sidebar_updates_the_header_and_persists_on_release() {
+        use gpui::{VisualTestContext, point};
+        let mut test = gpui::TestAppContext::single();
+        let (_dir, state) = test.update(seeded);
+        let for_view = state.clone();
+        let window = test.add_window(move |_, _| FlowX::new(for_view));
+        let mut visual = VisualTestContext::from_window(window.into(), &test);
+        visual.simulate_resize(size(px(1280.0), px(800.0)));
+        test.refresh().unwrap();
+        let grip = visual
+            .debug_bounds("sidebar-resize-handle")
+            .unwrap()
+            .center();
+        visual.simulate_mouse_down(grip, MouseButton::Left, Default::default());
+        let destination = point(px(330.0 - Layout::SIDEBAR_WIDTH) + grip.x, grip.y);
+        visual.simulate_mouse_move(destination, MouseButton::Left, Default::default());
+        visual.simulate_mouse_up(destination, MouseButton::Left, Default::default());
+        test.refresh().unwrap();
+        assert_eq!(
+            visual.debug_bounds("sidebar-column").unwrap().size.width,
+            px(330.0)
+        );
+        let header = visual
+            .debug_bounds("icon-button:Workspace actions")
+            .unwrap();
+        let toggle = visual
+            .debug_bounds("icon-button:Toggle sidebar · ⌘B")
+            .unwrap();
+        assert!((f32::from(header.center().x - toggle.center().x)).abs() <= 1.0);
+        assert!(visual.debug_bounds("workspace-title").unwrap().left() >= px(330.0));
+        test.update(|cx| {
+            let paths = state.read(cx).store.paths().clone();
+            let restored = cx.new(|cx| AppState::restore(paths, cx));
+            assert_eq!(restored.read(cx).sidebar_width(), 330.0);
+        });
+    }
+
+    #[test]
+    fn sidebar_toggle_reveals_an_intermediate_width_then_clears_hidden_hit_regions() {
+        use fx_design::theme::animation::FxAnimation;
+        use gpui::VisualTestContext;
+        let mut test = gpui::TestAppContext::single();
+        let (_dir, state) = test.update(seeded);
+        let for_view = state.clone();
+        let window = test.add_window(move |_, _| FlowX::new(for_view));
+        let mut visual = VisualTestContext::from_window(window.into(), &test);
+        visual.simulate_resize(size(px(1280.0), px(800.0)));
+        test.refresh().unwrap();
+        window
+            .update(&mut test, |view, _, cx| {
+                view.state.update(cx, |state, _| state.toggle_sidebar());
+                view.sidebar_transition
+                    .as_mut()
+                    .unwrap()
+                    .set_expanded(false, std::time::Instant::now() - FxAnimation::PANEL / 2);
+                cx.notify();
+            })
+            .unwrap();
+        test.refresh().unwrap();
+        let width = f32::from(visual.debug_bounds("sidebar-column").unwrap().size.width);
+        assert!(width > 0.0 && width < Layout::SIDEBAR_WIDTH);
+        test.read(|cx| {
+            for region in state.read(cx).context_registry.read(cx).regions() {
+                assert!(f32::from(region.bounds.right()) <= width);
+            }
+        });
+        // Advance the transition without a wall-clock sleep in the test.
+        window
+            .update(&mut test, |view, _, cx| {
+                let mut transition = PanelTransition::new(true);
+                transition.set_expanded(false, std::time::Instant::now() - FxAnimation::PANEL);
+                view.sidebar_transition = Some(transition);
+                cx.notify();
+            })
+            .unwrap();
+        test.refresh().unwrap();
+        assert_eq!(
+            visual.debug_bounds("sidebar-column").unwrap().size.width,
+            px(0.0)
+        );
+        test.read(|cx| assert!(state.read(cx).context_registry.read(cx).is_empty()));
     }
 
     /// Paints a transcript through the real render path.
@@ -1721,6 +1920,14 @@ mod tests {
         // declared twice. This is the only crate that sees both, so this is the
         // only place the duplication can be caught.
         let default = PersistedApp::default();
+        assert_eq!(default.sidebar_width, Layout::SIDEBAR_WIDTH);
+        let mut sidebar = default.clone();
+        sidebar.sidebar_width = 0.0;
+        sidebar.normalize();
+        assert_eq!(sidebar.sidebar_width, Layout::SIDEBAR_MIN_WIDTH);
+        sidebar.sidebar_width = f32::MAX;
+        sidebar.normalize();
+        assert_eq!(sidebar.sidebar_width, Layout::SIDEBAR_MAX_WIDTH);
         assert_eq!(default.right_panel_width, Layout::RIGHT_PANEL_DEFAULT_WIDTH);
         assert_eq!(default.min_right_panel_width, Layout::RIGHT_PANEL_MIN_WIDTH);
         assert_eq!(default.max_right_panel_width, Layout::RIGHT_PANEL_MAX_WIDTH);

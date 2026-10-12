@@ -141,6 +141,7 @@ icons! {
     ARROW_DOWN_RIGHT_ARROW_UP_LEFT => "arrow.down.right.and.arrow.up.left",
 
     // Actions
+    ELLIPSIS => "ellipsis",
     ELLIPSIS_CIRCLE => "ellipsis.circle",
     XMARK => "xmark",
     XMARK_CIRCLE_FILL => "xmark.circle.fill",

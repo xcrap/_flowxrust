@@ -577,6 +577,15 @@ impl AppState {
         self.snapshot.sidebar_visible = self.sidebar_visible;
     }
 
+    pub fn sidebar_width(&self) -> f32 {
+        Layout::clamp_sidebar_width(self.snapshot.sidebar_width)
+    }
+
+    /// Resize the project list, retaining its width while the sidebar is hidden.
+    pub fn set_sidebar_width(&mut self, width: f32) {
+        self.snapshot.sidebar_width = Layout::clamp_sidebar_width(width);
+    }
+
     pub fn toggle_inspector(&mut self) {
         self.snapshot.right_panel_visible = !self.snapshot.right_panel_visible;
     }
@@ -2125,6 +2134,36 @@ mod persistence_tests {
     use crate::session::SessionUpdate;
     use fx_agent::provider::Usage;
     use fx_core::{ConversationMessage, MessageRole};
+
+    #[test]
+    fn a_resized_sidebar_retains_its_width_through_hide_and_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let state = test.update(|cx| cx.new(|cx| AppState::restore(paths.clone(), cx)));
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                state.set_sidebar_width(320.5);
+                state.toggle_sidebar();
+                state.save();
+            });
+        });
+        let restored = test.update(|cx| cx.new(|cx| AppState::restore(paths, cx)));
+        test.update(|cx| {
+            restored.update(cx, |state, _| {
+                assert!(!state.sidebar_visible);
+                assert_eq!(state.sidebar_width(), 320.5);
+                state.toggle_sidebar();
+                assert_eq!(state.sidebar_width(), 320.5);
+                state.set_sidebar_width(10.0);
+                assert_eq!(state.sidebar_width(), Layout::SIDEBAR_MIN_WIDTH);
+                state.set_sidebar_width(9000.0);
+                assert_eq!(state.sidebar_width(), Layout::SIDEBAR_MAX_WIDTH);
+                state.set_sidebar_width(f32::NAN);
+                assert_eq!(state.sidebar_width(), Layout::SIDEBAR_WIDTH);
+            });
+        });
+    }
 
     fn workspace(cx: &mut App, paths: &AppPaths) -> (Entity<AppState>, Uuid, Uuid, Uuid) {
         let mut project = Project::new(paths.root().parent().unwrap().to_string_lossy());

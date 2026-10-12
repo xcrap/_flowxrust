@@ -143,6 +143,8 @@ impl Layout {
     // Shell
     pub const TITLE_BAR_HEIGHT: f32 = 52.0;
     pub const SIDEBAR_WIDTH: f32 = 248.0;
+    pub const SIDEBAR_MIN_WIDTH: f32 = 200.0;
+    pub const SIDEBAR_MAX_WIDTH: f32 = 400.0;
     pub const SETTINGS_PANEL_WIDTH: f32 = 560.0;
     pub const CONTROL_HEIGHT: f32 = 30.0;
     pub const CONTROL_COMPACT_HEIGHT: f32 = 28.0;
@@ -213,6 +215,15 @@ impl Layout {
     /// Line height for a diff code row: one mono line plus a little leading.
     pub fn diff_line_height(terminal_point_size: f32) -> f32 {
         (terminal_point_size * 1.4).ceil() + Spacing::XXXS
+    }
+
+    /// Clamp a persisted or user-dragged sidebar width into the allowed range.
+    pub fn clamp_sidebar_width(width: f32) -> f32 {
+        if width.is_finite() {
+            width.clamp(Self::SIDEBAR_MIN_WIDTH, Self::SIDEBAR_MAX_WIDTH)
+        } else {
+            Self::SIDEBAR_WIDTH
+        }
     }
 
     /// Clamp a persisted or user-dragged panel width into the allowed range.

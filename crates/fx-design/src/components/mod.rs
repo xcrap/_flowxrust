@@ -5,6 +5,7 @@
 //! so a theme change reaches all of them at once.
 
 pub mod button;
+pub mod collapsible;
 pub mod context_menu;
 pub mod menu;
 pub mod menu_model;
@@ -13,6 +14,7 @@ pub mod status;
 pub mod surface;
 pub mod tooltip;
 
+pub use collapsible::collapsible;
 pub use context_menu::{
     ContextRegion, ContextRegistry, context_frame, context_region, handle_root_right_click, open_at,
 };
