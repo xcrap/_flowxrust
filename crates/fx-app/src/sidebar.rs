@@ -205,45 +205,18 @@ fn body(state: Entity<AppState>, cx: &mut App) -> AnyElement {
                         }),
                 );
             }
-            let (archived, agents): (Vec<_>, Vec<_>) = project
+            let agents = project
                 .agent_order
                 .iter()
-                .filter(|id| !record.missing_native_agent_ids.contains(id))
+                .filter(|id| {
+                    !record.archived_agent_ids.contains(id)
+                        && !record.missing_native_agent_ids.contains(id)
+                })
                 .filter_map(|id| record.agents.iter().find(|agent| agent.id == *id))
                 .cloned()
-                .partition(|agent| record.archived_agent_ids.contains(&agent.id));
-            if !loading && (!agents.is_empty() || archived.is_empty()) {
-                group = group.child(threads(
-                    &state,
-                    id,
-                    agents,
-                    snapshot.active_agent_id,
-                    false,
-                    cx,
-                ));
-            }
-            if !archived.is_empty() {
-                group = group
-                    .child(
-                        div()
-                            .px(px_len(Spacing::SM))
-                            .pt(px_len(Spacing::SM))
-                            .pb(px_len(Spacing::XXS))
-                            .fx_overline()
-                            .text_color(Colors::fg_tertiary(&theme))
-                            .child(SharedString::from(format!(
-                                "Archived threads · {}",
-                                archived.len()
-                            ))),
-                    )
-                    .child(threads(
-                        &state,
-                        id,
-                        archived,
-                        snapshot.active_agent_id,
-                        true,
-                        cx,
-                    ));
+                .collect();
+            if !loading {
+                group = group.child(threads(&state, id, agents, snapshot.active_agent_id, cx));
             }
         }
         list = list.child(group);
@@ -387,7 +360,6 @@ fn threads(
     project_id: Uuid,
     agents: Vec<Agent>,
     active_agent: Option<Uuid>,
-    archived: bool,
     cx: &mut App,
 ) -> AnyElement {
     let mut column = div()
@@ -412,7 +384,6 @@ fn threads(
             project_id,
             agent.clone(),
             Some(agent.id) == active_agent,
-            archived,
             cx,
         ));
     }
@@ -424,14 +395,13 @@ fn thread_row(
     project_id: Uuid,
     agent: Agent,
     selected: bool,
-    archived: bool,
     cx: &mut App,
 ) -> AnyElement {
     let theme = global::current();
     let agent_id = agent.id;
     let title = thread_title(&agent);
     let busy = state.read(cx).is_thread_busy(agent_id);
-    let menu = thread_menu(archived, busy);
+    let menu = thread_menu(false, busy);
     let context_menu = menu.clone();
     let registry = state.read(cx).context_registry.clone();
 
@@ -466,43 +436,22 @@ fn thread_row(
                 });
             }
         })
-        .child(if archived {
-            div()
-                .w(px_len(Spacing::LG))
-                .flex_shrink_0()
-                .flex()
-                .justify_center()
-                .child(Icon::ARCHIVEBOX.render(
-                    IconSize::Small,
-                    Colors::fg_tertiary(&theme),
-                    &theme,
-                ))
-                .into_any_element()
-        } else {
-            activity_dot(
-                if busy || selected {
-                    Colors::accent(&theme)
-                } else {
-                    Colors::fg_tertiary(&theme)
-                },
-                if busy {
-                    ActivityState::Running
-                } else {
-                    ActivityState::Idle
-                },
-                0.0,
-            )
-            .into_any_element()
-        })
+        .child(activity_dot(
+            if busy || selected {
+                Colors::accent(&theme)
+            } else {
+                Colors::fg_tertiary(&theme)
+            },
+            if busy {
+                ActivityState::Running
+            } else {
+                ActivityState::Idle
+            },
+            0.0,
+        ))
         .child(
             div()
-                .debug_selector(move || {
-                    if archived {
-                        "sidebar-archived-thread-title".into()
-                    } else {
-                        "sidebar-thread-title".into()
-                    }
-                })
+                .debug_selector(|| "sidebar-thread-title".into())
                 .flex_1()
                 .min_w_0()
                 .overflow_hidden()
@@ -705,11 +654,7 @@ mod tests {
 
         let project_title = visual.debug_bounds("sidebar-project-title").unwrap();
         let active_title = visual.debug_bounds("sidebar-thread-title").unwrap();
-        let archived_title = visual
-            .debug_bounds("sidebar-archived-thread-title")
-            .unwrap();
         assert!(active_title.left() > project_title.left());
-        assert_eq!(active_title.left(), archived_title.left());
 
         let toggle = visual
             .debug_bounds("icon-button:Toggle sidebar · ⌘B")
@@ -835,43 +780,45 @@ mod tests {
     }
 
     #[test]
-    fn archived_threads_remain_visible_once_with_restore_actions_and_can_be_read() {
+    fn archived_threads_never_render_or_register_sidebar_menus_until_restored() {
         let temp = tempfile::tempdir().unwrap();
         let mut test = TestAppContext::single();
         let (state, ids) = seeded(&mut test, AppPaths::at(temp.path()), 2, true);
         let for_view = state.clone();
-        let window = test.add_window(move |_, _| SidebarProbe(for_view));
+        test.add_window(move |_, _| SidebarProbe(for_view));
         test.refresh().unwrap();
         test.read(|cx| {
             let registry = state.read(cx).context_registry.read(cx);
-            let matches: Vec<_> = registry
-                .regions()
-                .iter()
-                .filter(|region| region.owner.as_ref() == format!("thread:{}", ids[1]))
-                .collect();
-            assert_eq!(matches.len(), 1);
-            let choices: Vec<_> = matches[0]
-                .menu
-                .as_ref()
-                .unwrap()
-                .sections()
-                .iter()
-                .flat_map(|section| section.items.iter().map(|item| item.id.as_str()))
-                .collect();
-            assert_eq!(choices, ["rename", "unarchive", "delete"]);
-        });
-        let mut visual = VisualTestContext::from_window(window.into(), &test);
-        let position = thread_bounds(&test, &state, ids[1]).center();
-        visual.simulate_mouse_down(position, MouseButton::Left, Default::default());
-        visual.simulate_mouse_up(position, MouseButton::Left, Default::default());
-        test.read(|cx| {
-            let state = state.read(cx);
-            assert_eq!(state.snapshot.active_agent_id, Some(ids[1]));
             assert!(
-                state.snapshot.projects[0]
-                    .archived_agent_ids
-                    .contains(&ids[1])
+                registry
+                    .regions()
+                    .iter()
+                    .any(|region| region.owner.as_ref() == format!("thread:{}", ids[0]))
             );
+            assert!(
+                !registry
+                    .regions()
+                    .iter()
+                    .any(|region| region.owner.as_ref() == format!("thread:{}", ids[1]))
+            );
+        });
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                assert!(state.set_thread_archived(ids[1], false));
+                cx.notify();
+            })
+        });
+        test.refresh().unwrap();
+        test.read(|cx| {
+            assert!(
+                state
+                    .read(cx)
+                    .context_registry
+                    .read(cx)
+                    .regions()
+                    .iter()
+                    .any(|region| region.owner.as_ref() == format!("thread:{}", ids[1]))
+            )
         });
     }
 

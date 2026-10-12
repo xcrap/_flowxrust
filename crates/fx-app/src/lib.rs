@@ -11,6 +11,7 @@
 //! either would have to hand it back out again.
 
 pub mod approvals;
+mod archived_chats;
 mod claude_session_lease;
 pub mod composer;
 mod configuration;

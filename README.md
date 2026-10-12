@@ -27,9 +27,10 @@ not complete.** The remaining work is listed below.
   accidentally resumed through another provider. Model choices and supported
   reasoning levels come from the installed providers; the model picker includes
   a Refresh models action.
-- Thread actions through right-click or the row menu: rename, archive/restore
-  and confirmed local deletion. Archived conversations remain available in the
-  sidebar; these actions manage FlowX's saved records and preserve project files.
+- Thread actions through right-click or the row menu: rename, archive and
+  confirmed local deletion. Archived chats stay out of the sidebar. Search and
+  restore them from **Settings → Archived chats → Manage**; their history and
+  drafts are preserved. These actions manage FlowX's saved records locally.
 - Interactive tool approvals and grouped questions, including masked secret
   answers. Responses return to the thread that requested them.
 - Saved transcripts, provider session IDs, token/context totals, drafts and

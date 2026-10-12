@@ -428,6 +428,8 @@ pub struct SettingsSheet {
     on_apply: ApplyHandler,
     on_dismiss: DismissHandler,
     on_recheck: RecheckHandler,
+    archives: Option<Entity<crate::archived_chats::ArchivedChats>>,
+    show_archives: bool,
     /// Set once either outcome has been reported.
     ///
     /// The caller unmounts on the first callback and reacts to it, not the
@@ -461,6 +463,8 @@ impl SettingsSheet {
             on_apply,
             on_dismiss,
             on_recheck,
+            archives: None,
+            show_archives: false,
             settled: false,
         })
     }
@@ -485,6 +489,10 @@ impl SettingsSheet {
     /// The handle the sheet's key handler is reached through.
     pub fn focus_handle(&self) -> &FocusHandle {
         &self.focus
+    }
+
+    pub(crate) fn set_archives(&mut self, archives: Entity<crate::archived_chats::ArchivedChats>) {
+        self.archives = Some(archives);
     }
 
     /// The settings as they stand.
@@ -658,12 +666,10 @@ impl Render for SettingsSheet {
                     .capture_key_down({
                         let this = this.clone();
                         move |event: &KeyDownEvent, window, cx| {
-                            // Return is the dialog's default action here, and
-                            // nothing in the sheet is a text field that could
-                            // have wanted it.
+                            // Searching archives must not submit the settings.
                             let action = match event.keystroke.key.as_str() {
                                 "escape" => Some(Action::Dismiss),
-                                "enter" => Some(Action::Confirm),
+                                "enter" if !this.read(cx).show_archives => Some(Action::Confirm),
                                 _ => None,
                             };
                             let Some(action) = action else {
@@ -705,6 +711,87 @@ impl SettingsSheet {
         let for_reset = this.clone();
         let for_done = this.clone();
         let for_close = this.clone();
+        let content = if self.show_archives {
+            div().children(self.archives.clone()).into_any_element()
+        } else {
+            let mut content = div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap(px_len(Spacing::XXL))
+                .child(self.appearance_section(this))
+                .child(self.provider_section(this));
+            if self.archives.is_some() {
+                let this = this.clone();
+                content = content.child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px_len(Spacing::MD))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap(px_len(Spacing::XXS))
+                                .child(div().fx_body().child("Archived chats"))
+                                .child(
+                                    div()
+                                        .fx_caption()
+                                        .text_color(Colors::fg_secondary(&theme))
+                                        .child("Find and restore chats from your projects."),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .debug_selector(|| "manage-archived-chats".into())
+                                .child(button(
+                                    "Manage",
+                                    ButtonStyle::Secondary,
+                                    true,
+                                    move |_, window, cx| {
+                                        this.update(cx, |sheet, cx| {
+                                            sheet.show_archives = true;
+                                            if let Some(archives) = &sheet.archives {
+                                                archives.read(cx).focus_search(window, cx);
+                                            }
+                                            cx.notify();
+                                        });
+                                    },
+                                )),
+                        ),
+                );
+            }
+            content.into_any_element()
+        };
+        let reset_or_back = if self.show_archives {
+            button(
+                "Back to Settings",
+                ButtonStyle::Ghost,
+                true,
+                move |_, window, cx| {
+                    for_reset.update(cx, |sheet, cx| {
+                        sheet.show_archives = false;
+                        sheet.focus.focus(window);
+                        cx.notify();
+                    });
+                },
+            )
+            .into_any_element()
+        } else {
+            button(
+                "Reset changes",
+                ButtonStyle::Ghost,
+                self.can_reset(),
+                move |_, _, cx| {
+                    for_reset.update(cx, |sheet, cx| sheet.reset(cx));
+                },
+            )
+            .into_any_element()
+        };
         div()
             .w_full()
             .flex()
@@ -726,12 +813,20 @@ impl SettingsSheet {
                             .flex()
                             .flex_col()
                             .gap(px_len(Spacing::XXS))
-                            .child(div().fx_title2().child("Settings"))
+                            .child(div().fx_title2().child(if self.show_archives {
+                                "Archived chats"
+                            } else {
+                                "Settings"
+                            }))
                             .child(
                                 div()
                                     .fx_caption()
                                     .text_color(Colors::fg_secondary(&theme))
-                                    .child("Appearance and AI providers"),
+                                    .child(if self.show_archives {
+                                        "Restore a chat to return it to the sidebar."
+                                    } else {
+                                        "Appearance, AI providers and archived chats"
+                                    }),
                             ),
                     )
                     .child(icon_button(
@@ -747,7 +842,11 @@ impl SettingsSheet {
             .child(divider())
             .child(
                 div()
-                    .id("settings-content")
+                    .id(if self.show_archives {
+                        "settings-archives-content"
+                    } else {
+                        "settings-content"
+                    })
                     .w_full()
                     .min_h_0()
                     .max_h(max_body_height)
@@ -759,8 +858,7 @@ impl SettingsSheet {
                             .flex_col()
                             .gap(px_len(Spacing::XXL))
                             .p(px_len(Spacing::XXL))
-                            .child(self.appearance_section(this))
-                            .child(self.provider_section(this)),
+                            .child(content),
                     ),
             )
             .child(divider())
@@ -774,14 +872,7 @@ impl SettingsSheet {
                     .px(px_len(Spacing::XXL))
                     .py(px_len(Spacing::LG))
                     .flex_shrink_0()
-                    .child(button(
-                        "Reset changes",
-                        ButtonStyle::Ghost,
-                        self.can_reset(),
-                        move |_, _, cx| {
-                            for_reset.update(cx, |sheet, cx| sheet.reset(cx));
-                        },
-                    ))
+                    .child(reset_or_back)
                     .child(button(
                         "Done",
                         ButtonStyle::Primary,

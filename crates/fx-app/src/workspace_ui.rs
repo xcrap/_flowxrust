@@ -124,6 +124,7 @@ pub fn open_settings(state: Entity<AppState>, window: &mut Window, cx: &mut App)
     let apply_ui = ui.clone();
     let dismiss_ui = ui.clone();
     let refresh_ui = ui.clone();
+    let archives = crate::archived_chats::ArchivedChats::new(state.clone(), cx);
     let baseline = SettingsDraft::from_theme(&global::current());
     let sheet = SettingsSheet::open(
         window,
@@ -144,6 +145,7 @@ pub fn open_settings(state: Entity<AppState>, window: &mut Window, cx: &mut App)
             cx.defer(move |cx| refresh_ui.update(cx, |ui, cx| ui.recheck(cx)));
         }),
     );
+    sheet.update(cx, |sheet, _| sheet.set_archives(archives));
     ui.update(cx, |ui, cx| {
         ui.settings = Some(sheet);
         ui.recheck(cx);

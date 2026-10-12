@@ -470,6 +470,7 @@ impl AppState {
                 }
             } else {
                 record.archived_agent_ids.retain(|id| *id != agent_id);
+                record.missing_native_agent_ids.retain(|id| *id != agent_id);
             }
             break;
         }
