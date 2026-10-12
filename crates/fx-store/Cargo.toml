@@ -1,0 +1,21 @@
+[package]
+name = "fx-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "FlowX persistence. Owns the on-disk format and nothing else."
+
+[dependencies]
+fx-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+directories.workspace = true
+
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "fx-design"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "FlowX design system: tokens, typography, icons, and shared components."
+
+[dependencies]
+gpui.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+pretty_assertions = "1"
+# The same SVG engine GPUI uses; verify that embedded glyphs produce pixels.
+resvg = { version = "0.45.1", default-features = false }

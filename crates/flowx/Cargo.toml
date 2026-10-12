@@ -1,0 +1,20 @@
+[package]
+name = "flowx"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "flowx"
+path = "src/main.rs"
+
+[dependencies]
+# The binary's only job is to resolve state from disk and open the window.
+# Everything else is in `fx-app`, which is where the tests reach it from.
+fx-app.workspace = true
+fx-store.workspace = true
+gpui.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

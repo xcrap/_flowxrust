@@ -1,0 +1,899 @@
+//! Mounted workspace dialogs and their integration with the running sessions.
+
+use std::sync::mpsc;
+
+use fx_agent::provider::{ProviderEvent, UserResponse};
+use fx_core::services::runtime::{BinaryHealth, BinarySpec, RuntimeDiscovery, all_specs};
+use fx_design::components::{ButtonStyle, button, panel};
+use fx_design::styled::{FxStyled, px_len};
+use fx_design::theme::{Colors, Layout, Spacing, global};
+use gpui::prelude::*;
+use gpui::{App, Context, Entity, SharedString, Subscription, Window, div};
+use uuid::Uuid;
+
+use crate::settings::{self, ProviderReport, SettingsDraft, SettingsSheet};
+use crate::state::AppState;
+use crate::text_field::TextField;
+
+type HealthResults = Vec<(BinarySpec, BinaryHealth)>;
+
+#[derive(Clone)]
+pub struct UiHandle(pub Entity<WorkspaceUi>);
+impl gpui::Global for UiHandle {}
+
+#[derive(Default)]
+pub struct WorkspaceUi {
+    pub settings: Option<Entity<SettingsSheet>>,
+    pub request: Option<Entity<RequestPanel>>,
+    request_key: Option<(Uuid, String)>,
+    health: HealthResults,
+    health_results: Option<mpsc::Receiver<Result<HealthResults, String>>>,
+    health_error: Option<String>,
+}
+
+pub fn handle(cx: &mut App) -> Entity<WorkspaceUi> {
+    if let Some(handle) = cx.try_global::<UiHandle>() {
+        return handle.0.clone();
+    }
+    let ui = cx.new(|_| WorkspaceUi::default());
+    cx.set_global(UiHandle(ui.clone()));
+    ui
+}
+
+pub fn restore_preferences(state: &Entity<AppState>, cx: &mut App) {
+    match state.read(cx).store.load_preferences() {
+        Ok(saved) => {
+            let current = global::current();
+            let draft = preferences_draft(&saved, &current);
+            global::set(draft.apply_to(&current));
+        }
+        Err(error) => tracing::warn!(%error, "could not restore appearance preferences"),
+    }
+}
+
+fn preferences_draft(
+    saved: &fx_store::PersistedPreferences,
+    current: &fx_design::theme::Theme,
+) -> SettingsDraft {
+    fn stored_choice<T: Copy>(choices: Vec<settings::Choice<T>>, saved: &str) -> Option<T> {
+        choices
+            .into_iter()
+            .find(|choice| choice.label.eq_ignore_ascii_case(saved.trim()))
+            .map(|choice| choice.value)
+    }
+    SettingsDraft {
+        appearance: stored_choice(settings::appearance_choices(), &saved.appearance)
+            .unwrap_or(current.appearance_mode),
+        base_tone: stored_choice(settings::tone_choices(), &saved.base_tone)
+            .unwrap_or(current.base_tone),
+        accent: stored_choice(settings::accent_choices(), &saved.accent)
+            .unwrap_or(current.accent_color),
+        text_size: stored_choice(settings::text_size_choices(), &saved.text_size)
+            .unwrap_or(current.text_size),
+    }
+}
+
+fn apply_settings(
+    state: &Entity<AppState>,
+    ui: &Entity<WorkspaceUi>,
+    draft: SettingsDraft,
+    cx: &mut App,
+) {
+    let saved = fx_store::PersistedPreferences {
+        appearance: draft.appearance.label().to_ascii_lowercase(),
+        base_tone: draft.base_tone.label().to_ascii_lowercase(),
+        accent: draft.accent.label().to_ascii_lowercase(),
+        text_size: draft.text_size.label().to_ascii_lowercase(),
+    };
+    match state.read(cx).store.save_preferences(&saved) {
+        Err(error) => state.update(cx, |state, cx| {
+            state.last_error = Some(format!("Could not save settings: {error}"));
+            cx.notify();
+        }),
+        Ok(()) => global::set(draft.apply_to(&global::current())),
+    }
+    // Confirm settles the sheet before its callback. Remove it even on a
+    // failed save, so an invisible settled modal cannot block the workspace.
+    ui.update(cx, |ui, cx| {
+        ui.settings = None;
+        cx.notify();
+    });
+    cx.refresh_windows();
+}
+
+pub fn open_settings(state: Entity<AppState>, window: &mut Window, cx: &mut App) {
+    let ui = handle(cx);
+    let apply_ui = ui.clone();
+    let dismiss_ui = ui.clone();
+    let refresh_ui = ui.clone();
+    let sheet = SettingsSheet::open(
+        window,
+        cx,
+        Box::new(move |draft, window, cx| {
+            apply_settings(&state, &apply_ui, draft, cx);
+            window.blur();
+        }),
+        Box::new(move |window, cx| {
+            dismiss_ui.update(cx, |ui, cx| {
+                ui.settings = None;
+                cx.notify();
+            });
+            window.blur();
+        }),
+        Box::new(move |_, cx| {
+            let refresh_ui = refresh_ui.clone();
+            cx.defer(move |cx| refresh_ui.update(cx, |ui, cx| ui.recheck(cx)));
+        }),
+    );
+    ui.update(cx, |ui, cx| {
+        ui.settings = Some(sheet);
+        ui.recheck(cx);
+    });
+}
+
+impl WorkspaceUi {
+    fn recheck(&mut self, cx: &mut Context<Self>) {
+        if self.health_results.is_some() {
+            self.update_health_sheet(cx);
+            cx.notify();
+            return;
+        }
+        self.health_error = None;
+        self.health = all_specs()
+            .into_iter()
+            .map(|spec| (spec, BinaryHealth::Checking))
+            .collect();
+        self.update_health_sheet(cx);
+        let (tx, rx) = mpsc::channel();
+        self.health_results = Some(rx);
+        if let Err(error) = std::thread::Builder::new()
+            .name("flowx-runtime-health".into())
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        let _ = tx.send(Err(format!(
+                            "Could not initialize the runtime check: {error}"
+                        )));
+                        return;
+                    }
+                };
+                let results = runtime.block_on(async {
+                    let discovery = RuntimeDiscovery::default();
+                    let mut results = Vec::new();
+                    for spec in all_specs() {
+                        let health = discovery.health(&spec).await;
+                        results.push((spec, health));
+                    }
+                    results
+                });
+                let _ = tx.send(Ok(results));
+            })
+        {
+            tracing::warn!(%error, "could not start runtime health check");
+            self.health_failed(format!("Could not start the runtime check: {error}"), cx);
+        }
+        cx.notify();
+    }
+
+    fn update_health_sheet(&self, cx: &mut App) {
+        if let Some(sheet) = &self.settings {
+            if let Some(error) = &self.health_error {
+                sheet.update(cx, |sheet, cx| sheet.set_health_error(cx, error));
+                return;
+            }
+            let reports: Vec<_> = self
+                .health
+                .iter()
+                .map(|(spec, health)| ProviderReport::new(spec, health))
+                .collect();
+            sheet.update(cx, |sheet, cx| sheet.set_health(cx, &reports));
+        }
+    }
+
+    pub fn is_checking(&self) -> bool {
+        self.health_results.is_some()
+    }
+
+    fn health_failed(&mut self, reason: String, cx: &mut Context<Self>) {
+        self.health_results = None;
+        self.health_error = Some(reason);
+        self.update_health_sheet(cx);
+        cx.notify();
+    }
+
+    pub fn poll(&mut self, cx: &mut Context<Self>) {
+        let result = self.health_results.as_ref().map(|rx| rx.try_recv());
+        match result {
+            Some(Ok(Ok(health))) => {
+                self.health = health;
+                self.health_results = None;
+                self.update_health_sheet(cx);
+                cx.notify();
+            }
+            Some(Ok(Err(reason))) => self.health_failed(reason, cx),
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                self.health_failed(
+                    "The runtime check stopped before it returned a result. Try Check again."
+                        .into(),
+                    cx,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    pub fn sync_request(
+        &mut self,
+        state: &Entity<AppState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let pending = state.read(cx).next_interaction();
+        let key = pending
+            .as_ref()
+            .and_then(|(agent, event)| request_id(event).map(|id| (*agent, id.to_string())));
+        if key == self.request_key {
+            return;
+        }
+        if self.request.is_some() {
+            window.blur();
+        }
+        self.request_key = key;
+        self.request =
+            pending.map(|(agent, event)| RequestPanel::new(state.clone(), agent, event, cx));
+    }
+}
+
+fn request_id(event: &ProviderEvent) -> Option<&str> {
+    match event {
+        ProviderEvent::Approval(request) => Some(&request.id),
+        ProviderEvent::UserInput(request) => Some(&request.id),
+        _ => None,
+    }
+}
+
+pub struct RequestPanel {
+    state: Entity<AppState>,
+    agent: Uuid,
+    event: ProviderEvent,
+    fields: Vec<Entity<TextField>>,
+    _observations: Vec<Subscription>,
+    sent: bool,
+    focus: gpui::FocusHandle,
+    focused: bool,
+}
+
+impl RequestPanel {
+    fn new(
+        state: Entity<AppState>,
+        agent: Uuid,
+        event: ProviderEvent,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        cx.new(|cx| {
+            let fields = match &event {
+                ProviderEvent::UserInput(request) => request
+                    .questions
+                    .iter()
+                    .map(|question| {
+                        cx.new(|cx| {
+                            TextField::new(cx)
+                                .placeholder("Your answer")
+                                .max_len(16_000)
+                                .secret(question.is_secret)
+                        })
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            let observations = fields
+                .iter()
+                .map(|field| cx.observe(field, |_, _, cx| cx.notify()))
+                .collect();
+            Self {
+                state,
+                agent,
+                event,
+                fields,
+                _observations: observations,
+                sent: false,
+                focus: cx.focus_handle(),
+                focused: false,
+            }
+        })
+    }
+
+    fn respond(&mut self, response: UserResponse, cx: &mut Context<Self>) {
+        if self.sent {
+            return;
+        }
+        self.sent = self.state.update(cx, |state, cx| {
+            let sent = state.respond_to_interaction(self.agent, response);
+            cx.notify();
+            sent
+        });
+        cx.notify();
+    }
+
+    fn answers(&self, cx: &App) -> Option<UserResponse> {
+        let ProviderEvent::UserInput(request) = &self.event else {
+            return None;
+        };
+        let answers: Vec<_> = request
+            .questions
+            .iter()
+            .zip(&self.fields)
+            .map(|(question, field)| {
+                let value = field.read(cx).value();
+                (
+                    question.id.clone(),
+                    if question.is_secret {
+                        value.to_string()
+                    } else {
+                        value.trim().to_string()
+                    },
+                )
+            })
+            .collect();
+        if answers.len() != request.questions.len()
+            || answers.is_empty()
+            || answers.iter().any(|(_, value)| value.trim().is_empty())
+        {
+            return None;
+        }
+        Some(UserResponse::Questions {
+            id: request.id.clone(),
+            answers,
+        })
+    }
+}
+
+impl Render for RequestPanel {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.focused {
+            if let Some(field) = self.fields.first() {
+                field.read(cx).focus_handle().focus(window);
+            } else {
+                self.focus.focus(window);
+            }
+            self.focused = true;
+        }
+        let theme = global::current();
+        let title = self
+            .state
+            .read(cx)
+            .snapshot
+            .projects
+            .iter()
+            .flat_map(|p| &p.agents)
+            .find(|agent| agent.id == self.agent)
+            .map(|agent| agent.title.clone())
+            .unwrap_or_else(|| "Conversation".into());
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .gap(px_len(Spacing::MD))
+            .p(px_len(Spacing::LG))
+            .child(
+                div()
+                    .fx_caption()
+                    .text_color(Colors::fg_secondary(&theme))
+                    .child(SharedString::from(title)),
+            );
+        match &self.event {
+            ProviderEvent::Approval(request) => {
+                body = body
+                    .child(
+                        div()
+                            .fx_title2()
+                            .child(SharedString::from(format!("Allow {}?", request.tool_name))),
+                    )
+                    .child(
+                        div()
+                            .fx_mono()
+                            .text_color(Colors::fg_secondary(&theme))
+                            .child(SharedString::from(
+                                request
+                                    .input
+                                    .to_string()
+                                    .chars()
+                                    .take(4_000)
+                                    .collect::<String>(),
+                            )),
+                    );
+                let allow = UserResponse::Approval {
+                    id: request.id.clone(),
+                    approved: true,
+                };
+                let deny = UserResponse::Approval {
+                    id: request.id.clone(),
+                    approved: false,
+                };
+                body = body.child(
+                    div()
+                        .flex()
+                        .gap(px_len(Spacing::SM))
+                        .child(button(
+                            "Deny",
+                            ButtonStyle::Secondary,
+                            !self.sent,
+                            cx.listener(move |this, _, _, cx| this.respond(deny.clone(), cx)),
+                        ))
+                        .child(button(
+                            "Allow once",
+                            ButtonStyle::Primary,
+                            !self.sent,
+                            cx.listener(move |this, _, _, cx| this.respond(allow.clone(), cx)),
+                        )),
+                );
+            }
+            ProviderEvent::UserInput(request) => {
+                body = body.child(div().fx_title2().child("Your answer is needed"));
+                for (index, question) in request.questions.iter().enumerate() {
+                    let mut section = div().flex().flex_col().gap(px_len(Spacing::XS)).child(
+                        div()
+                            .fx_body_medium()
+                            .child(SharedString::from(question.question.clone())),
+                    );
+                    for option in &question.options {
+                        let field = self.fields[index].clone();
+                        let value = option.label.clone();
+                        section = section.child(button(
+                            SharedString::from(option.label.clone()),
+                            ButtonStyle::Secondary,
+                            !self.sent,
+                            move |_, _, cx| {
+                                field.update(cx, |field, cx| field.set_value(value.clone(), cx))
+                            },
+                        ));
+                        if !option.description.is_empty() {
+                            section = section.child(
+                                div()
+                                    .fx_caption()
+                                    .text_color(Colors::fg_secondary(&theme))
+                                    .child(SharedString::from(option.description.clone())),
+                            );
+                        }
+                    }
+                    section = section.child(self.fields[index].clone());
+                    body = body.child(section);
+                }
+                let answers = self.answers(cx);
+                let cancel = UserResponse::CancelQuestions {
+                    id: request.id.clone(),
+                };
+                body = body.child(
+                    div()
+                        .flex()
+                        .gap(px_len(Spacing::SM))
+                        .child(button(
+                            "Cancel",
+                            ButtonStyle::Secondary,
+                            !self.sent,
+                            cx.listener(move |this, _, _, cx| this.respond(cancel.clone(), cx)),
+                        ))
+                        .child(button(
+                            "Send answers",
+                            ButtonStyle::Primary,
+                            !self.sent && answers.is_some(),
+                            cx.listener(move |this, _, _, cx| {
+                                if let Some(answer) = this.answers(cx) {
+                                    this.respond(answer, cx);
+                                }
+                            }),
+                        )),
+                );
+            }
+            _ => {}
+        }
+        div()
+            .id("provider-request-overlay")
+            .track_focus(&self.focus)
+            .occlude()
+            .absolute()
+            .inset_0()
+            .bg(Colors::overlay(&theme))
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .w(px_len(Layout::SETTINGS_PANEL_WIDTH))
+                    .max_w_full()
+                    .max_h_full()
+                    .id("provider-request")
+                    .overflow_y_scroll()
+                    .child(panel(body)),
+            )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fx_agent::provider::{Question, UserInputRequest};
+    use fx_design::theme::{AccentColor, AppearanceMode, BaseTone, TextSizePreset};
+    use fx_store::{AppPaths, PersistedPreferences};
+
+    fn state(cx: &mut App, path: &std::path::Path) -> Entity<AppState> {
+        cx.new(|cx| AppState::restore(AppPaths::at(path), cx))
+    }
+
+    fn question(id: &str, secret: bool) -> Question {
+        Question {
+            id: id.into(),
+            header: id.into(),
+            question: format!("Answer {id}"),
+            options: vec![],
+            is_other: true,
+            is_secret: secret,
+        }
+    }
+
+    /// Render the real composer and modal entities together. A direct call to
+    /// TextField::set_value cannot detect which platform input handler owns keys.
+    struct MountedWorkspace {
+        state: Entity<AppState>,
+        ui: Entity<WorkspaceUi>,
+        composer: Entity<TextField>,
+    }
+
+    impl Render for MountedWorkspace {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            self.state.update(cx, |state, _| state.drain_updates());
+            self.ui
+                .update(cx, |ui, cx| ui.sync_request(&self.state, window, cx));
+            div()
+                .relative()
+                .size_full()
+                .child(self.composer.clone())
+                .children(self.ui.read(cx).settings.clone())
+                .children(self.ui.read(cx).request.clone())
+        }
+    }
+
+    #[test]
+    fn a_mounted_secret_request_takes_input_away_from_the_covered_composer() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut test = gpui::TestAppContext::single();
+        let (state, ui, composer) =
+            test.update(|cx| (state(cx, temp.path()), handle(cx), cx.new(TextField::new)));
+        let window = test.add_window({
+            let state = state.clone();
+            let ui = ui.clone();
+            let composer = composer.clone();
+            move |window, cx| {
+                composer.read(cx).focus_handle().focus(window);
+                MountedWorkspace {
+                    state,
+                    ui,
+                    composer,
+                }
+            }
+        });
+        test.refresh().expect("the composer painted");
+        test.simulate_input(window.into(), "existing-draft");
+        test.update(|cx| assert_eq!(composer.read(cx).value(), "existing-draft"));
+
+        let agent = Uuid::new_v4();
+        test.update(|cx| {
+            state.read(cx).update_sender_for(agent)(crate::session::SessionUpdate::Interaction {
+                event: ProviderEvent::UserInput(UserInputRequest {
+                    id: "secret-request".into(),
+                    questions: vec![question("password", true)],
+                }),
+            })
+        });
+        window.update(&mut test, |_, _, cx| cx.notify()).unwrap();
+        test.refresh().expect("the question overlay painted");
+        let field =
+            test.update(|cx| ui.read(cx).request.as_ref().unwrap().read(cx).fields[0].clone());
+        window
+            .update(&mut test, |_, window, cx| {
+                assert!(field.read(cx).focus_handle().is_focused(window));
+                assert!(!composer.read(cx).focus_handle().is_focused(window));
+            })
+            .unwrap();
+        test.simulate_input(window.into(), "test-secret");
+        test.update(|cx| {
+            assert_eq!(field.read(cx).value(), "test-secret");
+            assert_eq!(composer.read(cx).value(), "existing-draft");
+        });
+
+        test.update(|cx| {
+            state.read(cx).update_sender_for(agent)(
+                crate::session::SessionUpdate::InteractionResolved {
+                    id: "secret-request".into(),
+                },
+            )
+        });
+        window.update(&mut test, |_, _, cx| cx.notify()).unwrap();
+        test.refresh().expect("the resolved overlay was removed");
+        window
+            .update(&mut test, |_, window, cx| {
+                assert!(ui.read(cx).request.is_none());
+                assert!(!field.read(cx).focus_handle().is_focused(window));
+            })
+            .unwrap();
+        test.simulate_input(window.into(), "after");
+        test.update(|cx| {
+            assert_eq!(
+                field.read(cx).value(),
+                "test-secret",
+                "removed request retained the input handler"
+            );
+            assert_eq!(
+                composer.read(cx).value(),
+                "existing-draft",
+                "blur restored input into the covered draft"
+            );
+        });
+    }
+
+    #[test]
+    fn a_mounted_approval_blocks_typing_into_the_covered_composer() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut test = gpui::TestAppContext::single();
+        let (state, ui, composer) =
+            test.update(|cx| (state(cx, temp.path()), handle(cx), cx.new(TextField::new)));
+        let window = test.add_window({
+            let state = state.clone();
+            let ui = ui.clone();
+            let composer = composer.clone();
+            move |window, cx| {
+                composer.read(cx).focus_handle().focus(window);
+                MountedWorkspace {
+                    state,
+                    ui,
+                    composer,
+                }
+            }
+        });
+        test.refresh().unwrap();
+        test.simulate_input(window.into(), "draft");
+        test.update(|cx| {
+            state.read(cx).update_sender_for(Uuid::new_v4())(
+                crate::session::SessionUpdate::Interaction {
+                    event: ProviderEvent::Approval(fx_agent::provider::ApprovalRequest {
+                        id: "approval".into(),
+                        tool_name: "shell".into(),
+                        input: serde_json::json!({"command":"cargo test"}),
+                        risk: fx_agent::provider::RiskLevel::Moderate,
+                    }),
+                },
+            );
+        });
+        window.update(&mut test, |_, _, cx| cx.notify()).unwrap();
+        test.refresh().expect("the approval overlay painted");
+        window
+            .update(&mut test, |_, window, cx| {
+                assert!(ui.read(cx).request.is_some());
+                assert!(!composer.read(cx).focus_handle().is_focused(window));
+            })
+            .unwrap();
+        test.simulate_input(window.into(), "should-not-be-a-draft");
+        test.update(|cx| assert_eq!(composer.read(cx).value(), "draft"));
+    }
+
+    #[test]
+    fn settings_recheck_defers_refresh_until_the_sheet_entity_borrow_is_released() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut test = gpui::TestAppContext::single();
+        // Holding this pending mock prevents open_settings/recheck from ever
+        // launching discovery against the test machine's real provider CLIs.
+        let (_health_sender, health_receiver) = mpsc::channel();
+        let (state, ui, composer) = test.update(|cx| {
+            let ui = handle(cx);
+            ui.update(cx, |ui, _| {
+                ui.health_results = Some(health_receiver);
+                ui.health = vec![(
+                    BinarySpec::new("fixture", "Fixture runtime", vec![]),
+                    BinaryHealth::Checking,
+                )];
+            });
+            (state(cx, temp.path()), ui, cx.new(TextField::new))
+        });
+        let window = test.add_window(move |_, _| MountedWorkspace {
+            state,
+            ui,
+            composer,
+        });
+        window
+            .update(&mut test, |host, window, cx| {
+                open_settings(host.state.clone(), window, cx);
+                cx.notify();
+            })
+            .unwrap();
+        test.refresh()
+            .expect("the production settings sheet painted");
+        window
+            .update(&mut test, |host, window, cx| {
+                let sheet = host.ui.read(cx).settings.clone().unwrap();
+                // Same entity borrow used by SettingsSheet's Re-check button. The
+                // old synchronous callback tried to update this very entity again.
+                sheet.update(cx, |sheet, cx| sheet.recheck(window, cx));
+            })
+            .expect("rechecking did not re-enter the borrowed settings entity");
+        test.refresh()
+            .expect("the deferred health update repainted");
+        window
+            .update(&mut test, |host, _, cx| {
+                let ui = host.ui.read(cx);
+                assert!(ui.is_checking());
+                let rows = ui.settings.as_ref().unwrap().read(cx).rows();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].title, "Fixture runtime");
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn grouped_questions_keep_enclosing_and_nested_ids_and_require_every_answer() {
+        let temp = tempfile::tempdir().unwrap();
+        let test = gpui::TestAppContext::single();
+        test.update(|cx| {
+            let state = state(cx, temp.path());
+            let panel = RequestPanel::new(
+                state,
+                Uuid::new_v4(),
+                ProviderEvent::UserInput(UserInputRequest {
+                    id: "request-envelope".into(),
+                    questions: vec![question("database", false), question("region", false)],
+                }),
+                cx,
+            );
+            assert!(panel.read(cx).answers(cx).is_none());
+            let fields = panel.read(cx).fields.clone();
+            fields[0].update(cx, |field, cx| field.set_value("  SQLite  ", cx));
+            fields[1].update(cx, |field, cx| field.set_value("  \t ", cx));
+            assert!(
+                panel.read(cx).answers(cx).is_none(),
+                "a whitespace-only answer must not complete a group"
+            );
+            fields[1].update(cx, |field, cx| field.set_value("Azores", cx));
+            assert_eq!(
+                panel.read(cx).answers(cx),
+                Some(UserResponse::Questions {
+                    id: "request-envelope".into(),
+                    answers: vec![
+                        ("database".into(), "SQLite".into()),
+                        ("region".into(), "Azores".into())
+                    ],
+                })
+            );
+        });
+    }
+
+    #[test]
+    fn secret_questions_use_masked_fields_and_preserve_the_exact_answer() {
+        let temp = tempfile::tempdir().unwrap();
+        let test = gpui::TestAppContext::single();
+        test.update(|cx| {
+            let state = state(cx, temp.path());
+            let panel = RequestPanel::new(
+                state,
+                Uuid::new_v4(),
+                ProviderEvent::UserInput(UserInputRequest {
+                    id: "auth-request".into(),
+                    questions: vec![question("password", true)],
+                }),
+                cx,
+            );
+            let field = panel.read(cx).fields[0].clone();
+            assert!(field.read(cx).is_secret());
+            field.update(cx, |field, cx| field.set_value("  test-secret-🜁  ", cx));
+            assert_eq!(
+                panel.read(cx).answers(cx),
+                Some(UserResponse::Questions {
+                    id: "auth-request".into(),
+                    answers: vec![("password".into(), "  test-secret-🜁  ".into())],
+                })
+            );
+        });
+    }
+
+    #[test]
+    fn stored_preferences_accept_stable_lowercase_and_legacy_display_labels() {
+        let current = crate::state::default_theme();
+        let saved = PersistedPreferences {
+            appearance: "light".into(),
+            base_tone: "stone".into(),
+            accent: "orange".into(),
+            text_size: "large".into(),
+        };
+        let expected = SettingsDraft {
+            appearance: AppearanceMode::Light,
+            base_tone: BaseTone::Stone,
+            accent: AccentColor::Orange,
+            text_size: TextSizePreset::Large,
+        };
+        assert_eq!(preferences_draft(&saved, &current), expected);
+        let legacy = PersistedPreferences {
+            appearance: "Light".into(),
+            base_tone: "Stone".into(),
+            accent: "Orange".into(),
+            text_size: "Large".into(),
+        };
+        assert_eq!(preferences_draft(&legacy, &current), expected);
+        let invalid = PersistedPreferences {
+            accent: "removed-accent".into(),
+            ..saved
+        };
+        assert_eq!(
+            preferences_draft(&invalid, &current).accent,
+            current.accent_color
+        );
+    }
+
+    #[test]
+    fn a_settings_save_failure_closes_the_settled_sheet_and_reports_the_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let test = gpui::TestAppContext::single();
+        test.update(|cx| {
+            let state = state(cx, temp.path());
+            // A directory at the target is a deterministic write failure even for root.
+            std::fs::create_dir(state.read(cx).paths.preferences_file()).unwrap();
+            let ui = cx.new(|_| WorkspaceUi::default());
+            let sheet = SettingsSheet::new(
+                cx,
+                Box::new(|_, _, _| {}),
+                Box::new(|_, _| {}),
+                Box::new(|_, _| {}),
+            );
+            ui.update(cx, |ui, _| ui.settings = Some(sheet));
+            let before = global::current();
+            let draft = SettingsDraft::from_theme(&before.with_accent(before.accent_color.next()));
+            apply_settings(&state, &ui, draft, cx);
+            assert!(ui.read(cx).settings.is_none());
+            assert!(
+                state
+                    .read(cx)
+                    .last_error
+                    .as_deref()
+                    .unwrap()
+                    .starts_with("Could not save settings:")
+            );
+            assert_eq!(global::current().accent_color, before.accent_color);
+        });
+    }
+
+    #[test]
+    fn a_disconnected_health_worker_does_not_leave_permanent_checking_rows() {
+        let test = gpui::TestAppContext::single();
+        test.update(|cx| {
+            let sheet = SettingsSheet::new(
+                cx,
+                Box::new(|_, _, _| {}),
+                Box::new(|_, _| {}),
+                Box::new(|_, _| {}),
+            );
+            let ui = cx.new(|_| WorkspaceUi::default());
+            ui.update(cx, |ui, cx| {
+                ui.settings = Some(sheet.clone());
+                ui.health = all_specs()
+                    .into_iter()
+                    .map(|spec| (spec, BinaryHealth::Checking))
+                    .collect();
+                ui.update_health_sheet(cx);
+                let (sender, receiver) = mpsc::channel();
+                ui.health_results = Some(receiver);
+                drop(sender);
+                ui.poll(cx);
+                assert!(!ui.is_checking());
+            });
+            assert!(!sheet.read(cx).rows().is_empty());
+            assert!(
+                sheet
+                    .read(cx)
+                    .rows()
+                    .iter()
+                    .all(|row| row.badge == "Check failed" && row.tone == settings::RowTone::Bad)
+            );
+        });
+    }
+}

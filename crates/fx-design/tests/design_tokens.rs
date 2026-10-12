@@ -1,0 +1,401 @@
+//! The contrast contract.
+//!
+//! These tests are the reason the palette is trustworthy. They carry over the
+//! invariants from the Swift design system, which treats them as binding rather
+//! than advisory: if a tone is retuned and one of these fails, the tone is wrong.
+//!
+//! Run them after touching any foreground, background, or accent token.
+
+use fx_design::theme::{
+    AccentColor, AppearanceMode, BaseTone, Colors, Rgba, TextSizePreset, Theme, composite,
+    contrast, h,
+};
+
+/// Every tone and appearance combination. A test that must hold everywhere
+/// iterates this rather than a hand-written list.
+fn all_theme_combinations() -> Vec<(BaseTone, AppearanceMode)> {
+    let mut out = Vec::new();
+    for tone in BaseTone::ALL {
+        for mode in [AppearanceMode::Light, AppearanceMode::Dark] {
+            out.push((tone, mode));
+        }
+    }
+    out
+}
+
+/// The four status hues paired with their own tinted fills, in the order the
+/// palette declares them.
+fn status_pairs(t: &Theme) -> [(&'static str, Rgba, Rgba); 4] {
+    [
+        ("success", Colors::success(t), Colors::success_muted(t)),
+        ("warning", Colors::warning(t), Colors::warning_muted(t)),
+        ("error", Colors::error(t), Colors::error_muted(t)),
+        ("info", Colors::info(t), Colors::info_muted(t)),
+    ]
+}
+
+/// The surfaces a banner can be painted over.
+fn surfaces(t: &Theme) -> [(&'static str, Rgba); 3] {
+    [
+        ("bg", Colors::bg(t)),
+        ("bgElevated", Colors::bg_elevated(t)),
+        ("bgSurface", Colors::bg_surface(t)),
+    ]
+}
+
+fn theme_for(tone: BaseTone, mode: AppearanceMode) -> Theme {
+    Theme {
+        base_tone: tone,
+        appearance_mode: mode,
+        system_appearance: true,
+        ..Theme::default()
+    }
+}
+
+#[test]
+fn white_on_black_is_the_textbook_ratio() {
+    let ratio = contrast(h(0xFFFFFF), h(0x000000));
+    assert!((ratio - 21.0).abs() < 0.01, "expected 21:1, got {ratio}:1");
+}
+
+#[test]
+fn text_tokens_meet_their_contrast_floors_in_every_tone_and_mode() {
+    for (tone, mode) in all_theme_combinations() {
+        let t = theme_for(tone, mode);
+        let where_ = format!("{tone:?} {mode:?}");
+
+        // Captions, section headers, and menu subtitles sit on the window and
+        // panel surfaces, so every text step needs AA on both.
+        for (surface, background) in [
+            ("bg", Colors::bg(&t)),
+            ("bgElevated", Colors::bg_elevated(&t)),
+        ] {
+            let floors: [(&str, fx_design::theme::Rgba, f64); 4] = [
+                ("fg", Colors::fg(&t), 7.0),
+                ("fgSecondary", Colors::fg_secondary(&t), 4.5),
+                ("fgTertiary", Colors::fg_tertiary(&t), 4.5),
+                ("accentSecondary", Colors::accent_secondary(&t), 4.5),
+            ];
+            for (token, color, floor) in floors {
+                let ratio = contrast(color, background);
+                assert!(
+                    ratio >= floor,
+                    "{where_}: {token} on {surface} is {ratio}:1, needs {floor}:1"
+                );
+            }
+        }
+
+        // Menus, cards, and inputs use bgSurface. Tertiary text there is
+        // secondary information, so it only has to clear 3:1.
+        let surface = Colors::bg_surface(&t);
+        let secondary = contrast(Colors::fg_secondary(&t), surface);
+        assert!(
+            secondary >= 4.5,
+            "{where_}: fgSecondary on bgSurface is {secondary}:1"
+        );
+        let tertiary = contrast(Colors::fg_tertiary(&t), surface);
+        assert!(
+            tertiary >= 3.0,
+            "{where_}: fgTertiary on bgSurface is {tertiary}:1"
+        );
+
+        // The ladder must descend: each step weaker than the one above it.
+        let ladder = [
+            contrast(Colors::fg(&t), Colors::bg_elevated(&t)),
+            contrast(Colors::fg_secondary(&t), Colors::bg_elevated(&t)),
+            contrast(Colors::fg_tertiary(&t), Colors::bg_elevated(&t)),
+            contrast(Colors::fg_quaternary(&t), Colors::bg_elevated(&t)),
+        ];
+        assert!(
+            ladder.windows(2).all(|w| w[0] > w[1]),
+            "{where_}: foreground steps are out of order {ladder:?}"
+        );
+    }
+}
+
+#[test]
+fn labels_on_solid_accent_fills_stay_legible_for_every_accent() {
+    for accent in AccentColor::ALL {
+        for tone in BaseTone::ALL {
+            for mode in [AppearanceMode::Light, AppearanceMode::Dark] {
+                let t = Theme {
+                    accent_color: accent,
+                    ..theme_for(tone, mode)
+                };
+                let ratio = contrast(Colors::on_accent(&t), Colors::accent(&t));
+                assert!(
+                    ratio >= 3.0,
+                    "{accent:?} {tone:?} {mode:?}: onAccent on accent is {ratio}:1"
+                );
+            }
+        }
+
+        // Dark ink is reserved for accents that genuinely cannot carry white.
+        let white = contrast(h(0xFFFFFF), accent.color());
+        assert_eq!(
+            accent.prefers_dark_foreground(),
+            white < 3.0,
+            "{accent:?}: white on accent is {white}:1"
+        );
+    }
+}
+
+#[test]
+fn status_tints_adapt_to_the_appearance_mode() {
+    let light = theme_for(BaseTone::Zinc, AppearanceMode::Light);
+    let dark = theme_for(BaseTone::Zinc, AppearanceMode::Dark);
+
+    let light_tints = [
+        Colors::success_muted(&light),
+        Colors::warning_muted(&light),
+        Colors::error_muted(&light),
+        Colors::info_muted(&light),
+        Colors::accent_secondary_muted(&light),
+    ];
+    let dark_tints = [
+        Colors::success_muted(&dark),
+        Colors::warning_muted(&dark),
+        Colors::error_muted(&dark),
+        Colors::info_muted(&dark),
+        Colors::accent_secondary_muted(&dark),
+    ];
+
+    for (l, d) in light_tints.iter().zip(&dark_tints) {
+        assert_ne!(l, d, "a status tint did not change between modes");
+    }
+
+    // Each tint must remain distinguishable from the others within a mode.
+    let mut dark_sorted: Vec<u32> = dark_tints.iter().map(|c| u32::from(*c)).collect();
+    dark_sorted.sort_unstable();
+    dark_sorted.dedup();
+    assert_eq!(
+        dark_sorted.len(),
+        dark_tints.len(),
+        "two dark status tints resolved to the same color"
+    );
+}
+
+#[test]
+fn banner_text_clears_aa_on_every_muted_fill() {
+    // This is the invariant that actually governs readability. A `*Muted` token
+    // is a *banner fill*, painted translucently over the window or panel behind
+    // it, and the words on it are `fg` / `fgSecondary`. The same-hue color is
+    // used for the banner's icon, not its text.
+    //
+    // The raw tint has no effective color until the renderer composites it, so
+    // composite first and measure the result.
+    for (tone, mode) in all_theme_combinations() {
+        let t = theme_for(tone, mode);
+        for (surface_name, surface) in surfaces(&t) {
+            let fills: [(&str, Rgba); 5] = [
+                ("successMuted", Colors::success_muted(&t)),
+                ("warningMuted", Colors::warning_muted(&t)),
+                ("errorMuted", Colors::error_muted(&t)),
+                ("infoMuted", Colors::info_muted(&t)),
+                ("accentSecondaryMuted", Colors::accent_secondary_muted(&t)),
+            ];
+            for (fill_name, tint) in fills {
+                let fill = composite(tint, surface);
+                for (ink_name, ink) in [
+                    ("fg", Colors::fg(&t)),
+                    ("fgSecondary", Colors::fg_secondary(&t)),
+                ] {
+                    let ratio = contrast(ink, fill);
+                    assert!(
+                        ratio >= 4.5,
+                        "{tone:?} {mode:?}: {ink_name} on {fill_name} over {surface_name} is {ratio}:1"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_muted_tint_is_actually_translucent() {
+    // Guards the premise of the tests above: if these ever became opaque, the
+    // contrast checks would silently stop testing anything.
+    for mode in [AppearanceMode::Light, AppearanceMode::Dark] {
+        let t = theme_for(BaseTone::Zinc, mode);
+        for (name, tint) in [
+            ("successMuted", Colors::success_muted(&t)),
+            ("warningMuted", Colors::warning_muted(&t)),
+            ("errorMuted", Colors::error_muted(&t)),
+            ("infoMuted", Colors::info_muted(&t)),
+        ] {
+            assert!(
+                tint.a < 1.0,
+                "{mode:?}: {name} is opaque, so it would cover the surface instead of tinting it"
+            );
+            assert!(tint.a > 0.0, "{mode:?}: {name} is fully transparent");
+        }
+    }
+}
+
+#[test]
+fn status_ink_meets_its_documented_floor_on_its_own_tint() {
+    // Where the same-hue color *is* used as an icon on its own tint, WCAG asks
+    // for 3:1. The measured floor across all tones and both modes is 2.29:1,
+    // reached by light-mode `warning` (amber-600 under a 10% amber tint).
+    // Light-mode `success` likewise lands at 2.67:1. Dark mode clears 3:1
+    // everywhere.
+    //
+    // This test pins the floor so a future retune cannot make it worse, and
+    // records the shortfall rather than hiding it. Raising it to a true 3:1
+    // would mean darkening the light-mode `warning` and `success` values, which
+    // is a palette change, not a port.
+    const DOCUMENTED_FLOOR: f64 = 2.25;
+    const TARGET: f64 = 3.0;
+
+    for (tone, mode) in all_theme_combinations() {
+        let t = theme_for(tone, mode);
+        for (surface_name, surface) in surfaces(&t) {
+            for (name, ink, tint) in status_pairs(&t) {
+                let ratio = contrast(ink, composite(tint, surface));
+                assert!(
+                    ratio >= DOCUMENTED_FLOOR,
+                    "{tone:?} {mode:?}: {name} ink on its own tint over {surface_name} fell to {ratio}:1, below the documented {DOCUMENTED_FLOOR}:1 floor"
+                );
+                if ratio < TARGET {
+                    // Dark mode has no known shortfall; if light mode regresses
+                    // further this branch will start firing for tones it did not
+                    // before, which is the signal we want.
+                    assert!(
+                        mode == AppearanceMode::Light,
+                        "{tone:?}: {name} on its tint over {surface_name} is {ratio}:1 in dark mode, where every token is expected to clear {TARGET}:1"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn dark_mode_status_ink_clears_the_non_text_target_everywhere() {
+    for tone in BaseTone::ALL {
+        let t = theme_for(tone, AppearanceMode::Dark);
+        for (surface_name, surface) in surfaces(&t) {
+            for (name, ink, tint) in status_pairs(&t) {
+                let ratio = contrast(ink, composite(tint, surface));
+                assert!(
+                    ratio >= 3.0,
+                    "{tone:?}: {name} on its tint over {surface_name} is {ratio}:1 in dark mode"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn diff_foreground_is_legible_on_its_own_diff_background() {
+    for (tone, mode) in all_theme_combinations() {
+        let t = theme_for(tone, mode);
+        let added = contrast(Colors::diff_added_fg(&t), Colors::diff_added_bg(&t));
+        assert!(
+            added >= 3.0,
+            "{tone:?} {mode:?}: diffAddedFg on diffAddedBg is {added}:1"
+        );
+        let removed = contrast(Colors::diff_removed_fg(&t), Colors::diff_removed_bg(&t));
+        assert!(
+            removed >= 3.0,
+            "{tone:?} {mode:?}: diffRemovedFg on diffRemovedBg is {removed}:1"
+        );
+    }
+}
+
+#[test]
+fn a_theme_change_reaches_every_token_it_should() {
+    let dark = theme_for(BaseTone::Zinc, AppearanceMode::Dark);
+    let light = Theme {
+        appearance_mode: AppearanceMode::Light,
+        ..dark
+    };
+
+    for (name, a, b) in [
+        ("bg", Colors::bg(&dark), Colors::bg(&light)),
+        (
+            "diffAddedBg",
+            Colors::diff_added_bg(&dark),
+            Colors::diff_added_bg(&light),
+        ),
+        (
+            "successMuted",
+            Colors::success_muted(&dark),
+            Colors::success_muted(&light),
+        ),
+    ] {
+        assert_ne!(a, b, "{name} ignored the appearance change");
+    }
+
+    // Switching back must reproduce the original exactly, because palettes are
+    // cached rather than regenerated per read.
+    let back = theme_for(BaseTone::Zinc, AppearanceMode::Dark);
+    assert_eq!(Colors::bg(&dark), Colors::bg(&back));
+    assert_eq!(Colors::diff_added_bg(&dark), Colors::diff_added_bg(&back));
+
+    // A tone change must move the background too.
+    let stone = Theme {
+        base_tone: BaseTone::Stone,
+        ..back
+    };
+    assert_ne!(Colors::bg(&back), Colors::bg(&stone));
+}
+
+#[test]
+fn accent_muted_tracks_the_accent_and_the_mode() {
+    let violet = Theme {
+        accent_color: AccentColor::Violet,
+        ..theme_for(BaseTone::Zinc, AppearanceMode::Dark)
+    };
+    let rose = Theme {
+        accent_color: AccentColor::Rose,
+        ..violet
+    };
+    assert_ne!(Colors::accent_muted(&violet), Colors::accent_muted(&rose));
+
+    let dark_muted = Colors::accent_muted(&violet);
+    let light_muted = Colors::accent_muted(&Theme {
+        appearance_mode: AppearanceMode::Light,
+        ..violet
+    });
+    assert!(
+        light_muted.a < dark_muted.a,
+        "light mode should use a lighter accent tint"
+    );
+}
+
+#[test]
+fn the_system_appearance_only_matters_when_the_mode_is_system() {
+    let mut pinned_dark = theme_for(BaseTone::Zinc, AppearanceMode::Dark);
+    pinned_dark.system_appearance = false;
+    assert!(pinned_dark.is_dark(), "an explicit dark mode must win");
+
+    let mut pinned_light = theme_for(BaseTone::Zinc, AppearanceMode::Light);
+    pinned_light.system_appearance = true;
+    assert!(!pinned_light.is_dark(), "an explicit light mode must win");
+
+    let following = Theme {
+        appearance_mode: AppearanceMode::System,
+        system_appearance: true,
+        ..pinned_dark
+    };
+    assert!(following.is_dark());
+}
+
+#[test]
+fn the_text_size_preset_rescales_type_without_disturbing_color() {
+    let standard = theme_for(BaseTone::Zinc, AppearanceMode::Dark);
+    let large = Theme {
+        text_size: TextSizePreset::Large,
+        ..standard
+    };
+    assert_eq!(
+        Colors::fg(&standard),
+        Colors::fg(&large),
+        "text size must not alter color tokens"
+    );
+    assert!(
+        large.text_scale() > standard.text_scale(),
+        "large preset should scale type up"
+    );
+}

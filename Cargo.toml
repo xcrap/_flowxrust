@@ -1,0 +1,97 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/fx-core",
+    "crates/fx-design",
+    "crates/fx-agent",
+    "crates/fx-store",
+    "crates/fx-term",
+    "crates/fx-app",
+    "crates/flowx",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "Apache-2.0"
+repository = "https://github.com/xcrap/_flowxrust"
+authors = ["FlowX"]
+
+[workspace.dependencies]
+# Internal crates — always referenced by path, never by version.
+fx-core = { path = "crates/fx-core" }
+fx-design = { path = "crates/fx-design" }
+fx-agent = { path = "crates/fx-agent" }
+fx-store = { path = "crates/fx-store" }
+fx-term = { path = "crates/fx-term" }
+fx-app = { path = "crates/fx-app" }
+
+# GPUI: rendering, input, and windowing for every crate that draws.
+gpui = "0.2.2"
+gpui_platform = "0.2.2"
+# `test-support` is enabled from `fx-app`'s dev-dependencies rather than here:
+# it pulls in leak detection and a fake platform, neither of which belongs in a
+# shipped binary.
+
+# Async runtime. GPUI drives its own executor on the main thread; `tokio` is
+# used only for blocking IO (subprocesses, file reads) on the thread pool.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "io-util", "sync", "time", "signal"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# Serialization. `serde` derives live on domain types; `serde_json` is the wire
+# format for both provider protocols and persisted state.
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+
+# Error handling: `thiserror` for library errors, `anyhow` at the binary edge.
+thiserror = "2"
+base64 = "0.22"
+anyhow = "1"
+
+# Observability.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Filesystem and paths.
+directories = "6"
+tempfile = "3"
+glob = "0.3"
+# Only for `getxattr`, which has no std equivalent.
+libc = "0.2"
+walkdir = "2"
+
+# Time.
+# `now` is separate from `clock` as of chrono 0.4.45; both are needed for `DateTime::now()`.
+chrono = { version = "0.4", default-features = false, features = ["clock", "now", "std", "serde"] }
+
+# Hashing (image prompt correlation, content revisions).
+sha2 = "0.10"
+
+# Stable identifiers. `v5` derives a UUID from a name, which is how a provider
+# thread is mapped back to the same agent id on every launch.
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
+
+# Terminal emulator core (phase 2). Requires `zig` on PATH to build.
+libghostty-vt = "0.2"
+
+# Testing.
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"
+
+[profile.dev]
+opt-level = 0
+debug = 1
+
+# Benchmarks measure presentation preparation, not frame rate, so they need
+# optimizations even in a dev profile.
+[profile.bench]
+opt-level = 3
+debug = 1

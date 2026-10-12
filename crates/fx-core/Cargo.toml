@@ -1,0 +1,29 @@
+[package]
+name = "fx-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "FlowX domain models, pure policies, git parsing, runtime discovery, and image preparation. No UI."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+base64.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+glob.workspace = true
+walkdir.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+pretty_assertions = "1"
+criterion.workspace = true
+
+[[bench]]
+name = "git_status_poll"
+harness = false

@@ -1,0 +1,25 @@
+FlowX (Rust)
+
+This workspace declares the Apache License, Version 2.0 in Cargo.toml.
+The Apache license text is provided in LICENSE.
+
+Vendored icons
+--------------
+
+The Lucide SVG files in crates/fx-design/assets/icons/ contain headers identifying
+their source as lucide-static v1.52.0. Their filenames use the Swift application's symbol
+names; the original Lucide glyphs are embedded by the Rust build script.
+
+Upstream project: https://github.com/lucide-icons/lucide
+Source package: https://registry.npmjs.org/lucide-static/-/lucide-static-1.52.0.tgz
+
+The complete, unmodified package LICENSE is preserved at
+licenses/lucide-static-1.52.0-LICENSE. It contains the Lucide ISC license and
+the original Feather MIT license and attribution for the listed derived icons.
+
+Other dependencies
+------------------
+
+Dependencies resolved through Cargo retain their own upstream licenses and
+notices. Cargo.lock records the selected versions; this notice does not
+relicense those dependencies.
