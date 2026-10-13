@@ -78,6 +78,24 @@ impl Store {
         read_bounded(&path, crate::format::MAX_PROJECTS_BYTES)
     }
 
+    /// Read only the committed primary file. Unlike normal recovery loading,
+    /// neither a missing primary nor its backup can confirm a partial save.
+    pub fn load_preferences_primary(&self) -> Result<PersistedPreferences, LoadError> {
+        use std::io::Read;
+
+        let limit = crate::format::MAX_PROJECTS_BYTES;
+        let file = std::fs::File::open(self.paths.preferences_file())?;
+        if file.metadata()?.len() > limit {
+            return Err(LoadError::TooLarge { limit });
+        }
+        let mut bytes = Vec::new();
+        file.take(limit + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > limit {
+            return Err(LoadError::TooLarge { limit });
+        }
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
     pub fn save_preferences(&self, preferences: &PersistedPreferences) -> Result<(), SaveError> {
         write::write_json_atomically(&self.paths.preferences_file(), preferences)?;
         Ok(())
@@ -569,14 +587,27 @@ mod tests {
             store.load_preferences().unwrap(),
             PersistedPreferences::default()
         );
+        assert!(store.load_preferences_primary().is_err());
         let preferences = PersistedPreferences {
             appearance: "light".into(),
             accent: "orange".into(),
+            codex_defaults: crate::ProviderDefaults {
+                model_id: Some("codex-model".into()),
+                effort: Some("high".into()),
+                agent_access: Some(fx_core::AgentAccess::Supervised),
+            },
+            claude_defaults: crate::ProviderDefaults {
+                model_id: Some("claude-model".into()),
+                effort: Some("low".into()),
+                agent_access: Some(fx_core::AgentAccess::AcceptEdits),
+            },
             ..Default::default()
         };
         store.save_preferences(&preferences).unwrap();
         assert_eq!(store.load_preferences().unwrap(), preferences);
+        assert_eq!(store.load_preferences_primary().unwrap(), preferences);
         std::fs::write(store.paths().preferences_file(), b"{ damaged").unwrap();
+        assert!(store.load_preferences_primary().is_err());
         assert_eq!(store.load_preferences().unwrap(), preferences);
     }
 

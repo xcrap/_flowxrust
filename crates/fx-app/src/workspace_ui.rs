@@ -51,14 +51,9 @@ pub fn has_modal(state: &Entity<AppState>, cx: &App) -> bool {
 }
 
 pub fn restore_preferences(state: &Entity<AppState>, cx: &mut App) {
-    match state.read(cx).store.load_preferences() {
-        Ok(saved) => {
-            let current = global::current();
-            let draft = preferences_draft(&saved, &current);
-            global::set(draft.apply_to(&current));
-        }
-        Err(error) => tracing::warn!(%error, "could not restore appearance preferences"),
-    }
+    let current = global::current();
+    let draft = preferences_draft(&state.read(cx).preferences, &current);
+    global::set(draft.apply_to(&current));
 }
 
 fn preferences_draft(
@@ -88,6 +83,7 @@ fn apply_settings(
     ui: &Entity<WorkspaceUi>,
     draft: SettingsDraft,
     baseline: SettingsDraft,
+    defaults: (fx_store::ProviderDefaults, fx_store::ProviderDefaults),
     cx: &mut App,
 ) {
     let saved = fx_store::PersistedPreferences {
@@ -95,16 +91,42 @@ fn apply_settings(
         base_tone: draft.base_tone.label().to_ascii_lowercase(),
         accent: draft.accent.label().to_ascii_lowercase(),
         text_size: draft.text_size.label().to_ascii_lowercase(),
+        codex_defaults: defaults.0,
+        claude_defaults: defaults.1,
     };
     match state.read(cx).store.save_preferences(&saved) {
         Err(error) => {
-            global::set(baseline.apply_to(&global::current()));
+            // The primary file commits before the recovery copy. If only the
+            // backup failed, keep this session consistent with the next launch.
+            let committed = state
+                .read(cx)
+                .store
+                .load_preferences_primary()
+                .is_ok_and(|primary| primary == saved);
+            if committed {
+                state.update(cx, |state, cx| {
+                    state.preferences = saved;
+                    state.last_error = Some(format!(
+                        "Settings were saved, but the recovery copy could not be updated: {error}"
+                    ));
+                    cx.notify();
+                });
+                global::set(draft.apply_to(&global::current()));
+            } else {
+                global::set(baseline.apply_to(&global::current()));
+                state.update(cx, |state, cx| {
+                    state.last_error = Some(format!("Could not save settings: {error}"));
+                    cx.notify();
+                });
+            }
+        }
+        Ok(()) => {
             state.update(cx, |state, cx| {
-                state.last_error = Some(format!("Could not save settings: {error}"));
+                state.preferences = saved;
                 cx.notify();
             });
+            global::set(draft.apply_to(&global::current()));
         }
-        Ok(()) => global::set(draft.apply_to(&global::current())),
     }
     // Confirm settles the sheet before its callback. Remove it even on a
     // failed save, so an invisible settled modal cannot block the workspace.
@@ -120,17 +142,32 @@ pub fn open_settings(state: Entity<AppState>, window: &mut Window, cx: &mut App)
         return;
     }
     dismiss_popup(&state, cx);
+    // Catalog discovery is nonblocking and respects its refresh cooldown.
+    // Tests exercise choices directly without launching installed provider CLIs.
+    #[cfg(not(test))]
+    for provider in ["codex", "claude"] {
+        crate::provider_catalog::refresh(provider);
+    }
     let ui = handle(cx);
     let apply_ui = ui.clone();
     let dismiss_ui = ui.clone();
     let refresh_ui = ui.clone();
     let archives = crate::archived_chats::ArchivedChats::new(state.clone(), cx);
+    let preferences = state.read(cx).preferences.clone();
+    let defaults = crate::provider_settings::ProviderSettings::new(
+        preferences.codex_defaults,
+        preferences.claude_defaults,
+        state.read(cx).menu_layer.clone(),
+        cx,
+    );
+    let apply_defaults = defaults.clone();
     let baseline = SettingsDraft::from_theme(&global::current());
     let sheet = SettingsSheet::open(
         window,
         cx,
         Box::new(move |draft, window, cx| {
-            apply_settings(&state, &apply_ui, draft, baseline, cx);
+            let defaults = apply_defaults.read(cx).values();
+            apply_settings(&state, &apply_ui, draft, baseline, defaults, cx);
             window.blur();
         }),
         Box::new(move |window, cx| {
@@ -145,7 +182,10 @@ pub fn open_settings(state: Entity<AppState>, window: &mut Window, cx: &mut App)
             cx.defer(move |cx| refresh_ui.update(cx, |ui, cx| ui.recheck(cx)));
         }),
     );
-    sheet.update(cx, |sheet, _| sheet.set_archives(archives));
+    sheet.update(cx, |sheet, cx| {
+        sheet.set_archives(archives);
+        sheet.set_provider_defaults(defaults, cx);
+    });
     ui.update(cx, |ui, cx| {
         ui.settings = Some(sheet);
         ui.recheck(cx);
@@ -919,6 +959,7 @@ mod tests {
             base_tone: "stone".into(),
             accent: "orange".into(),
             text_size: "large".into(),
+            ..Default::default()
         };
         let expected = SettingsDraft {
             appearance: AppearanceMode::Light,
@@ -932,6 +973,7 @@ mod tests {
             base_tone: "Stone".into(),
             accent: "Orange".into(),
             text_size: "Large".into(),
+            ..Default::default()
         };
         assert_eq!(preferences_draft(&legacy, &current), expected);
         let invalid = PersistedPreferences {
@@ -942,6 +984,165 @@ mod tests {
             preferences_draft(&invalid, &current).accent,
             current.accent_color
         );
+    }
+
+    #[test]
+    fn settings_default_picker_routes_through_the_root_and_saves_only_on_done() {
+        use gpui::{MouseButton, VisualTestContext, px, size};
+        let temp = tempfile::tempdir().unwrap();
+        let mut test = gpui::TestAppContext::single();
+        let (_health_sender, health_receiver) = mpsc::channel();
+        let (state, ui) = test.update(|cx| {
+            let ui = handle(cx);
+            ui.update(cx, |ui, _| ui.health_results = Some(health_receiver));
+            let state = state(cx, temp.path());
+            crate::AppHandle::install(state.clone(), cx);
+            (state, ui)
+        });
+        let for_view = state.clone();
+        let window = test.add_window(move |_, _| crate::FlowX::new(for_view));
+        let mut visual = VisualTestContext::from_window(window.into(), &test);
+        visual.simulate_resize(size(px(1280.0), px(900.0)));
+        test.refresh().unwrap();
+        window
+            .update(&mut test, |_, window, cx| {
+                open_settings(state.clone(), window, cx)
+            })
+            .unwrap();
+        test.refresh().unwrap();
+        test.update(|_| {});
+        let picker = visual
+            .debug_bounds("settings-defaults:codex:access")
+            .unwrap()
+            .center();
+        visual.simulate_mouse_down(picker, MouseButton::Left, Default::default());
+        visual.simulate_mouse_up(picker, MouseButton::Left, Default::default());
+        test.read(|cx| assert!(state.read(cx).menu_layer.read(cx).is_open()));
+        visual.simulate_keystrokes("down enter");
+        test.read(|cx| {
+            assert!(!state.read(cx).menu_layer.read(cx).is_open());
+            assert!(ui.read(cx).settings.is_some());
+            let sheet = ui.read(cx).settings.clone().unwrap();
+            let editor = sheet.read(cx).provider_defaults().unwrap();
+            assert_eq!(
+                editor.read(cx).values().0.agent_access,
+                Some(fx_core::AgentAccess::Supervised)
+            );
+            assert_eq!(state.read(cx).preferences.codex_defaults.agent_access, None);
+        });
+        visual.simulate_keystrokes("enter");
+        test.read(|cx| {
+            assert!(ui.read(cx).settings.is_none());
+            assert_eq!(
+                state.read(cx).preferences.codex_defaults.agent_access,
+                Some(fx_core::AgentAccess::Supervised)
+            );
+            assert_eq!(
+                state
+                    .read(cx)
+                    .store
+                    .load_preferences()
+                    .unwrap()
+                    .codex_defaults
+                    .agent_access,
+                Some(fx_core::AgentAccess::Supervised)
+            );
+        });
+    }
+
+    #[test]
+    fn provider_defaults_save_with_appearance_and_restore_for_new_chats() {
+        let temp = tempfile::tempdir().unwrap();
+        let test = gpui::TestAppContext::single();
+        test.update(|cx| {
+            let state = state(cx, temp.path());
+            let ui = cx.new(|_| WorkspaceUi::default());
+            let appearance = SettingsDraft::from_theme(&global::current());
+            let codex = fx_store::ProviderDefaults {
+                model_id: Some(fx_core::DEFAULT_CODEX_MODEL_ID.into()),
+                effort: Some("high".into()),
+                agent_access: Some(fx_core::AgentAccess::Supervised),
+            };
+            let claude = fx_store::ProviderDefaults {
+                model_id: Some("sonnet".into()),
+                effort: Some("medium".into()),
+                agent_access: Some(fx_core::AgentAccess::AcceptEdits),
+            };
+            apply_settings(
+                &state,
+                &ui,
+                appearance,
+                appearance,
+                (codex.clone(), claude.clone()),
+                cx,
+            );
+            assert_eq!(state.read(cx).preferences.codex_defaults, codex);
+            let restored = cx.new(|cx| AppState::restore(AppPaths::at(temp.path()), cx));
+            assert_eq!(restored.read(cx).preferences.codex_defaults, codex);
+            assert_eq!(restored.read(cx).preferences.claude_defaults, claude);
+            assert_eq!(
+                restored
+                    .read(cx)
+                    .default_configuration("claude")
+                    .agent_access,
+                Some(fx_core::AgentAccess::AcceptEdits)
+            );
+            apply_settings(
+                &state,
+                &ui,
+                appearance,
+                appearance,
+                (codex.clone(), claude.clone()),
+                cx,
+            );
+            let saved = state.read(cx).store.load_preferences().unwrap();
+            assert_eq!(saved.codex_defaults, codex);
+            assert_eq!(saved.claude_defaults, claude);
+        });
+    }
+
+    #[test]
+    fn a_settings_backup_failure_keeps_committed_defaults_consistent_with_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let test = gpui::TestAppContext::single();
+        test.update(|cx| {
+            let state = state(cx, temp.path());
+            let path = state.read(cx).paths.preferences_file();
+            std::fs::create_dir(fx_store::write::backup_path(&path)).unwrap();
+            let ui = cx.new(|_| WorkspaceUi::default());
+            let before = global::current();
+            let draft = SettingsDraft::from_theme(&before.with_accent(before.accent_color.next()));
+            let defaults = fx_store::ProviderDefaults {
+                effort: Some("high".into()),
+                agent_access: Some(fx_core::AgentAccess::Supervised),
+                ..Default::default()
+            };
+            apply_settings(
+                &state,
+                &ui,
+                draft,
+                SettingsDraft::from_theme(&before),
+                (defaults.clone(), Default::default()),
+                cx,
+            );
+            assert_eq!(state.read(cx).preferences.codex_defaults, defaults);
+            assert_eq!(
+                state.read(cx).store.load_preferences().unwrap(),
+                state.read(cx).preferences
+            );
+            let restored = cx.new(|cx| AppState::restore(AppPaths::at(temp.path()), cx));
+            assert_eq!(restored.read(cx).preferences, state.read(cx).preferences);
+            assert_eq!(global::current().accent_color, draft.accent);
+            assert!(
+                state
+                    .read(cx)
+                    .last_error
+                    .as_deref()
+                    .unwrap()
+                    .starts_with("Settings were saved, but the recovery copy")
+            );
+            assert!(ui.read(cx).settings.is_none());
+        });
     }
 
     #[test]
@@ -963,7 +1164,21 @@ mod tests {
             let before = global::current();
             let draft = SettingsDraft::from_theme(&before.with_accent(before.accent_color.next()));
             global::set(draft.apply_to(&before));
-            apply_settings(&state, &ui, draft, SettingsDraft::from_theme(&before), cx);
+            let original = state.read(cx).preferences.clone();
+            let changed_defaults = fx_store::ProviderDefaults {
+                model_id: Some("unsaved-model".into()),
+                agent_access: Some(fx_core::AgentAccess::Supervised),
+                ..Default::default()
+            };
+            apply_settings(
+                &state,
+                &ui,
+                draft,
+                SettingsDraft::from_theme(&before),
+                (changed_defaults, Default::default()),
+                cx,
+            );
+            assert_eq!(state.read(cx).preferences, original);
             assert!(ui.read(cx).settings.is_none());
             assert!(
                 state

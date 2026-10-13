@@ -242,6 +242,7 @@ fn row(
     section_id: &str,
     item: &MenuItem,
     hovered: bool,
+    show_selection: bool,
     on_choose: impl Fn(String, String, &mut Window, &mut App) + 'static,
     on_hover: impl Fn(String, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
@@ -269,22 +270,24 @@ fn row(
         .bg(palette.background)
         .rounded(px_len(Radii::SM));
 
-    // A checkmark column, present for every row so titles line up whether or
-    // not any item in this section is currently selected.
-    content = content.child(
-        div()
-            .w(px_len(Layout::MENU_CHECK_GUTTER))
-            .flex()
-            .flex_shrink_0()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .child(if item.selected {
-                Icon::CHECKMARK.render(crate::theme::IconSize::Small, palette.check, &theme)
-            } else {
-                div().size(px_len(0.0)).into_any_element()
-            }),
-    );
+    // Choice menus align every title beside the selected item's checkmark.
+    // Action menus have no selection and need no empty leading column.
+    if show_selection {
+        content = content.child(
+            div()
+                .w(px_len(Layout::MENU_CHECK_GUTTER))
+                .flex()
+                .flex_shrink_0()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .child(if item.selected {
+                    Icon::CHECKMARK.render(crate::theme::IconSize::Small, palette.check, &theme)
+                } else {
+                    div().size(px_len(0.0)).into_any_element()
+                }),
+        );
+    }
 
     let mut labels = div()
         .flex()
@@ -359,13 +362,17 @@ pub fn menu_surface(
     let on_choose = Rc::new(on_choose);
     let on_mouse_move = Rc::new(on_mouse_move);
     let theme = global::current();
+    let show_selection = model
+        .sections()
+        .iter()
+        .flat_map(|section| &section.items)
+        .any(|item| item.selected);
 
     let mut body = div()
         .flex()
         .flex_col()
         .gap(px_len(0.0))
-        .px(px_len(Spacing::XXS))
-        .py(px_len(Spacing::XXXS));
+        .p(px_len(Spacing::XXS));
 
     for (index, section) in model.sections().iter().enumerate() {
         // Separate consecutive groups so a long menu stays readable.
@@ -399,6 +406,7 @@ pub fn menu_surface(
                 &section.id,
                 item,
                 hovered,
+                show_selection,
                 move |s, i, w, c| choose(s, i, w, c),
                 move |k, w, c| hover(k.as_ref(), w, c),
             ));
@@ -415,7 +423,7 @@ pub fn menu_surface(
         .max_h(px_len(Layout::MENU_MAX_PANEL_HEIGHT))
         .overflow_y_scroll()
         .bg(Colors::bg_surface(&theme))
-        .rounded(px_len(Radii::XL))
+        .rounded(px_len(Radii::MD))
         .border_1()
         .border_color(Colors::border_medium(&theme))
         .occlude()

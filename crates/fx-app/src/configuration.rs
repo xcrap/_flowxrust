@@ -240,6 +240,8 @@ pub fn apply(state: &Entity<AppState>, owner: &str, chosen: &str, cx: &mut App) 
         if field == "provider" && provider_is_locked(state, id) {
             return;
         }
+        let provider_defaults = (field == "provider" && ["codex", "claude"].contains(&chosen))
+            .then(|| state.default_configuration(chosen));
         let native = state.native_defaults(id);
         let Some(agent) = state
             .snapshot
@@ -261,10 +263,9 @@ pub fn apply(state: &Entity<AppState>, owner: &str, chosen: &str, cx: &mut App) 
                 if provider(agent) == chosen {
                     return;
                 }
-                agent.configuration.provider_id = Some(chosen.into());
-                agent.configuration.model_id = None;
-                agent.configuration.context_window_size = None;
-                agent.configuration.effort = None;
+                let system_prompt = agent.configuration.system_prompt.take();
+                agent.configuration = provider_defaults.expect("validated provider defaults");
+                agent.configuration.system_prompt = system_prompt;
             }
             "model" if models(&effective).iter().any(|(id, _)| id == chosen) => {
                 agent.configuration.model_id = Some(chosen.into());
@@ -440,6 +441,70 @@ mod tests {
                     .configuration
                     .provider_id
                     .is_none()
+            );
+        });
+    }
+
+    #[test]
+    fn switching_an_unused_chat_applies_target_defaults_and_retains_system_prompt() {
+        let test = gpui::TestAppContext::single();
+        let dir = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(dir.path().join("state"));
+        let mut agent = Agent::new("Unused");
+        agent.configuration.system_prompt = Some("Project-specific instructions".into());
+        agent.configuration.agent_access = Some(AgentAccess::FullAccess);
+        agent.configuration.context_window_size = Some(10);
+        Store::new(paths.clone())
+            .save_app(&PersistedApp {
+                projects: vec![PersistedProject {
+                    project: Some(Project::new(dir.path().to_str().unwrap())),
+                    agents: vec![agent.clone()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .unwrap();
+        let state = test.update(|cx| cx.new(|cx| AppState::restore(paths.clone(), cx)));
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                state.preferences.claude_defaults = fx_store::ProviderDefaults {
+                    model_id: Some("custom-claude-model".into()),
+                    effort: Some("high".into()),
+                    agent_access: Some(AgentAccess::Supervised),
+                };
+                state.preferences.codex_defaults = fx_store::ProviderDefaults {
+                    model_id: Some("gpt-6-astra".into()),
+                    effort: Some("unsupported-effort".into()),
+                    agent_access: Some(AgentAccess::AcceptEdits),
+                };
+            });
+            let owner = format!("configuration:{}:provider", agent.id);
+            apply(&state, &owner, "claude", cx);
+            let saved = Store::new(paths.clone()).load_app().unwrap();
+            let configuration = &saved.projects[0].agents[0].configuration;
+            assert_eq!(configuration.provider_id.as_deref(), Some("claude"));
+            assert_eq!(
+                configuration.model_id.as_deref(),
+                Some("custom-claude-model")
+            );
+            assert_eq!(configuration.effort.as_deref(), Some("high"));
+            assert_eq!(configuration.agent_access, Some(AgentAccess::Supervised));
+            assert!(configuration.context_window_size.is_none());
+            assert_eq!(
+                configuration.system_prompt,
+                agent.configuration.system_prompt
+            );
+            apply(&state, &owner, "codex", cx);
+            let saved = Store::new(paths).load_app().unwrap();
+            let configuration = &saved.projects[0].agents[0].configuration;
+            assert_eq!(configuration.provider_id.as_deref(), Some("codex"));
+            assert_eq!(configuration.model_id.as_deref(), Some("gpt-6-astra"));
+            assert!(configuration.effort.is_none());
+            assert_eq!(configuration.agent_access, Some(AgentAccess::AcceptEdits));
+            assert_eq!(configuration.context_window_size, Some(272_000));
+            assert_eq!(
+                configuration.system_prompt,
+                agent.configuration.system_prompt
             );
         });
     }

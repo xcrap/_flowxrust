@@ -15,6 +15,7 @@ const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
 struct Catalog {
     models: Vec<Model>,
     aliases: HashMap<String, String>,
+    capabilities_known: bool,
     running: bool,
     last_attempt: Option<Instant>,
     warning: Option<String>,
@@ -25,6 +26,9 @@ impl Catalog {
         Self {
             models: fallback_models(provider),
             aliases: HashMap::new(),
+            // Codex has a concrete fallback catalog. Claude's sole fallback
+            // is an alias with unknown capabilities until initialization.
+            capabilities_known: provider == "codex",
             running: false,
             last_attempt: None,
             warning: None,
@@ -37,11 +41,21 @@ impl Catalog {
             Ok(catalog) if !catalog.models.is_empty() => {
                 self.models = catalog.models;
                 self.aliases = catalog.aliases;
+                self.capabilities_known = true;
                 self.warning = None;
             }
             Ok(_) => self.warning = Some("The provider returned no model choices.".into()),
             Err(reason) => self.warning = Some(reason),
         }
+    }
+
+    fn model(&self, id: &str) -> Option<Model> {
+        let lookup = self.aliases.get(id).map(String::as_str).unwrap_or(id);
+        self.models.iter().find(|model| model.id == lookup).cloned()
+    }
+
+    fn known_model(&self, id: &str) -> Option<Model> {
+        self.capabilities_known.then(|| self.model(id)).flatten()
     }
 
     fn begin(&mut self, force: bool) -> bool {
@@ -79,12 +93,17 @@ pub fn model(provider: &str, id: &str) -> Option<Model> {
     let catalog = catalogs
         .entry(provider.into())
         .or_insert_with(|| Catalog::new(provider));
-    let lookup = catalog.aliases.get(id).map(String::as_str).unwrap_or(id);
-    catalog
-        .models
-        .iter()
-        .find(|model| model.id == lookup)
-        .cloned()
+    catalog.model(id)
+}
+
+/// Return capability metadata only when it is known. A placeholder model may
+/// still be displayed while discovery runs, but must not erase saved choices.
+pub fn known_model(provider: &str, id: &str) -> Option<Model> {
+    let mut catalogs = catalogs().lock().unwrap_or_else(|error| error.into_inner());
+    catalogs
+        .entry(provider.into())
+        .or_insert_with(|| Catalog::new(provider))
+        .known_model(id)
 }
 
 /// Resolve an effort against the actual selected model. An empty advertised
@@ -94,7 +113,7 @@ pub fn effective_effort(
     model_id: &str,
     configured: Option<&str>,
 ) -> Option<String> {
-    let model = model(provider, model_id);
+    let model = known_model(provider, model_id);
     resolve_effort(model.as_ref(), configured)
 }
 
@@ -238,6 +257,38 @@ pub fn fallback_models(provider: &str) -> Vec<Model> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unknown_claude_fallback_preserves_reasoning_until_capabilities_are_discovered() {
+        let mut catalog = Catalog::new("claude");
+        assert!(catalog.model("default").is_some());
+        assert!(catalog.known_model("default").is_none());
+        assert_eq!(
+            resolve_effort(catalog.known_model("default").as_ref(), Some("high")).as_deref(),
+            Some("high")
+        );
+        catalog.finish(Err("discovery unavailable".into()));
+        assert_eq!(
+            resolve_effort(catalog.known_model("default").as_ref(), Some("high")).as_deref(),
+            Some("high")
+        );
+
+        // A discovered empty list genuinely disallows a reasoning parameter.
+        catalog.finish(Ok(ModelCatalog {
+            models: fallback_models("claude"),
+            aliases: HashMap::new(),
+        }));
+        assert!(catalog.known_model("default").is_some());
+        assert_eq!(
+            resolve_effort(catalog.known_model("default").as_ref(), Some("high")),
+            None
+        );
+        catalog.finish(Err("later refresh failed".into()));
+        assert_eq!(
+            resolve_effort(catalog.known_model("default").as_ref(), Some("high")),
+            None
+        );
+    }
 
     #[test]
     fn a_failed_or_empty_refresh_preserves_the_last_available_choices() {

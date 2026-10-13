@@ -1547,7 +1547,7 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn claude_unknown_default_capabilities_omit_the_flag_even_with_a_stale_saved_choice() {
+    fn claude_unknown_default_capabilities_preserve_the_explicit_saved_effort() {
         let Some(server) = ClaudeFixture::new() else {
             return;
         };
@@ -1561,7 +1561,11 @@ for line in sys.stdin:
         );
         let logs = server.received();
         let args = logs[0]["args"].as_array().unwrap();
-        assert!(!args.iter().any(|arg| arg == "--effort"), "{args:?}");
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--effort" && pair[1] == "high"),
+            "{args:?}"
+        );
     }
 
     #[test]

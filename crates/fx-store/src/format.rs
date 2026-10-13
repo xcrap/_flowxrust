@@ -19,6 +19,37 @@ pub const MAX_CONVERSATION_BYTES: u64 = 32 * 1024 * 1024;
 /// Most dormant provider presentations remembered per project.
 pub const MAX_DORMANT_PRESENTATIONS: usize = 32;
 
+/// Choices copied into new chats for one provider. Unset fields leave the
+/// provider's own model/reasoning selection and FlowX's access default intact.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProviderDefaults {
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_or_default"
+    )]
+    pub model_id: Option<String>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_or_default"
+    )]
+    pub effort: Option<String>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_or_default"
+    )]
+    pub agent_access: Option<AgentAccess>,
+}
+
+fn deserialize_or_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned + Default,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
+}
+
 /// User preferences use stable strings so storage stays independent of UI types.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -27,6 +58,10 @@ pub struct PersistedPreferences {
     pub base_tone: String,
     pub accent: String,
     pub text_size: String,
+    #[serde(deserialize_with = "deserialize_or_default")]
+    pub codex_defaults: ProviderDefaults,
+    #[serde(deserialize_with = "deserialize_or_default")]
+    pub claude_defaults: ProviderDefaults,
 }
 
 impl Default for PersistedPreferences {
@@ -36,6 +71,8 @@ impl Default for PersistedPreferences {
             base_tone: "zinc".into(),
             accent: "violet".into(),
             text_size: "standard".into(),
+            codex_defaults: ProviderDefaults::default(),
+            claude_defaults: ProviderDefaults::default(),
         }
     }
 }
@@ -474,6 +511,36 @@ mod tests {
 
     fn workspace() -> PersistedWorkspace {
         PersistedWorkspace::default()
+    }
+
+    #[test]
+    fn preferences_from_before_provider_defaults_keep_their_appearance() {
+        let legacy: PersistedPreferences = serde_json::from_str(
+            r#"{"appearance":"light","base_tone":"stone","accent":"blue","text_size":"large"}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.appearance, "light");
+        assert_eq!(legacy.base_tone, "stone");
+        assert_eq!(legacy.accent, "blue");
+        assert_eq!(legacy.text_size, "large");
+        assert_eq!(legacy.codex_defaults, ProviderDefaults::default());
+        assert_eq!(legacy.claude_defaults, ProviderDefaults::default());
+    }
+
+    #[test]
+    fn malformed_provider_choices_do_not_discard_other_preferences() {
+        let decoded: PersistedPreferences = serde_json::from_str(
+            r#"{"appearance":"light","codex_defaults":{"model_id":"saved-model","effort":42,"agent_access":"futureAccess"},"claude_defaults":null}"#,
+        )
+        .unwrap();
+        assert_eq!(decoded.appearance, "light");
+        assert_eq!(
+            decoded.codex_defaults.model_id.as_deref(),
+            Some("saved-model")
+        );
+        assert_eq!(decoded.codex_defaults.effort, None);
+        assert_eq!(decoded.codex_defaults.agent_access, None);
+        assert_eq!(decoded.claude_defaults, ProviderDefaults::default());
     }
 
     #[test]

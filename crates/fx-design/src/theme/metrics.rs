@@ -146,6 +146,9 @@ impl Layout {
     pub const SIDEBAR_MIN_WIDTH: f32 = 200.0;
     pub const SIDEBAR_MAX_WIDTH: f32 = 400.0;
     pub const SETTINGS_PANEL_WIDTH: f32 = 560.0;
+    pub const SETTINGS_WINDOW_WIDTH: f32 = 800.0;
+    pub const SETTINGS_NAV_WIDTH: f32 = 176.0;
+    pub const SETTINGS_BODY_HEIGHT: f32 = 512.0;
     pub const CONTROL_HEIGHT: f32 = 30.0;
     pub const CONTROL_COMPACT_HEIGHT: f32 = 28.0;
     pub const SIDEBAR_ROW_HEIGHT: f32 = 30.0;

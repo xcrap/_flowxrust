@@ -125,7 +125,7 @@ pub fn button_with_icon(
     style: ButtonStyle,
     enabled: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
+) -> gpui::Stateful<gpui::Div> {
     let theme = global::current();
     let label = label.into();
     let button_id: SharedString = format!("button:{label}").into();
@@ -192,6 +192,24 @@ pub fn button_with_icon(
             if enabled {
                 on_click(event, window, cx);
             }
+        })
+}
+
+/// A full-width, left-aligned destination in a settings or navigation list.
+pub fn navigation_button(
+    label: impl Into<SharedString>,
+    icon: Icon,
+    selected: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let theme = global::current();
+    button_with_icon(label, Some(icon), ButtonStyle::Ghost, true, on_click)
+        .w_full()
+        .justify_start()
+        .when(selected, |button| {
+            button
+                .bg(Colors::bg_selected(&theme))
+                .text_color(Colors::fg(&theme))
         })
 }
 

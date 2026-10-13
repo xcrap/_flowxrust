@@ -13,12 +13,14 @@ use std::time::{Duration, Instant};
 pub type GuardedConversation = Mutex<Conversation>;
 
 use fx_agent::conversation::Conversation;
-use fx_core::{Agent, Project};
+use fx_core::{Agent, AgentConfiguration, Project};
 use fx_design::components::{ContextRegistry, MenuLayer};
 use fx_design::theme::{
     AccentColor, AppearanceMode, BaseTone, Layout, TextSizePreset, Theme, global,
 };
-use fx_store::{AppPaths, PersistedApp, PersistedConversation, RightPanelTab, Store};
+use fx_store::{
+    AppPaths, PersistedApp, PersistedConversation, PersistedPreferences, RightPanelTab, Store,
+};
 
 use crate::text_field::TextField;
 use gpui::{App, AppContext, Context, Entity};
@@ -40,6 +42,7 @@ pub enum StoreError {
 pub struct AppState {
     pub store: Store,
     pub snapshot: PersistedApp,
+    pub preferences: PersistedPreferences,
     /// Live transcripts, keyed by agent. Populated as threads are opened.
     ///
     /// Guarded, because a turn runs on a background thread and writes events into
@@ -104,6 +107,10 @@ impl AppState {
     /// does not parse every transcript in every project.
     pub fn restore(paths: AppPaths, cx: &mut Context<Self>) -> Self {
         let store = Store::new(paths.clone());
+        let preferences = store.load_preferences().unwrap_or_else(|error| {
+            tracing::warn!(%error, "could not restore preferences");
+            PersistedPreferences::default()
+        });
         let (mut snapshot, last_error, snapshot_writable) = match store.load_app() {
             Ok(snapshot) => (snapshot, None, true),
             Err(error) => {
@@ -159,6 +166,7 @@ impl AppState {
             context_registry: cx.new(|_| ContextRegistry::default()),
             store,
             snapshot,
+            preferences,
             conversations: HashMap::new(),
             drafts: HashMap::new(),
             runners: HashMap::new(),
@@ -230,7 +238,17 @@ impl AppState {
     /// nowhere to put a thread that has no project.
     pub fn create_thread(&mut self) -> Option<Uuid> {
         let project_id = self.snapshot.active_project_id?;
-        let agent = fx_core::Agent::new("Untitled thread");
+        let provider = self
+            .active_agent()
+            .and_then(|agent| {
+                agent
+                    .configuration
+                    .provider_id
+                    .or_else(|| self.native_defaults(agent.id).provider_id)
+            })
+            .unwrap_or_else(|| "codex".into());
+        let mut agent = fx_core::Agent::new("Untitled thread");
+        agent.configuration = self.default_configuration(&provider);
 
         let record = self
             .snapshot
@@ -246,6 +264,43 @@ impl AppState {
             .insert(agent.id, Arc::new(Mutex::new(Conversation::new(agent.id))));
         self.snapshot.active_agent_id = Some(agent.id);
         Some(agent.id)
+    }
+
+    /// Snapshot a provider's defaults for a new, unused chat. Existing chats
+    /// resolve only their own overrides/native settings, never current defaults.
+    pub fn default_configuration(&self, provider: &str) -> AgentConfiguration {
+        let defaults = if provider == "claude" {
+            &self.preferences.claude_defaults
+        } else {
+            &self.preferences.codex_defaults
+        };
+        let model_id = defaults
+            .model_id
+            .as_deref()
+            .unwrap_or(if provider == "claude" {
+                "default"
+            } else {
+                fx_core::DEFAULT_CODEX_MODEL_ID
+            });
+        let model = crate::provider_catalog::known_model(provider, model_id);
+        AgentConfiguration {
+            provider_id: Some(provider.into()),
+            model_id: defaults.model_id.clone(),
+            effort: defaults
+                .effort
+                .as_ref()
+                .filter(|effort| {
+                    model
+                        .as_ref()
+                        .is_none_or(|model| model.supported_efforts.contains(effort))
+                })
+                .cloned(),
+            agent_access: defaults.agent_access,
+            context_window_size: model
+                .map(|model| model.context_window)
+                .filter(|size| *size > 0),
+            ..Default::default()
+        }
     }
 
     /// Whether a project's threads are showing.
@@ -2134,6 +2189,175 @@ mod persistence_tests {
     use crate::session::SessionUpdate;
     use fx_agent::provider::Usage;
     use fx_core::{ConversationMessage, MessageRole};
+
+    #[test]
+    fn new_chats_copy_provider_defaults_and_keep_them_after_defaults_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let mut preferences = PersistedPreferences {
+            codex_defaults: fx_store::ProviderDefaults {
+                model_id: Some("gpt-6-astra".into()),
+                effort: Some("high".into()),
+                agent_access: Some(fx_core::AgentAccess::Supervised),
+            },
+            ..Default::default()
+        };
+        Store::new(paths.clone())
+            .save_preferences(&preferences)
+            .unwrap();
+        let test = gpui::TestAppContext::single();
+        let state = test.update(|cx| cx.new(|cx| AppState::restore(paths.clone(), cx)));
+        let first = test.update(|cx| {
+            state.update(cx, |state, _| {
+                assert_eq!(state.preferences, preferences);
+                state.add_project(temp.path().to_str().unwrap());
+                let first = state.create_thread().unwrap();
+                let configuration = &state.thread(first).unwrap().configuration;
+                assert_eq!(configuration.provider_id.as_deref(), Some("codex"));
+                assert_eq!(configuration.model_id.as_deref(), Some("gpt-6-astra"));
+                assert_eq!(configuration.effort.as_deref(), Some("high"));
+                assert_eq!(
+                    configuration.agent_access,
+                    Some(fx_core::AgentAccess::Supervised)
+                );
+                assert_eq!(configuration.context_window_size, Some(272_000));
+                state.save();
+                first
+            })
+        });
+        preferences.codex_defaults.effort = Some("low".into());
+        preferences.codex_defaults.agent_access = Some(fx_core::AgentAccess::AcceptEdits);
+        Store::new(paths.clone())
+            .save_preferences(&preferences)
+            .unwrap();
+        let restarted = test.update(|cx| cx.new(|cx| AppState::restore(paths, cx)));
+        test.update(|cx| {
+            restarted.update(cx, |state, _| {
+                assert_eq!(
+                    state.thread(first).unwrap().configuration.effort.as_deref(),
+                    Some("high")
+                );
+                assert_eq!(
+                    state.thread(first).unwrap().configuration.agent_access,
+                    Some(fx_core::AgentAccess::Supervised)
+                );
+                let second = state.create_thread().unwrap();
+                assert_eq!(
+                    state
+                        .thread(second)
+                        .unwrap()
+                        .configuration
+                        .effort
+                        .as_deref(),
+                    Some("low")
+                );
+                assert_eq!(
+                    state.thread(second).unwrap().configuration.agent_access,
+                    Some(fx_core::AgentAccess::AcceptEdits)
+                );
+            })
+        });
+    }
+
+    #[test]
+    fn new_chat_uses_native_provider_without_copying_or_changing_native_settings() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, _, imported, _) = test.update(|cx| workspace(cx, &paths));
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                state.preferences.claude_defaults = fx_store::ProviderDefaults {
+                    model_id: Some("custom-claude-model".into()),
+                    effort: Some("low".into()),
+                    agent_access: Some(fx_core::AgentAccess::AcceptEdits),
+                };
+                let native: fx_store::PersistedBinding =
+                    serde_json::from_value(serde_json::json!({
+                        "agentId": imported,
+                        "providerId": "claude",
+                        "sessionId": "native-session",
+                        "updatedAt": fx_core::models::now(),
+                        "model": "native-model",
+                        "effort": "high",
+                        "agentAccess": "supervised"
+                    }))
+                    .unwrap();
+                state.snapshot.projects[0].native_bindings.push(native);
+                let original = state.thread(imported).unwrap().configuration.clone();
+                let created = state.create_thread().unwrap();
+                let configuration = &state.thread(created).unwrap().configuration;
+                assert_eq!(configuration.provider_id.as_deref(), Some("claude"));
+                assert_eq!(
+                    configuration.model_id.as_deref(),
+                    Some("custom-claude-model")
+                );
+                assert_eq!(configuration.effort.as_deref(), Some("low"));
+                assert_eq!(
+                    configuration.agent_access,
+                    Some(fx_core::AgentAccess::AcceptEdits)
+                );
+                assert_eq!(state.thread(imported).unwrap().configuration, original);
+                let effective = crate::configuration::with_native_defaults(
+                    state.thread(imported).unwrap().clone(),
+                    state.native_defaults(imported),
+                );
+                assert_eq!(
+                    effective.configuration.model_id.as_deref(),
+                    Some("native-model")
+                );
+                assert_eq!(effective.configuration.effort.as_deref(), Some("high"));
+                assert_eq!(
+                    effective.configuration.agent_access,
+                    Some(fx_core::AgentAccess::Supervised)
+                );
+                // The next new chat follows the explicit provider on the previous new chat.
+                let next = state.create_thread().unwrap();
+                assert_eq!(
+                    state.thread(next).unwrap().configuration,
+                    state.thread(created).unwrap().configuration
+                );
+            })
+        });
+    }
+
+    #[test]
+    fn provider_defaults_preserve_unknown_efforts_and_clear_known_unsupported_values() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let state = test.update(|cx| cx.new(|cx| AppState::restore(paths, cx)));
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                state.preferences.codex_defaults = fx_store::ProviderDefaults {
+                    model_id: Some("gpt-6-astra".into()),
+                    effort: Some("unsupported-effort".into()),
+                    ..Default::default()
+                };
+                let codex = state.default_configuration("codex");
+                assert_eq!(codex.context_window_size, Some(272_000));
+                assert!(codex.effort.is_none());
+                state.preferences.claude_defaults.effort = Some("high".into());
+                let claude = state.default_configuration("claude");
+                assert_eq!(claude.effort.as_deref(), Some("high"));
+                assert!(claude.context_window_size.is_none());
+                assert_eq!(
+                    crate::provider_catalog::effective_effort(
+                        "claude",
+                        "default",
+                        claude.effort.as_deref()
+                    )
+                    .as_deref(),
+                    Some("high")
+                );
+                state.preferences.claude_defaults.model_id = Some("unknown-custom-model".into());
+                assert_eq!(
+                    state.default_configuration("claude").effort.as_deref(),
+                    Some("high")
+                );
+            })
+        });
+    }
 
     #[test]
     fn a_resized_sidebar_retains_its_width_through_hide_and_restart() {

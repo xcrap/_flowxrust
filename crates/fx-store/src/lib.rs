@@ -12,7 +12,7 @@ pub mod write;
 
 pub use format::{
     PersistedApp, PersistedBinding, PersistedConversation, PersistedPreferences, PersistedProject,
-    PersistedUnsentPrompt, PersistedWorkspace, RightPanelTab, SplitContent,
+    PersistedUnsentPrompt, PersistedWorkspace, ProviderDefaults, RightPanelTab, SplitContent,
 };
 pub use paths::{AppPaths, PathsError};
 pub use store::{LoadError, SaveError, Store};

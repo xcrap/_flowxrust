@@ -19,6 +19,7 @@ pub mod inspector;
 mod native_sync;
 pub mod project_picker;
 pub mod provider_catalog;
+mod provider_settings;
 pub mod session;
 pub mod settings;
 pub mod sidebar;
@@ -275,6 +276,7 @@ impl Render for FlowX {
         let registry = self.state.read(cx).context_registry.clone();
         let frame_registry = registry.clone();
         let for_click = layer.clone();
+        let context_state = self.state.clone();
         let ui = workspace_ui::handle(cx);
         let settings = ui.read(cx).settings.clone();
         let request = ui.read(cx).request.clone();
@@ -396,6 +398,9 @@ impl Render for FlowX {
                 }
             })
             .on_mouse_down(MouseButton::Right, move |event, window, cx| {
+                if workspace_ui::has_modal(&context_state, cx) {
+                    return;
+                }
                 fx_design::components::handle_root_right_click(
                     &registry, &for_click, event, window, cx,
                 );
@@ -439,6 +444,9 @@ impl Render for FlowX {
                 || div().into_any_element(),
                 |picker| AnyView::from(picker).into_any_element(),
             ))
+            .children(settings.map(AnyView::from))
+            .children(thread_dialog.map(AnyView::from))
+            .children(request.map(AnyView::from))
             .child(fx_design::components::menu_layer_overlay(
                 &self.state.read(cx).menu_layer,
                 cx,
@@ -451,10 +459,7 @@ impl Render for FlowX {
                 |_item, _window, cx| {
                     crate::highlight_menu_item(cx);
                 },
-            ))
-            .children(settings.map(AnyView::from))
-            .children(thread_dialog.map(AnyView::from))
-            .children(request.map(AnyView::from));
+            ));
         fx_design::components::context_frame(&frame_registry, root)
     }
 }
@@ -1119,6 +1124,17 @@ pub fn dispatch_menu_choice(owner: &str, chosen: &str, window: &mut Window, cx: 
     let Some(handle) = AppHandle::get(cx) else {
         return;
     };
+    if owner.starts_with("settings-defaults:") {
+        let sheet = workspace_ui::handle(cx).read(cx).settings.clone();
+        if let Some(sheet) = sheet
+            && let Some(editor) = sheet.read(cx).provider_defaults()
+        {
+            editor.update(cx, |editor, cx| {
+                editor.apply(owner, chosen, cx);
+            });
+        }
+        return;
+    }
     if chosen == "new-project" {
         crate::state::open_project_picker(handle.0.clone(), window, cx);
         return;

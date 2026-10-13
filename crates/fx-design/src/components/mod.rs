@@ -27,6 +27,7 @@ pub use menu_model::{MenuItem, MenuItemTone, MenuModel, MenuSection};
 pub use button::{
     ButtonStyle, ICON_BUTTON_SIZE, IconButtonProps, IconButtonVariant, button, button_palette,
     button_with_icon, choice_row, compact_action_button, icon_button, icon_button_palette,
+    navigation_button,
 };
 pub use segmented::{SegmentedOption, segmented_control};
 pub use status::{

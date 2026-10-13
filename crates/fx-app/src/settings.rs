@@ -20,8 +20,8 @@ use std::path::{Path, PathBuf};
 use fx_core::services::runtime::{BinaryHealth, BinarySpec, expand_glob};
 use fx_design::components::segmented::{SegmentedOption, segmented_control};
 use fx_design::components::{
-    BadgeTone, ButtonStyle, IconButtonProps, badge, button, button_with_icon, card, divider,
-    icon_button, panel, section_header, tooltip,
+    BadgeTone, ButtonStyle, DividerAxis, IconButtonProps, badge, button, button_with_icon, card,
+    divider, divider_with_axis, icon_button, navigation_button, panel, section_header, tooltip,
 };
 use fx_design::icon::Icon;
 use fx_design::styled::{FxStyled, px_len};
@@ -32,7 +32,7 @@ use fx_design::theme::{
 use gpui::prelude::*;
 use gpui::{
     AnyElement, App, Context, Entity, FocusHandle, KeyDownEvent, MouseButton, Render, SharedString,
-    Window, div, px,
+    Subscription, Window, div, px,
 };
 
 // ── The draft ──────────────────────────────────────────────────────────────
@@ -411,6 +411,51 @@ type RecheckHandler = Box<dyn Fn(&mut Window, &mut App)>;
 /// Element id of the container that owns the sheet's keys.
 const SHEET_ID: &str = "settings.sheet";
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SettingsPage {
+    ChatDefaults,
+    #[default]
+    Appearance,
+    Providers,
+    Archives,
+}
+
+impl SettingsPage {
+    const ALL: [Self; 4] = [
+        Self::ChatDefaults,
+        Self::Appearance,
+        Self::Providers,
+        Self::Archives,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::ChatDefaults => "Chat defaults",
+            Self::Appearance => "Appearance",
+            Self::Providers => "Providers",
+            Self::Archives => "Archived chats",
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::ChatDefaults => "chat-defaults",
+            Self::Appearance => "appearance",
+            Self::Providers => "providers",
+            Self::Archives => "archives",
+        }
+    }
+
+    fn icon(self) -> Icon {
+        match self {
+            Self::ChatDefaults => Icon::BUBBLE_LEFT_AND_BUBBLE_RIGHT,
+            Self::Appearance => Icon::GEARSHAPE,
+            Self::Providers => Icon::TERMINAL,
+            Self::Archives => Icon::ARCHIVEBOX,
+        }
+    }
+}
+
 /// The settings sheet, mounted over the window by its caller.
 ///
 /// The sheet owns a reversible appearance preview. The caller owns persistence
@@ -428,8 +473,11 @@ pub struct SettingsSheet {
     on_apply: ApplyHandler,
     on_dismiss: DismissHandler,
     on_recheck: RecheckHandler,
+    provider_defaults: Option<Entity<crate::provider_settings::ProviderSettings>>,
+    provider_defaults_dirty: bool,
+    provider_defaults_subscription: Option<Subscription>,
     archives: Option<Entity<crate::archived_chats::ArchivedChats>>,
-    show_archives: bool,
+    page: SettingsPage,
     /// Set once either outcome has been reported.
     ///
     /// The caller unmounts on the first callback and reacts to it, not the
@@ -463,8 +511,11 @@ impl SettingsSheet {
             on_apply,
             on_dismiss,
             on_recheck,
+            provider_defaults: None,
+            provider_defaults_dirty: false,
+            provider_defaults_subscription: None,
             archives: None,
-            show_archives: false,
+            page: SettingsPage::default(),
             settled: false,
         })
     }
@@ -495,6 +546,57 @@ impl SettingsSheet {
         self.archives = Some(archives);
     }
 
+    pub(crate) fn set_provider_defaults(
+        &mut self,
+        editor: Entity<crate::provider_settings::ProviderSettings>,
+        cx: &mut Context<Self>,
+    ) {
+        self.provider_defaults_dirty = editor.read(cx).is_dirty();
+        self.provider_defaults_subscription = Some(cx.observe(&editor, |sheet, editor, cx| {
+            sheet.provider_defaults_dirty = editor.read(cx).is_dirty();
+            cx.notify();
+        }));
+        self.provider_defaults = Some(editor);
+        self.page = SettingsPage::ChatDefaults;
+        cx.notify();
+    }
+
+    fn page_available(&self, page: SettingsPage) -> bool {
+        match page {
+            SettingsPage::ChatDefaults => self.provider_defaults.is_some(),
+            SettingsPage::Archives => self.archives.is_some(),
+            _ => true,
+        }
+    }
+
+    fn select_page(&mut self, page: SettingsPage, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.page_available(page) {
+            return;
+        }
+        self.dismiss_provider_menu(cx);
+        self.page = page;
+        if page == SettingsPage::Archives {
+            if let Some(archives) = &self.archives {
+                archives.read(cx).focus_search(window, cx);
+            }
+        } else {
+            self.focus.focus(window);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn provider_defaults(
+        &self,
+    ) -> Option<Entity<crate::provider_settings::ProviderSettings>> {
+        self.provider_defaults.clone()
+    }
+
+    fn dismiss_provider_menu(&self, cx: &mut App) {
+        if let Some(editor) = &self.provider_defaults {
+            editor.update(cx, |editor, cx| editor.dismiss_menu(cx));
+        }
+    }
+
     /// The settings as they stand.
     pub fn draft(&self) -> SettingsDraft {
         self.draft
@@ -507,7 +609,7 @@ impl SettingsSheet {
 
     /// Whether applying would change anything.
     pub fn is_dirty(&self) -> bool {
-        self.draft.is_dirty_against(&self.baseline)
+        self.draft.is_dirty_against(&self.baseline) || self.provider_defaults_dirty
     }
 
     /// Whether Reset has anything to undo.
@@ -563,6 +665,10 @@ impl SettingsSheet {
     /// Restore the opening appearance without persisting the draft.
     fn reset(&mut self, cx: &mut Context<Self>) {
         self.draft = self.baseline;
+        if let Some(editor) = &self.provider_defaults {
+            editor.update(cx, |editor, cx| editor.reset(cx));
+        }
+        self.provider_defaults_dirty = false;
         self.preview();
         cx.refresh_windows();
         cx.notify();
@@ -574,6 +680,7 @@ impl SettingsSheet {
             return;
         }
         self.settled = true;
+        self.dismiss_provider_menu(cx);
         (self.on_apply)(self.draft, window, cx);
     }
 
@@ -583,6 +690,7 @@ impl SettingsSheet {
             return;
         }
         self.settled = true;
+        self.dismiss_provider_menu(cx);
         global::set(self.baseline.apply_to(&global::current()));
         cx.refresh_windows();
         (self.on_dismiss)(window, cx);
@@ -625,10 +733,9 @@ impl Render for SettingsSheet {
                 }
             });
 
-        // `SETTINGS_PANEL_WIDTH` is the width the token layer declared for this
-        // panel; nothing else in the app uses it.
+        // The settings window reserves room for its own page navigation.
         let sheet = div()
-            .w(px_len(Layout::SETTINGS_PANEL_WIDTH))
+            .w(px_len(Layout::SETTINGS_WINDOW_WIDTH))
             .max_w_full()
             // Padding around the panel so the shadow has somewhere to land: a
             // styled element's shadow is clipped to the element's own bounds.
@@ -666,10 +773,22 @@ impl Render for SettingsSheet {
                     .capture_key_down({
                         let this = this.clone();
                         move |event: &KeyDownEvent, window, cx| {
+                            if this
+                                .read(cx)
+                                .provider_defaults
+                                .as_ref()
+                                .is_some_and(|editor| editor.read(cx).menu_is_open(cx))
+                            {
+                                // The app's one menu layer owns Escape, Enter,
+                                // and arrow keys until this picker closes.
+                                return;
+                            }
                             // Searching archives must not submit the settings.
                             let action = match event.keystroke.key.as_str() {
                                 "escape" => Some(Action::Dismiss),
-                                "enter" if !this.read(cx).show_archives => Some(Action::Confirm),
+                                "enter" if this.read(cx).page != SettingsPage::Archives => {
+                                    Some(Action::Confirm)
+                                }
                                 _ => None,
                             };
                             let Some(action) = action else {
@@ -701,7 +820,7 @@ enum Action {
 }
 
 impl SettingsSheet {
-    /// Fixed header and footer surround the only scrolling region.
+    /// Navigation, header and footer stay put while the selected page scrolls.
     fn body(
         &self,
         this: &Entity<SettingsSheet>,
@@ -711,89 +830,31 @@ impl SettingsSheet {
         let for_reset = this.clone();
         let for_done = this.clone();
         let for_close = this.clone();
-        let content = if self.show_archives {
-            div().children(self.archives.clone()).into_any_element()
-        } else {
-            let mut content = div()
+        let content = match self.page {
+            SettingsPage::ChatDefaults => div()
+                .children(self.provider_defaults.clone())
+                .into_any_element(),
+            SettingsPage::Appearance => self.appearance_section(this),
+            SettingsPage::Providers => self.provider_section(this),
+            SettingsPage::Archives => div()
                 .w_full()
                 .flex()
                 .flex_col()
-                .gap(px_len(Spacing::XXL))
-                .child(self.appearance_section(this))
-                .child(self.provider_section(this));
-            if self.archives.is_some() {
-                let this = this.clone();
-                content = content.child(
+                .gap(px_len(Spacing::MD))
+                .child(section_header("Archived chats"))
+                .child(
                     div()
-                        .w_full()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap(px_len(Spacing::MD))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .flex()
-                                .flex_col()
-                                .gap(px_len(Spacing::XXS))
-                                .child(div().fx_body().child("Archived chats"))
-                                .child(
-                                    div()
-                                        .fx_caption()
-                                        .text_color(Colors::fg_secondary(&theme))
-                                        .child("Find and restore chats from your projects."),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .debug_selector(|| "manage-archived-chats".into())
-                                .child(button(
-                                    "Manage",
-                                    ButtonStyle::Secondary,
-                                    true,
-                                    move |_, window, cx| {
-                                        this.update(cx, |sheet, cx| {
-                                            sheet.show_archives = true;
-                                            if let Some(archives) = &sheet.archives {
-                                                archives.read(cx).focus_search(window, cx);
-                                            }
-                                            cx.notify();
-                                        });
-                                    },
-                                )),
-                        ),
-                );
-            }
-            content.into_any_element()
+                        .fx_caption()
+                        .text_color(Colors::fg_secondary(&theme))
+                        .child("Find and restore chats from your projects."),
+                )
+                .children(self.archives.clone())
+                .into_any_element(),
         };
-        let reset_or_back = if self.show_archives {
-            button(
-                "Back to Settings",
-                ButtonStyle::Ghost,
-                true,
-                move |_, window, cx| {
-                    for_reset.update(cx, |sheet, cx| {
-                        sheet.show_archives = false;
-                        sheet.focus.focus(window);
-                        cx.notify();
-                    });
-                },
-            )
-            .into_any_element()
-        } else {
-            button(
-                "Reset changes",
-                ButtonStyle::Ghost,
-                self.can_reset(),
-                move |_, _, cx| {
-                    for_reset.update(cx, |sheet, cx| sheet.reset(cx));
-                },
-            )
-            .into_any_element()
-        };
+        let page = self.page;
         div()
             .w_full()
+            .min_w_0()
             .flex()
             .flex_col()
             .child(
@@ -806,29 +867,7 @@ impl SettingsSheet {
                     .px(px_len(Spacing::XXL))
                     .py(px_len(Spacing::XL))
                     .flex_shrink_0()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .gap(px_len(Spacing::XXS))
-                            .child(div().fx_title2().child(if self.show_archives {
-                                "Archived chats"
-                            } else {
-                                "Settings"
-                            }))
-                            .child(
-                                div()
-                                    .fx_caption()
-                                    .text_color(Colors::fg_secondary(&theme))
-                                    .child(if self.show_archives {
-                                        "Restore a chat to return it to the sidebar."
-                                    } else {
-                                        "Appearance, AI providers and archived chats"
-                                    }),
-                            ),
-                    )
+                    .child(div().fx_title2().child("Settings"))
                     .child(icon_button(
                         IconButtonProps::new(Icon::XMARK, "Close settings"),
                         move |_, window, cx| {
@@ -842,23 +881,31 @@ impl SettingsSheet {
             .child(divider())
             .child(
                 div()
-                    .id(if self.show_archives {
-                        "settings-archives-content"
-                    } else {
-                        "settings-content"
-                    })
                     .w_full()
-                    .min_h_0()
-                    .max_h(max_body_height)
-                    .overflow_y_scroll()
+                    .min_w_0()
+                    .h(px(Layout::SETTINGS_BODY_HEIGHT).min(max_body_height))
+                    .flex()
+                    .overflow_hidden()
+                    .child(self.navigation(this))
+                    .child(divider_with_axis(DividerAxis::Vertical))
                     .child(
                         div()
-                            .w_full()
-                            .flex()
-                            .flex_col()
-                            .gap(px_len(Spacing::XXL))
-                            .p(px_len(Spacing::XXL))
-                            .child(content),
+                            .id(SharedString::from(format!("settings-page-{}", page.key())))
+                            .debug_selector(move || format!("settings-page-{}", page.key()))
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .overflow_y_scroll()
+                            .child(
+                                div()
+                                    .w_full()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px_len(Spacing::XXL))
+                                    .p(px_len(Spacing::XXL))
+                                    .child(content),
+                            ),
                     ),
             )
             .child(divider())
@@ -872,7 +919,14 @@ impl SettingsSheet {
                     .px(px_len(Spacing::XXL))
                     .py(px_len(Spacing::LG))
                     .flex_shrink_0()
-                    .child(reset_or_back)
+                    .child(button(
+                        "Reset changes",
+                        ButtonStyle::Ghost,
+                        self.can_reset(),
+                        move |_, _, cx| {
+                            for_reset.update(cx, |sheet, cx| sheet.reset(cx));
+                        },
+                    ))
                     .child(button(
                         "Done",
                         ButtonStyle::Primary,
@@ -885,6 +939,47 @@ impl SettingsSheet {
                         },
                     )),
             )
+    }
+
+    fn navigation(&self, this: &Entity<SettingsSheet>) -> AnyElement {
+        let mut navigation = div()
+            .debug_selector(|| "settings-navigation".into())
+            .w(px_len(Layout::SETTINGS_NAV_WIDTH))
+            .h_full()
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .gap(px_len(Spacing::XS))
+            .p(px_len(Spacing::MD));
+        for page in SettingsPage::ALL {
+            if !self.page_available(page) {
+                continue;
+            }
+            let this = this.clone();
+            let selected = self.page == page;
+            let item = div()
+                .w_full()
+                .debug_selector(move || format!("settings-nav-{}", page.key()))
+                .child(navigation_button(
+                    page.label(),
+                    page.icon(),
+                    selected,
+                    move |_, window, cx| {
+                        this.update(cx, |sheet, cx| sheet.select_page(page, window, cx));
+                    },
+                ));
+            // Keep the recovery entry's established automation selector.
+            navigation = if page == SettingsPage::Archives {
+                navigation.child(
+                    div()
+                        .debug_selector(|| "manage-archived-chats".into())
+                        .child(item),
+                )
+            } else {
+                navigation.child(item)
+            };
+        }
+        navigation.into_any_element()
     }
 
     /// Provider CLIs: one row per report, and the re-check.
@@ -1817,6 +1912,158 @@ mod tests {
     }
 
     #[test]
+    fn provider_drafts_are_independent_and_reset_with_the_sheet() {
+        let mut mounted = mount();
+        let editor = mounted.test.update(|cx| {
+            let menus = cx.new(|_| fx_design::components::MenuLayer::default());
+            crate::provider_settings::ProviderSettings::new(
+                fx_store::ProviderDefaults::default(),
+                fx_store::ProviderDefaults::default(),
+                menus,
+                cx,
+            )
+        });
+        mounted.sheet.update(&mut mounted.test, |sheet, cx| {
+            sheet.set_provider_defaults(editor.clone(), cx)
+        });
+        editor.update(&mut mounted.test, |editor, cx| {
+            assert!(editor.apply("settings-defaults:claude:access", "Supervised", cx));
+        });
+        mounted.test.refresh().unwrap();
+        assert!(mounted.read(|sheet| sheet.can_reset()));
+        mounted.test.read(|cx| {
+            let (codex, claude) = editor.read(cx).values();
+            assert_eq!(codex, fx_store::ProviderDefaults::default());
+            assert_eq!(claude.agent_access, Some(fx_core::AgentAccess::Supervised));
+        });
+        mounted
+            .sheet
+            .update(&mut mounted.test, |sheet, cx| sheet.reset(cx));
+        mounted.test.refresh().unwrap();
+        assert!(!mounted.read(|sheet| sheet.is_dirty()));
+        assert!(mounted.applied().is_empty());
+        mounted.test.read(|cx| {
+            assert_eq!(
+                editor.read(cx).values(),
+                (
+                    fx_store::ProviderDefaults::default(),
+                    fx_store::ProviderDefaults::default()
+                )
+            )
+        });
+    }
+
+    #[test]
+    fn settings_navigation_preserves_edits_and_keeps_page_geometry_stable() {
+        let mut mounted = mount();
+        let (menus, editor) = mounted.test.update(|cx| {
+            let menus = cx.new(|_| fx_design::components::MenuLayer::default());
+            let editor = crate::provider_settings::ProviderSettings::new(
+                fx_store::ProviderDefaults::default(),
+                fx_store::ProviderDefaults::default(),
+                menus.clone(),
+                cx,
+            );
+            (menus, editor)
+        });
+        mounted.sheet.update(&mut mounted.test, |sheet, cx| {
+            sheet.set_provider_defaults(editor.clone(), cx);
+        });
+        let mut visual = VisualTestContext::from_window(mounted.window, &mounted.test);
+        visual.simulate_resize(gpui::size(px(1_000.0), px(640.0)));
+        mounted.test.refresh().unwrap();
+        assert_eq!(mounted.read(|sheet| sheet.page), SettingsPage::ChatDefaults);
+        let defaults_bounds = visual.debug_bounds("settings-page-chat-defaults").unwrap();
+        let navigation_bounds = visual.debug_bounds("settings-navigation").unwrap();
+        assert!(defaults_bounds.size.width > px(400.0));
+        assert!(navigation_bounds.right() <= defaults_bounds.left());
+
+        editor.update(&mut mounted.test, |editor, cx| {
+            editor.apply("settings-defaults:claude:access", "Supervised", cx);
+        });
+        menus.update(&mut mounted.test, |menus, cx| {
+            menus.open(
+                fx_design::components::MenuModel::default(),
+                "settings-defaults:codex:model",
+            );
+            cx.notify();
+        });
+        let appearance = visual
+            .debug_bounds("settings-nav-appearance")
+            .unwrap()
+            .center();
+        mounted.click_at(appearance);
+        assert_eq!(mounted.read(|sheet| sheet.page), SettingsPage::Appearance);
+        mounted.test.read(|cx| assert!(!menus.read(cx).is_open()));
+        assert_eq!(
+            visual.debug_bounds("settings-page-appearance").unwrap(),
+            defaults_bounds
+        );
+        mounted.choose(|sheet| sheet.set_tone(BaseTone::Stone));
+        let providers = visual
+            .debug_bounds("settings-nav-providers")
+            .unwrap()
+            .center();
+        mounted.click_at(providers);
+        assert_eq!(mounted.read(|sheet| sheet.page), SettingsPage::Providers);
+        assert_eq!(
+            visual.debug_bounds("settings-page-providers").unwrap(),
+            defaults_bounds
+        );
+        assert_eq!(global::current().base_tone, BaseTone::Stone);
+        let defaults = visual
+            .debug_bounds("settings-nav-chat-defaults")
+            .unwrap()
+            .center();
+        mounted.click_at(defaults);
+        assert_eq!(mounted.read(|sheet| sheet.page), SettingsPage::ChatDefaults);
+        mounted.test.read(|cx| {
+            assert_eq!(
+                editor.read(cx).values().1.agent_access,
+                Some(fx_core::AgentAccess::Supervised)
+            )
+        });
+        assert!(mounted.read(|sheet| sheet.is_dirty()));
+        assert!(mounted.applied().is_empty());
+        assert_eq!(
+            visual.debug_bounds("settings-navigation").unwrap(),
+            navigation_bounds
+        );
+    }
+
+    #[test]
+    fn escape_and_enter_do_not_settle_settings_while_a_provider_picker_is_open() {
+        let mut mounted = mount();
+        let (menus, editor) = mounted.test.update(|cx| {
+            let menus = cx.new(|_| fx_design::components::MenuLayer::default());
+            let editor = crate::provider_settings::ProviderSettings::new(
+                fx_store::ProviderDefaults::default(),
+                fx_store::ProviderDefaults::default(),
+                menus.clone(),
+                cx,
+            );
+            (menus, editor)
+        });
+        mounted.sheet.update(&mut mounted.test, |sheet, cx| {
+            sheet.set_provider_defaults(editor, cx)
+        });
+        menus.update(&mut mounted.test, |menus, cx| {
+            menus.open(
+                fx_design::components::MenuModel::default(),
+                "settings-defaults:codex:model",
+            );
+            cx.notify();
+        });
+        mounted.press("escape");
+        mounted.press("enter");
+        assert_eq!(*mounted.dismissed.borrow(), 0);
+        assert!(mounted.applied().is_empty());
+        mounted.done();
+        mounted.test.read(|cx| assert!(!menus.read(cx).is_open()));
+        assert_eq!(mounted.applied().len(), 1);
+    }
+
+    #[test]
     fn choosing_a_setting_previews_the_theme_without_persisting_the_draft() {
         let theme = Theme::default();
         let _guard = ThemeGuard::install(theme);
@@ -2039,6 +2286,7 @@ mod tests {
     fn runtime_paths_keep_readable_width_in_a_narrow_settings_window() {
         let mut mounted = mount();
         mounted.choose(|sheet| {
+            sheet.page = SettingsPage::Providers;
             sheet.rows = vec![
                 HealthRow {
                     id: "codex".into(),
@@ -2144,6 +2392,7 @@ mod tests {
             ProviderReport::new(&ok_spec, &bundled),
         ];
         sheet.update(&mut mounted.test, |sheet, cx| {
+            sheet.page = SettingsPage::Providers;
             sheet.set_health(cx, &reports);
         });
         mounted
