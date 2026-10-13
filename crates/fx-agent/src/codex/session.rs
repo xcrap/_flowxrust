@@ -487,6 +487,67 @@ pub fn is_read_only_command(command: &str) -> bool {
     READ_ONLY.contains(&base)
 }
 
+/// Preserve the tool arguments shared by live items and native history.
+///
+/// Command items carry their command at the top level, whereas MCP and dynamic
+/// calls carry `arguments`. The transcript reads a JSON `command` string; argv
+/// arrays additionally retain their exact boundaries in `command_argv`.
+pub(super) fn tool_input(item: &Value) -> Value {
+    let mut input = item
+        .get("input")
+        .filter(|value| !value.is_null())
+        .or_else(|| item.get("arguments").filter(|value| !value.is_null()))
+        .cloned()
+        .unwrap_or_else(|| {
+            let mut input = item.clone();
+            if let Some(map) = input.as_object_mut() {
+                for key in [
+                    "aggregatedOutput",
+                    "output",
+                    "result",
+                    "error",
+                    "contentItems",
+                ] {
+                    map.remove(key);
+                }
+            }
+            input
+        });
+    // Some protocol versions serialize the input object as a JSON string.
+    if let Some(raw) = input.as_str()
+        && let Ok(parsed @ Value::Object(_)) = serde_json::from_str::<Value>(raw)
+    {
+        input = parsed;
+    }
+    let command = item
+        .get("command")
+        .filter(|value| !value.is_null())
+        .or_else(|| input.get("command"))
+        .cloned();
+    let display = match command.as_ref() {
+        Some(Value::String(command)) => Some(command.clone()),
+        Some(Value::Array(words)) => words
+            .iter()
+            .map(Value::as_str)
+            .collect::<Option<Vec<_>>>()
+            .map(|words| words.join(" ")),
+        _ => None,
+    };
+    if let Some(display) = display {
+        if !input.is_object() {
+            input = json!({ "input": input });
+        }
+        input["command"] = Value::String(display);
+        if matches!(command, Some(Value::Array(_))) {
+            input["command_argv"] = command.unwrap();
+        }
+        if let Some(cwd) = item.get("cwd") {
+            input["cwd"] = cwd.clone();
+        }
+    }
+    input
+}
+
 /// Translate one notification into zero or more events.
 ///
 /// Returns a list because several Codex notifications map to more than one
@@ -530,16 +591,15 @@ pub fn parse_notification(method: &str, params: &Value) -> Vec<ProviderEvent> {
                 .to_string();
 
             if is_tool_item(item_type) {
-                let command = item.get("command").and_then(Value::as_str).or_else(|| {
-                    item.get("input")
-                        .and_then(|i| i.get("command"))
-                        .and_then(Value::as_str)
-                });
                 if method == "item/started" {
+                    let input = tool_input(item);
                     return vec![ProviderEvent::ToolUse {
                         id,
                         name,
-                        input: item.get("input").map(Value::to_string).unwrap_or_default(),
+                        input: input
+                            .as_str()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| input.to_string()),
                     }];
                 }
                 // Completed: the output is the result.
@@ -561,7 +621,6 @@ pub fn parse_notification(method: &str, params: &Value) -> Vec<ProviderEvent> {
                     .unwrap_or_else(|| TRIVIAL_TOOL_RESULT.to_string());
                 let is_error = item.get("error").is_some()
                     || item.get("is_error").and_then(Value::as_bool) == Some(true);
-                let _ = command;
                 return vec![ProviderEvent::ToolResult {
                     id,
                     content,
@@ -1049,6 +1108,67 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn a_real_shaped_started_command_keeps_its_command_and_working_directory() {
+        // Same top-level fields as the captured 0.155.1 native command item;
+        // values are synthetic. In particular, there is no invented `input`.
+        let events = parse_notification(
+            "item/started",
+            &json!({
+                "threadId": "thread", "turnId": "turn", "item": {
+                    "type": "commandExecution", "id": "command", "command": "cargo test",
+                    "cwd": "/project", "status": "inProgress", "commandActions": [],
+                    "aggregatedOutput": null, "exitCode": null, "durationMs": null
+                }
+            }),
+        );
+        let ProviderEvent::ToolUse { input, .. } = &events[0] else {
+            panic!("missing tool use");
+        };
+        let input: Value = serde_json::from_str(input).unwrap();
+        assert_eq!(input["command"], "cargo test");
+        assert_eq!(input["cwd"], "/project");
+        assert!(input.get("aggregatedOutput").is_none());
+    }
+
+    #[test]
+    fn argv_commands_preserve_argument_boundaries_and_other_input_fields() {
+        // The argv form is also exercised by the Codex approval fixtures.
+        let argv = json!(["printf", "%s", "a path with spaces"]);
+        for raw in [
+            json!({"type":"commandExecution", "command":argv, "cwd":"/project", "input":{"timeout_ms":1000}}),
+            json!({"type":"commandExecution", "input":{"command":argv, "timeout_ms":1000}}),
+        ] {
+            let input = tool_input(&raw);
+            assert_eq!(input["command"], "printf %s a path with spaces");
+            assert_eq!(input["command_argv"], argv);
+            assert_eq!(input["timeout_ms"], 1000);
+        }
+        let input = tool_input(
+            &json!({"command":"cargo test", "input":{"command":"stale", "timeout_ms":1000}}),
+        );
+        assert_eq!(input["command"], "cargo test");
+        assert_eq!(input["timeout_ms"], 1000);
+    }
+
+    #[test]
+    fn tool_arguments_are_preserved_without_copying_result_payloads_into_input() {
+        assert_eq!(
+            tool_input(
+                &json!({"type":"mcpToolCall", "input":null, "arguments":{"file":"readme"}, "result":"contents"})
+            ),
+            json!({"file":"readme"})
+        );
+        assert_eq!(
+            tool_input(&json!({"type":"toolCall", "input":"plain text input"})),
+            json!("plain text input")
+        );
+        assert_eq!(
+            tool_input(&json!({"type":"toolCall", "input":"{\"command\":\"ls\"}"}))["command"],
+            "ls"
+        );
     }
 
     #[test]

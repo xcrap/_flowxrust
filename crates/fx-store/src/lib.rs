@@ -11,8 +11,9 @@ mod store;
 pub mod write;
 
 pub use format::{
-    PersistedApp, PersistedBinding, PersistedConversation, PersistedPreferences, PersistedProject,
-    PersistedUnsentPrompt, PersistedWorkspace, ProviderDefaults, RightPanelTab, SplitContent,
+    AutoTitlePreferences, PersistedApp, PersistedBinding, PersistedConversation,
+    PersistedPreferences, PersistedProject, PersistedUnsentPrompt, PersistedWorkspace,
+    ProviderDefaults, RightPanelTab, SplitContent,
 };
 pub use paths::{AppPaths, PathsError};
 pub use store::{LoadError, SaveError, Store};

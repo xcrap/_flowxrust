@@ -1,7 +1,7 @@
 //! Live, read-only changes and files inspector.
 
 #[path = "git_inspector.rs"]
-mod repository;
+pub(crate) mod repository;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -693,7 +693,7 @@ impl Render for Inspector {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PreviewRowStyle {
+pub(crate) enum PreviewRowStyle {
     Section,
     Metadata,
     Hunk,
@@ -702,7 +702,7 @@ enum PreviewRowStyle {
 
 /// Git's transport metadata is quieter than the actual changed source. Keep
 /// plain file contents literal, even when source text resembles a diff header.
-fn preview_row_style(line: &repository::PreviewLine, diff: bool) -> PreviewRowStyle {
+pub(crate) fn preview_row_style(line: &repository::PreviewLine, diff: bool) -> PreviewRowStyle {
     if !diff {
         return PreviewRowStyle::Code;
     }

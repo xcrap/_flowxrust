@@ -33,6 +33,12 @@ not complete.** The remaining work is listed below.
   drafts are preserved. These actions manage FlowX's saved records locally.
 - Interactive tool approvals and grouped questions, including masked secret
   answers. Responses return to the thread that requested them.
+- Compact activity groups show progress and action counts without flooding the
+  transcript. Open a group to inspect commands, with earlier actions paged in.
+- Automatic names for new chats after their first successful exchange, using a
+  separate lightweight model: Codex GPT-5.6-Luna or Claude Haiku by default.
+  **Settings → Chat names** changes these models or turns naming off. Each name
+  uses one additional provider request; manual names and imported chats are kept.
 - Saved transcripts, provider session IDs, token/context totals, drafts and
   unsent prompts. Drafts clear after provider acceptance; a failed submission
   remains retryable. Recovery copies are bounded on read, and unreadable or
@@ -43,6 +49,10 @@ not complete.** The remaining work is listed below.
 - Read-only Changes and Files tabs: repository status, staged/unstaged text
   diffs, file previews and refresh. Reads are bounded, and preview paths are
   checked against the project root.
+- A working-tree tray above the composer opens file diffs directly in the chat.
+  It refreshes every five seconds and after a turn, even with the inspector
+  closed. It shows shared project changes, including edits from other chats and
+  editors; it does not automatically commit, fetch, or push.
 
 The test suite covers pure policies, storage recovery, GPUI views and provider
 process behavior through local fake servers. It also exercises saving a session

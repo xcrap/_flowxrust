@@ -73,6 +73,11 @@ const REFUSAL_SENTINEL: &str = "FlowX ";
 /// thread-safe.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SessionUpdate {
+    /// A separate ephemeral naming request completed; it never changes history.
+    AutoTitle {
+        generation: uuid::Uuid,
+        result: Result<String, String>,
+    },
     /// Streaming content changed; wake the matching conversation view.
     Changed,
     /// The provider accepted the submitted prompt; a retained draft may clear.

@@ -41,6 +41,25 @@ pub struct ProviderDefaults {
     pub agent_access: Option<AgentAccess>,
 }
 
+/// Separate lightweight models used once to name a newly created chat.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AutoTitlePreferences {
+    pub enabled: bool,
+    pub codex_model_id: String,
+    pub claude_model_id: String,
+}
+
+impl Default for AutoTitlePreferences {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            codex_model_id: "gpt-5.6-luna".into(),
+            claude_model_id: "haiku".into(),
+        }
+    }
+}
+
 fn deserialize_or_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -62,6 +81,8 @@ pub struct PersistedPreferences {
     pub codex_defaults: ProviderDefaults,
     #[serde(deserialize_with = "deserialize_or_default")]
     pub claude_defaults: ProviderDefaults,
+    #[serde(deserialize_with = "deserialize_or_default")]
+    pub auto_titles: AutoTitlePreferences,
 }
 
 impl Default for PersistedPreferences {
@@ -73,6 +94,7 @@ impl Default for PersistedPreferences {
             text_size: "standard".into(),
             codex_defaults: ProviderDefaults::default(),
             claude_defaults: ProviderDefaults::default(),
+            auto_titles: AutoTitlePreferences::default(),
         }
     }
 }
@@ -180,6 +202,10 @@ pub struct PersistedProject {
     pub project: Option<Project>,
     #[serde(default)]
     pub agents: Vec<Agent>,
+    /// Only chats created by FlowX are eligible. Removing an ID before a
+    /// request is persisted ensures restart cannot repeat a paid title call.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub auto_title_pending: Vec<Uuid>,
     /// Archived threads retain their place, history, and provider binding.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub archived_agent_ids: Vec<Uuid>,
@@ -339,6 +365,10 @@ impl PersistedApp {
             let agents: std::collections::HashSet<_> =
                 record.agents.iter().map(|agent| agent.id).collect();
             let mut seen = std::collections::HashSet::new();
+            record
+                .auto_title_pending
+                .retain(|id| agents.contains(id) && seen.insert(*id));
+            seen.clear();
             record
                 .archived_agent_ids
                 .retain(|id| agents.contains(id) && seen.insert(*id));
@@ -525,6 +555,9 @@ mod tests {
         assert_eq!(legacy.text_size, "large");
         assert_eq!(legacy.codex_defaults, ProviderDefaults::default());
         assert_eq!(legacy.claude_defaults, ProviderDefaults::default());
+        assert_eq!(legacy.auto_titles, AutoTitlePreferences::default());
+        let project: PersistedProject = serde_json::from_str("{}").unwrap();
+        assert!(project.auto_title_pending.is_empty());
     }
 
     #[test]

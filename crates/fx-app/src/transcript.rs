@@ -37,8 +37,8 @@ use fx_core::policy::transcript_grouping::{
 use fx_core::{ConversationImageAssetReference, ConversationMessage, MessageContent, MessageRole};
 use fx_design::components::surface::banner;
 use fx_design::components::{
-    BadgeTone, DividerAxis, badge, divider_with_axis, empty_state, panel, spinner_arc,
-    typing_indicator,
+    BadgeTone, ButtonStyle, DividerAxis, badge, button, divider_with_axis, empty_state, panel,
+    spinner_arc, typing_indicator,
 };
 use fx_design::icon::Icon;
 use fx_design::styled::{FxRefinement, FxStyled, px_len};
@@ -62,6 +62,10 @@ const COLUMN_SELECTOR: &str = "transcript.column";
 const EMPTY_SELECTOR: &str = "transcript.empty";
 const USER_SELECTOR: &str = "transcript.user";
 const ASSISTANT_SELECTOR: &str = "transcript.assistant";
+const ACTIVITY_HEADER_SELECTOR: &str = "transcript.activity-header";
+const ACTIVITY_DETAILS_SELECTOR: &str = "transcript.activity-details";
+const EARLIER_ACTIONS_SELECTOR: &str = "transcript.earlier-actions";
+const ACTIVITY_PAGE_SIZE: usize = 20;
 
 /// The name a result carries when the transcript never saw the call it belongs
 /// to.
@@ -111,6 +115,8 @@ struct ViewMemory {
     /// Keys carry the conversation, so pruning one thread's groups cannot close
     /// another's.
     disclosures: HashMap<String, bool>,
+    /// Expanded groups reveal their newest page first, even after long runs.
+    detail_limits: HashMap<String, usize>,
     /// The content revision each conversation's disclosure map was last pruned
     /// at. Without this, a long-lived thread accumulates one entry per group it
     /// has ever shown.
@@ -175,6 +181,28 @@ fn toggle_disclosure(key: &str) {
     });
 }
 
+fn detail_limit(key: &str) -> usize {
+    MEMORY.with(|memory| {
+        memory
+            .borrow()
+            .detail_limits
+            .get(key)
+            .copied()
+            .unwrap_or(ACTIVITY_PAGE_SIZE)
+    })
+}
+
+fn reveal_earlier_actions(key: &str) {
+    MEMORY.with(|memory| {
+        let mut memory = memory.borrow_mut();
+        let limit = memory
+            .detail_limits
+            .entry(key.to_owned())
+            .or_insert(ACTIVITY_PAGE_SIZE);
+        *limit = limit.saturating_add(ACTIVITY_PAGE_SIZE);
+    });
+}
+
 /// Forget the groups a conversation no longer has.
 ///
 /// Keyed on the revisions rather than run every pass: pruning is a map rebuild,
@@ -200,6 +228,9 @@ fn prune_disclosures(
         // groups survive being filtered.
         memory
             .disclosures
+            .retain(|key, _| !key.starts_with(&prefix) || live.contains(key));
+        memory
+            .detail_limits
             .retain(|key, _| !key.starts_with(&prefix) || live.contains(key));
     });
 }
@@ -458,7 +489,10 @@ pub fn view(conversation: &crate::Conversation, window: &mut Window, cx: &mut Ap
 
     let frame = MEMORY.with(|memory| memory.borrow_mut().next_frame());
     request_caret_frame(conversation, frame, window);
-    let streaming = streaming_tail(conversation, frame);
+    let has_active_group = rows
+        .iter()
+        .any(|row| matches!(row, Row::Activity(group) if group.is_active));
+    let streaming = streaming_tail(conversation, frame, has_active_group);
     let is_empty = rows.is_empty() && streaming.is_none() && conversation.error().is_none();
     let focus = viewport_focus(conversation.id, cx);
     let for_keys = handle.clone();
@@ -920,7 +954,11 @@ fn empty_transcript_notice() -> AnyElement {
 
 /// The reply still being written, or the indicator that stands in for one before
 /// any of it has arrived. `None` when there is nothing live to show.
-fn streaming_tail(conversation: &crate::Conversation, frame: u32) -> Option<AnyElement> {
+fn streaming_tail(
+    conversation: &crate::Conversation,
+    frame: u32,
+    has_active_group: bool,
+) -> Option<AnyElement> {
     let theme = global::current();
     let text = conversation.streaming_text();
 
@@ -970,7 +1008,7 @@ fn streaming_tail(conversation: &crate::Conversation, frame: u32) -> Option<AnyE
 
     // Waiting on the reader is not working, and saying otherwise would claim
     // progress that is not happening.
-    if !conversation.is_busy() || conversation.is_waiting_for_user() {
+    if !conversation.is_busy() || conversation.is_waiting_for_user() || has_active_group {
         return None;
     }
 
@@ -1050,10 +1088,9 @@ fn activity_group(
     frame: u32,
 ) -> AnyElement {
     let theme = global::current();
-    // A group being worked on is forced open, as in the original: a reader
-    // watching a turn is watching it work, not reading its history. The toggle
-    // still records a choice, which takes effect once the turn settles.
-    let expanded = group.is_active || is_disclosed(&group.key);
+    // Progress stays compact until the reader asks for details. Streaming new
+    // calls must never override a reader's decision to close the disclosure.
+    let expanded = is_disclosed(&group.key);
 
     let chevron = if expanded {
         Icon::CHEVRON_DOWN
@@ -1079,6 +1116,7 @@ fn activity_group(
     };
 
     let header = div()
+        .debug_selector(|| ACTIVITY_HEADER_SELECTOR.into())
         .w_full()
         .flex()
         .flex_row()
@@ -1097,7 +1135,10 @@ fn activity_group(
                 .fx_role(TextRole::CaptionMedium)
                 .text_color(Colors::fg_secondary(&theme))
                 .truncate()
-                .child(SharedString::from(group_title(group))),
+                .child(SharedString::from(group_title(
+                    group,
+                    conversation.phase().label(),
+                ))),
         )
         .child(failures)
         .id(SharedString::from(format!("activity:{}", group.key)))
@@ -1123,6 +1164,7 @@ fn activity_group(
 
     if expanded {
         let mut details = div()
+            .debug_selector(|| ACTIVITY_DETAILS_SELECTOR.into())
             .w_full()
             .min_w_0()
             .flex()
@@ -1135,7 +1177,28 @@ fn activity_group(
             // Without it a long list of rows reads as more transcript.
             .border_l(px_len(BorderWidth::HAIRLINE))
             .border_color(Colors::border_subtle(&theme));
-        for call in &group.calls {
+        let hidden = group.calls.len().saturating_sub(detail_limit(&group.key));
+        if hidden > 0 {
+            let key = group.key.clone();
+            details = details.child(
+                div()
+                    .debug_selector(|| EARLIER_ACTIONS_SELECTOR.into())
+                    .child(button(
+                        SharedString::from(format!(
+                            "Show {} earlier {}",
+                            hidden.min(ACTIVITY_PAGE_SIZE),
+                            if hidden == 1 { "action" } else { "actions" }
+                        )),
+                        ButtonStyle::Ghost,
+                        true,
+                        move |_, _, cx| {
+                            reveal_earlier_actions(&key);
+                            cx.refresh_windows();
+                        },
+                    )),
+            );
+        }
+        for call in &group.calls[hidden..] {
             details = details.child(tool_row(call, group.is_active, conversation, frame));
         }
         column = column.child(details);
@@ -1167,6 +1230,10 @@ fn tool_row(
     };
 
     let title = div()
+        .debug_selector({
+            let id = call.id.clone();
+            move || format!("transcript.activity-call:{id}")
+        })
         .w_full()
         .flex()
         .flex_row()
@@ -1263,13 +1330,11 @@ fn tool_detail(call: &ToolCall<'_>) -> Option<String> {
     (!summarized.is_empty()).then_some(summarized)
 }
 
-fn group_title(group: &ActivityGroup<'_>) -> String {
-    if group.is_active {
-        return "Working…".to_string();
-    }
-    let mut title = match group.summary.seconds {
-        Some(seconds) => format!("Worked for {}", duration_label(seconds)),
-        None => "Worked".to_string(),
+fn group_title(group: &ActivityGroup<'_>, phase_label: &str) -> String {
+    let mut title = match (group.is_active, group.summary.seconds) {
+        (true, _) => format!("{phase_label}…"),
+        (false, Some(seconds)) => format!("Worked for {}", duration_label(seconds)),
+        (false, None) => "Worked".to_string(),
     };
     if group.summary.calls > 0 {
         title.push_str(" · ");
@@ -2061,8 +2126,8 @@ mod tests {
         assert_eq!(group.summary.calls, 4);
         assert_eq!(group.summary.edits, 2);
         assert_eq!(group.summary.failures, 1);
-        assert!(group_title(group).contains("4 actions"));
-        assert!(group_title(group).contains("2 edits"));
+        assert!(group_title(group, "Working").contains("4 actions"));
+        assert!(group_title(group, "Working").contains("2 edits"));
     }
 
     #[test]
@@ -2083,7 +2148,10 @@ mod tests {
     fn a_working_group_is_titled_as_working() {
         let source = [tool_use("a", "Read", "{}")];
         let rows = build_rows(&borrowed(&source), true, CONVERSATION);
-        assert_eq!(group_title(only_group(&rows)), "Working…");
+        assert_eq!(
+            group_title(only_group(&rows), "Working"),
+            "Working… · 1 action"
+        );
     }
 
     #[test]
@@ -2322,6 +2390,157 @@ mod tests {
             conversation.apply(event);
         }
         conversation
+    }
+
+    fn working_calls(count: usize) -> Conversation {
+        let mut conversation = Conversation::new(Uuid::new_v4());
+        conversation.apply(ProviderEvent::Lifecycle(Lifecycle::TurnStarted));
+        for index in 0..count {
+            conversation.apply(ProviderEvent::ToolUse {
+                id: format!("tool-{index}"),
+                name: "commandExecution".into(),
+                input: format!(r#"{{"command":"echo {index}"}}"#),
+            });
+            conversation.apply(ProviderEvent::ToolResult {
+                id: format!("tool-{index}"),
+                content: "Completed".into(),
+                is_error: false,
+            });
+        }
+        conversation
+    }
+
+    #[test]
+    fn live_activity_starts_compact_and_can_be_closed_while_work_continues() {
+        let mut test = TestAppContext::single();
+        let window = test.add_window(|_, _| Harness {
+            conversation: working_calls(12),
+        });
+        let mut visual = VisualTestContext::from_window(*window.deref(), &test);
+        visual.simulate_resize(size(px(900.0), px(600.0)));
+        test.refresh().unwrap();
+        test.update(|_| {});
+        let collapsed = visual.debug_bounds(COLUMN_SELECTOR).unwrap().size.height;
+        assert!(
+            collapsed < px(120.0),
+            "twelve actions should occupy one summary row"
+        );
+        assert!(visual.debug_bounds(ACTIVITY_DETAILS_SELECTOR).is_none());
+        let header = visual
+            .debug_bounds(ACTIVITY_HEADER_SELECTOR)
+            .unwrap()
+            .center();
+        visual.simulate_mouse_down(header, gpui::MouseButton::Left, Default::default());
+        visual.simulate_mouse_up(header, gpui::MouseButton::Left, Default::default());
+        test.refresh().unwrap();
+        test.update(|_| {});
+        assert!(
+            visual
+                .debug_bounds(ACTIVITY_DETAILS_SELECTOR)
+                .unwrap()
+                .size
+                .height
+                > px(200.0)
+        );
+        let header = visual
+            .debug_bounds(ACTIVITY_HEADER_SELECTOR)
+            .unwrap()
+            .center();
+        visual.simulate_mouse_down(header, gpui::MouseButton::Left, Default::default());
+        visual.simulate_mouse_up(header, gpui::MouseButton::Left, Default::default());
+        window
+            .update(&mut test, |view, _, cx| {
+                view.conversation.apply(ProviderEvent::ToolUse {
+                    id: "another-call".into(),
+                    name: "Read".into(),
+                    input: "{}".into(),
+                });
+                assert!(view.conversation.is_busy());
+                cx.notify();
+            })
+            .unwrap();
+        test.refresh().unwrap();
+        test.update(|_| {});
+        assert_eq!(
+            visual.debug_bounds(COLUMN_SELECTOR).unwrap().size.height,
+            collapsed
+        );
+    }
+
+    #[test]
+    fn expanded_activity_pages_earlier_calls_instead_of_rendering_the_entire_run() {
+        let conversation = working_calls(45);
+        let messages: Vec<_> = conversation.messages().collect();
+        let rows = build_rows(&messages, true, conversation.id);
+        toggle_disclosure(&only_group(&rows).key);
+        let mut test = TestAppContext::single();
+        let window = test.add_window(|_, _| Harness { conversation });
+        let mut visual = VisualTestContext::from_window(*window.deref(), &test);
+        visual.simulate_resize(size(px(900.0), px(1600.0)));
+        test.refresh().unwrap();
+        test.update(|_| {});
+        assert!(
+            visual
+                .debug_bounds("transcript.activity-call:tool-24")
+                .is_none()
+        );
+        assert!(
+            visual
+                .debug_bounds("transcript.activity-call:tool-25")
+                .is_some()
+        );
+        assert!(
+            visual
+                .debug_bounds("transcript.activity-call:tool-44")
+                .is_some()
+        );
+        let earlier = visual
+            .debug_bounds(EARLIER_ACTIONS_SELECTOR)
+            .unwrap()
+            .center();
+        visual.simulate_mouse_down(earlier, gpui::MouseButton::Left, Default::default());
+        visual.simulate_mouse_up(earlier, gpui::MouseButton::Left, Default::default());
+        test.refresh().unwrap();
+        test.update(|_| {});
+        assert!(
+            visual
+                .debug_bounds("transcript.activity-call:tool-4")
+                .is_none()
+        );
+        assert!(
+            visual
+                .debug_bounds("transcript.activity-call:tool-5")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn activity_progress_replaces_only_the_empty_working_indicator() {
+        let mut conversation = working_calls(12);
+        assert!(streaming_tail(&conversation, 0, true).is_none());
+        assert!(streaming_tail(&conversation, 0, false).is_some());
+        conversation.apply(ProviderEvent::TextDelta("Here is what I found.".into()));
+        assert!(streaming_tail(&conversation, 0, true).is_some());
+    }
+
+    #[test]
+    fn compact_activity_preserves_stopping_compaction_and_approval_status() {
+        use fx_agent::conversation::state::Phase;
+        for phase in [
+            Phase::Compacting,
+            Phase::WaitingForApproval,
+            Phase::Cancelling,
+        ] {
+            let mut conversation = working_calls(12);
+            conversation.set_phase(phase);
+            let messages: Vec<_> = conversation.messages().collect();
+            let rows = build_rows(&messages, conversation.is_busy(), conversation.id);
+            assert_eq!(
+                group_title(only_group(&rows), conversation.phase().label()),
+                format!("{}… · 12 actions", phase.label())
+            );
+            assert!(streaming_tail(&conversation, 0, true).is_none());
+        }
     }
 
     #[test]

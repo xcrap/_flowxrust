@@ -414,6 +414,7 @@ const SHEET_ID: &str = "settings.sheet";
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum SettingsPage {
     ChatDefaults,
+    ChatNames,
     #[default]
     Appearance,
     Providers,
@@ -421,8 +422,9 @@ enum SettingsPage {
 }
 
 impl SettingsPage {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::ChatDefaults,
+        Self::ChatNames,
         Self::Appearance,
         Self::Providers,
         Self::Archives,
@@ -431,6 +433,7 @@ impl SettingsPage {
     fn label(self) -> &'static str {
         match self {
             Self::ChatDefaults => "Chat defaults",
+            Self::ChatNames => "Chat names",
             Self::Appearance => "Appearance",
             Self::Providers => "Providers",
             Self::Archives => "Archived chats",
@@ -440,6 +443,7 @@ impl SettingsPage {
     fn key(self) -> &'static str {
         match self {
             Self::ChatDefaults => "chat-defaults",
+            Self::ChatNames => "chat-names",
             Self::Appearance => "appearance",
             Self::Providers => "providers",
             Self::Archives => "archives",
@@ -449,6 +453,7 @@ impl SettingsPage {
     fn icon(self) -> Icon {
         match self {
             Self::ChatDefaults => Icon::BUBBLE_LEFT_AND_BUBBLE_RIGHT,
+            Self::ChatNames => Icon::PENCIL_LINE,
             Self::Appearance => Icon::GEARSHAPE,
             Self::Providers => Icon::TERMINAL,
             Self::Archives => Icon::ARCHIVEBOX,
@@ -476,6 +481,9 @@ pub struct SettingsSheet {
     provider_defaults: Option<Entity<crate::provider_settings::ProviderSettings>>,
     provider_defaults_dirty: bool,
     provider_defaults_subscription: Option<Subscription>,
+    title_settings: Option<Entity<crate::title_settings::TitleSettings>>,
+    title_settings_dirty: bool,
+    title_settings_subscription: Option<Subscription>,
     archives: Option<Entity<crate::archived_chats::ArchivedChats>>,
     page: SettingsPage,
     /// Set once either outcome has been reported.
@@ -514,6 +522,9 @@ impl SettingsSheet {
             provider_defaults: None,
             provider_defaults_dirty: false,
             provider_defaults_subscription: None,
+            title_settings: None,
+            title_settings_dirty: false,
+            title_settings_subscription: None,
             archives: None,
             page: SettingsPage::default(),
             settled: false,
@@ -564,6 +575,7 @@ impl SettingsSheet {
     fn page_available(&self, page: SettingsPage) -> bool {
         match page {
             SettingsPage::ChatDefaults => self.provider_defaults.is_some(),
+            SettingsPage::ChatNames => self.title_settings.is_some(),
             SettingsPage::Archives => self.archives.is_some(),
             _ => true,
         }
@@ -591,8 +603,39 @@ impl SettingsSheet {
         self.provider_defaults.clone()
     }
 
+    pub(crate) fn set_title_settings(
+        &mut self,
+        editor: Entity<crate::title_settings::TitleSettings>,
+        cx: &mut Context<Self>,
+    ) {
+        self.title_settings_dirty = editor.read(cx).is_dirty();
+        self.title_settings_subscription = Some(cx.observe(&editor, |sheet, editor, cx| {
+            sheet.title_settings_dirty = editor.read(cx).is_dirty();
+            cx.notify();
+        }));
+        self.title_settings = Some(editor);
+        cx.notify();
+    }
+
+    pub(crate) fn title_settings(&self) -> Option<Entity<crate::title_settings::TitleSettings>> {
+        self.title_settings.clone()
+    }
+
+    fn settings_menu_is_open(&self, cx: &App) -> bool {
+        self.provider_defaults
+            .as_ref()
+            .is_some_and(|editor| editor.read(cx).menu_is_open(cx))
+            || self
+                .title_settings
+                .as_ref()
+                .is_some_and(|editor| editor.read(cx).menu_is_open(cx))
+    }
+
     fn dismiss_provider_menu(&self, cx: &mut App) {
         if let Some(editor) = &self.provider_defaults {
+            editor.update(cx, |editor, cx| editor.dismiss_menu(cx));
+        }
+        if let Some(editor) = &self.title_settings {
             editor.update(cx, |editor, cx| editor.dismiss_menu(cx));
         }
     }
@@ -609,7 +652,9 @@ impl SettingsSheet {
 
     /// Whether applying would change anything.
     pub fn is_dirty(&self) -> bool {
-        self.draft.is_dirty_against(&self.baseline) || self.provider_defaults_dirty
+        self.draft.is_dirty_against(&self.baseline)
+            || self.provider_defaults_dirty
+            || self.title_settings_dirty
     }
 
     /// Whether Reset has anything to undo.
@@ -669,6 +714,10 @@ impl SettingsSheet {
             editor.update(cx, |editor, cx| editor.reset(cx));
         }
         self.provider_defaults_dirty = false;
+        if let Some(editor) = &self.title_settings {
+            editor.update(cx, |editor, cx| editor.reset(cx));
+        }
+        self.title_settings_dirty = false;
         self.preview();
         cx.refresh_windows();
         cx.notify();
@@ -773,12 +822,7 @@ impl Render for SettingsSheet {
                     .capture_key_down({
                         let this = this.clone();
                         move |event: &KeyDownEvent, window, cx| {
-                            if this
-                                .read(cx)
-                                .provider_defaults
-                                .as_ref()
-                                .is_some_and(|editor| editor.read(cx).menu_is_open(cx))
-                            {
+                            if this.read(cx).settings_menu_is_open(cx) {
                                 // The app's one menu layer owns Escape, Enter,
                                 // and arrow keys until this picker closes.
                                 return;
@@ -833,6 +877,9 @@ impl SettingsSheet {
         let content = match self.page {
             SettingsPage::ChatDefaults => div()
                 .children(self.provider_defaults.clone())
+                .into_any_element(),
+            SettingsPage::ChatNames => div()
+                .children(self.title_settings.clone())
                 .into_any_element(),
             SettingsPage::Appearance => self.appearance_section(this),
             SettingsPage::Providers => self.provider_section(this),
@@ -1951,6 +1998,39 @@ mod tests {
                 )
             )
         });
+    }
+
+    #[test]
+    fn chat_name_changes_follow_settings_reset_and_cancel() {
+        let mut mounted = mount();
+        let baseline = fx_store::AutoTitlePreferences::default();
+        let editor = mounted.test.update(|cx| {
+            let menus = cx.new(|_| fx_design::components::MenuLayer::default());
+            crate::title_settings::TitleSettings::new(baseline.clone(), menus, cx)
+        });
+        mounted.sheet.update(&mut mounted.test, |sheet, cx| {
+            sheet.set_title_settings(editor.clone(), cx)
+        });
+        editor.update(&mut mounted.test, |editor, cx| {
+            editor.set_enabled(false, cx);
+            assert!(editor.apply("settings-titles:codex", fx_core::DEFAULT_CODEX_MODEL_ID, cx));
+        });
+        mounted.test.refresh().unwrap();
+        assert!(mounted.read(|sheet| sheet.can_reset()));
+        mounted
+            .sheet
+            .update(&mut mounted.test, |sheet, cx| sheet.reset(cx));
+        mounted.test.refresh().unwrap();
+        assert!(!mounted.read(|sheet| sheet.is_dirty()));
+        mounted
+            .test
+            .read(|cx| assert_eq!(editor.read(cx).values(), baseline));
+        editor.update(&mut mounted.test, |editor, cx| {
+            editor.set_enabled(false, cx)
+        });
+        mounted.press("escape");
+        assert_eq!(mounted.dismissed(), 1);
+        assert!(mounted.applied().is_empty());
     }
 
     #[test]

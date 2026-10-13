@@ -125,6 +125,17 @@ fn require_success(output: CommandOutput) -> Result<CommandOutput, String> {
 /// Load a repository snapshot, or a bounded directory listing for a folder
 /// without Git. Errors remain visible instead of resembling a clean tree.
 pub async fn snapshot(root: &Path) -> Result<Snapshot, String> {
+    read_snapshot(root, true).await
+}
+
+/// The inline conversation surface needs only Git status, not a recursive file
+/// listing. Keeping that separate avoids walking non-repository project folders
+/// and enumerating every tracked file on its background refresh.
+pub async fn changes_snapshot(root: &Path) -> Result<Snapshot, String> {
+    read_snapshot(root, false).await
+}
+
+async fn read_snapshot(root: &Path, include_files: bool) -> Result<Snapshot, String> {
     let root = root
         .canonicalize()
         .map_err(|error| format!("Cannot open this project: {error}"))?;
@@ -138,7 +149,11 @@ pub async fn snapshot(root: &Path) -> Result<Snapshot, String> {
         if !probe.stderr.contains("not a git repository") {
             return require_success(probe).map(|_| unreachable!());
         }
-        let (files, truncated) = directory_files(&root)?;
+        let (files, truncated) = if include_files {
+            directory_files(&root)?
+        } else {
+            (Vec::new(), false)
+        };
         return Ok(Snapshot {
             root,
             repository: None,
@@ -161,32 +176,42 @@ pub async fn snapshot(root: &Path) -> Result<Snapshot, String> {
         )
         .await?,
     )?;
-    let list_output = require_success(
-        command(
-            &root,
-            &[
-                "ls-files",
-                "--cached",
-                "--others",
-                "--exclude-standard",
-                "-z",
-            ],
-            MAX_LIST_BYTES,
-        )
-        .await?,
-    )?;
+    let list_output = if include_files {
+        Some(require_success(
+            command(
+                &root,
+                &[
+                    "ls-files",
+                    "--cached",
+                    "--others",
+                    "--exclude-standard",
+                    "-z",
+                ],
+                MAX_LIST_BYTES,
+            )
+            .await?,
+        )?)
+    } else {
+        None
+    };
     let mut status = GitStatusParser::parse_status(complete_records(&status_output.stdout));
-    let truncated =
-        status_output.truncated || list_output.truncated || status.files.len() > MAX_FILES;
+    let truncated = status_output.truncated
+        || list_output.as_ref().is_some_and(|list| list.truncated)
+        || status.files.len() > MAX_FILES;
     status.files.truncate(MAX_FILES);
     let info = GitStatusParser::make_info(&status, &HashMap::new(), &HashMap::new(), false, 1);
-    let mut files: Vec<_> = complete_records(&list_output.stdout)
-        .split_terminator('\0')
-        .filter(|path| !path.is_empty())
-        .map(String::from)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
+    let mut files: Vec<_> = complete_records(
+        list_output
+            .as_ref()
+            .map(|list| list.stdout.as_str())
+            .unwrap_or_default(),
+    )
+    .split_terminator('\0')
+    .filter(|path| !path.is_empty())
+    .map(String::from)
+    .collect::<BTreeSet<_>>()
+    .into_iter()
+    .collect();
     let truncated = truncated || files.len() > MAX_FILES;
     files.truncate(MAX_FILES);
     Ok(Snapshot {

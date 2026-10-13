@@ -43,6 +43,7 @@ pub struct AppState {
     pub store: Store,
     pub snapshot: PersistedApp,
     pub preferences: PersistedPreferences,
+    title_jobs: HashMap<Uuid, crate::auto_title::TitleJob>,
     /// Live transcripts, keyed by agent. Populated as threads are opened.
     ///
     /// Guarded, because a turn runs on a background thread and writes events into
@@ -167,6 +168,7 @@ impl AppState {
             store,
             snapshot,
             preferences,
+            title_jobs: HashMap::new(),
             conversations: HashMap::new(),
             drafts: HashMap::new(),
             runners: HashMap::new(),
@@ -258,6 +260,7 @@ impl AppState {
         let project = record.project.as_mut()?;
         project.agent_order.push(agent.id);
         record.agents.push(agent.clone());
+        record.auto_title_pending.push(agent.id);
         record.is_expanded = true;
 
         self.conversations
@@ -300,6 +303,189 @@ impl AppState {
                 .map(|model| model.context_window)
                 .filter(|size| *size > 0),
             ..Default::default()
+        }
+    }
+
+    /// Naming continues after the main turn without making the composer busy.
+    pub fn has_title_jobs(&self) -> bool {
+        !self.title_jobs.is_empty()
+    }
+
+    /// Discard results from requests started before automatic naming was disabled.
+    pub(crate) fn cancel_title_jobs(&mut self) {
+        self.title_jobs.clear();
+    }
+
+    fn auto_title_record(&self, agent: Uuid) -> Option<&fx_store::PersistedProject> {
+        self.snapshot
+            .projects
+            .iter()
+            .find(|record| record.auto_title_pending.contains(&agent))
+    }
+
+    fn latest_exchange(&self, agent: Uuid) -> Option<(String, String)> {
+        let conversation = self.conversations.get(&agent)?.lock().ok()?;
+        let mut user = String::new();
+        let mut assistant = String::new();
+        for message in conversation.messages() {
+            match message.role {
+                fx_core::MessageRole::User => {
+                    user = message.text_content();
+                    assistant.clear();
+                }
+                fx_core::MessageRole::Assistant => {
+                    let text = message.text_content();
+                    if !text.trim().is_empty() {
+                        assistant = text;
+                    }
+                }
+                _ => {}
+            }
+        }
+        (!user.trim().is_empty()).then_some((user, assistant))
+    }
+
+    fn set_auto_title(&mut self, agent_id: Uuid, title: &str) -> bool {
+        if !self.snapshot_writable || self.thread(agent_id).is_none() {
+            return false;
+        }
+        let mut next = self.snapshot.clone();
+        for record in &mut next.projects {
+            if let Some(agent) = record.agents.iter_mut().find(|agent| agent.id == agent_id) {
+                agent.title = title.to_owned();
+                local_override(record, agent_id).title = Some(title.to_owned());
+                for binding in &mut record.native_bindings {
+                    if binding.agent_id == agent_id {
+                        binding.title = title.to_owned();
+                    }
+                }
+                break;
+            }
+        }
+        self.commit_thread_change(next, "save the generated chat name")
+    }
+
+    fn show_prompt_title(&mut self, agent: Uuid) {
+        if !self.preferences.auto_titles.enabled || self.auto_title_record(agent).is_none() {
+            return;
+        }
+        if let Some((user, _)) = self.latest_exchange(agent)
+            && let Some(title) = crate::auto_title::fallback_title(&user)
+        {
+            self.set_auto_title(agent, &title);
+        }
+    }
+
+    /// Consume eligibility durably before calling a model. Failure, cancellation,
+    /// restart and later turns never repeat this automatic paid request.
+    fn prepare_auto_title(&mut self, agent_id: Uuid) -> Option<fx_agent::title::TitleRequest> {
+        self.auto_title_record(agent_id)?;
+        // An opted-out first completion consumes eligibility, but an empty
+        // response does not: there is no usable request (or paid attempt) yet.
+        let request = if !self.preferences.auto_titles.enabled || self.is_thread_archived(agent_id)
+        {
+            None
+        } else {
+            let agent = self.thread(agent_id)?;
+            let provider = agent
+                .configuration
+                .provider_id
+                .clone()
+                .or(self.native_defaults(agent_id).provider_id)
+                .unwrap_or_else(|| "codex".into());
+            let (user, assistant) = self.latest_exchange(agent_id)?;
+            if assistant.trim().is_empty() {
+                return None;
+            }
+            let model = match provider.as_str() {
+                "codex" => self.preferences.auto_titles.codex_model_id.clone(),
+                "claude" => self.preferences.auto_titles.claude_model_id.clone(),
+                _ => return None,
+            };
+            Some(fx_agent::title::TitleRequest {
+                provider,
+                model,
+                user,
+                assistant,
+            })
+        };
+        let mut next = self.snapshot.clone();
+        for record in &mut next.projects {
+            record.auto_title_pending.retain(|id| *id != agent_id);
+        }
+        if !self.snapshot_writable
+            || !self.commit_thread_change(next, "remember the chat naming attempt")
+        {
+            return None;
+        }
+        request
+    }
+
+    fn start_auto_title(&mut self, agent_id: Uuid) {
+        let Some(request) = self.prepare_auto_title(agent_id) else {
+            return;
+        };
+        let generation = Uuid::new_v4();
+        self.title_jobs.insert(
+            agent_id,
+            crate::auto_title::TitleJob {
+                generation,
+                provider: request.provider.clone(),
+            },
+        );
+        #[cfg(not(test))]
+        if let Err(error) =
+            crate::auto_title::spawn(request, generation, self.update_sender_for(agent_id))
+        {
+            self.title_jobs.remove(&agent_id);
+            tracing::warn!(%error, "could not start chat naming");
+        }
+        // Unit/view tests never issue billable provider requests. The runner is
+        // exercised separately against fake child processes.
+        #[cfg(test)]
+        self.title_jobs.remove(&agent_id);
+    }
+
+    fn finish_auto_title(
+        &mut self,
+        agent_id: Uuid,
+        generation: Uuid,
+        result: Result<String, String>,
+    ) {
+        if !self
+            .title_jobs
+            .get(&agent_id)
+            .is_some_and(|job| job.generation == generation)
+        {
+            return;
+        }
+        let job = self
+            .title_jobs
+            .remove(&agent_id)
+            .expect("matched title job");
+        let Some(agent) = self.thread(agent_id) else {
+            return;
+        };
+        let provider = agent
+            .configuration
+            .provider_id
+            .as_deref()
+            .unwrap_or("codex");
+        if !self.preferences.auto_titles.enabled
+            || self.is_thread_archived(agent_id)
+            || provider != job.provider
+        {
+            return;
+        }
+        match result {
+            Ok(title) => {
+                if let Some(title) = fx_agent::title::clean_title(&title) {
+                    self.set_auto_title(agent_id, &title);
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "automatic chat naming failed; keeping the existing name")
+            }
         }
     }
 
@@ -493,6 +679,7 @@ impl AppState {
         for record in &mut next.projects {
             if let Some(agent) = record.agents.iter_mut().find(|agent| agent.id == agent_id) {
                 agent.title = title.to_string();
+                record.auto_title_pending.retain(|id| *id != agent_id);
                 local_override(record, agent_id).title = Some(title.to_string());
                 for binding in &mut record.native_bindings {
                     if binding.agent_id == agent_id {
@@ -502,7 +689,11 @@ impl AppState {
                 break;
             }
         }
-        self.commit_thread_change(next, "rename this thread")
+        let committed = self.commit_thread_change(next, "rename this thread");
+        if committed {
+            self.title_jobs.remove(&agent_id);
+        }
+        committed
     }
 
     pub fn set_thread_archived(&mut self, agent_id: Uuid, archived: bool) -> bool {
@@ -541,6 +732,7 @@ impl AppState {
         }
         if archived {
             self.pending_interactions.remove(&agent_id);
+            self.title_jobs.remove(&agent_id);
         }
         true
     }
@@ -604,6 +796,7 @@ impl AppState {
             return false;
         }
         self.deleted_agents.insert(agent_id);
+        self.title_jobs.remove(&agent_id);
         self.conversations.remove(&agent_id);
         self.drafts.remove(&agent_id);
         self.runners.remove(&agent_id);
@@ -953,6 +1146,12 @@ impl AppState {
 
     fn apply_update(&mut self, agent_id: Option<Uuid>, update: crate::session::SessionUpdate) {
         use crate::session::SessionUpdate;
+        if let SessionUpdate::AutoTitle { generation, result } = update {
+            if let Some(agent) = agent_id {
+                self.finish_auto_title(agent, generation, result);
+            }
+            return;
+        }
         if agent_id.is_some_and(|id| self.deleted_agents.contains(&id)) {
             return;
         }
@@ -983,6 +1182,9 @@ impl AppState {
                     }
                     conversation.clear_unsent();
                 }
+                if let Some(agent_id) = agent_id {
+                    self.show_prompt_title(agent_id);
+                }
                 // The composer is synchronized before its accepted text is written again.
                 should_save = false;
             }
@@ -1010,6 +1212,9 @@ impl AppState {
                     self.mark_native_local_turn(agent_id);
                     self.runners.remove(&agent_id);
                     self.pending_interactions.remove(&agent_id);
+                    if outcome.is_completed() {
+                        self.start_auto_title(agent_id);
+                    }
                 }
                 // A turn that worked clears the previous turn's failure. Leaving
                 // it up would report an error that no longer describes anything.
@@ -1030,6 +1235,7 @@ impl AppState {
             SessionUpdate::Refused { tool, reason } => {
                 tracing::info!(tool, reason, "a tool call was refused");
             }
+            SessionUpdate::AutoTitle { .. } => unreachable!("handled before conversation updates"),
         }
         if should_save {
             self.save_conversations();
@@ -2181,6 +2387,352 @@ pub fn open_project_picker(state: Entity<AppState>, window: &mut gpui::Window, c
         state.picker = Some(picker);
         cx.notify();
     });
+}
+
+#[cfg(test)]
+mod auto_title_tests {
+    use super::*;
+    use fx_core::{ConversationMessage, MessageRole};
+
+    fn new_chat(cx: &mut App, paths: AppPaths, root: &std::path::Path) -> (Entity<AppState>, Uuid) {
+        let state = cx.new(|cx| AppState::restore(paths, cx));
+        let id = state.update(cx, |state, _| {
+            state.add_project(root.to_str().unwrap());
+            let id = state.create_thread().unwrap();
+            let mut conversation = state.conversations[&id].lock().unwrap();
+            conversation.append(ConversationMessage::text(
+                MessageRole::User,
+                "Fix sidebar alignment and resize behavior",
+            ));
+            conversation.append(ConversationMessage::text(
+                MessageRole::Assistant,
+                "Aligned the rows and added resizing.",
+            ));
+            id
+        });
+        (state, id)
+    }
+
+    fn pending_job(state: &mut AppState, id: Uuid) -> Uuid {
+        let request = state.prepare_auto_title(id).unwrap();
+        let generation = Uuid::new_v4();
+        state.title_jobs.insert(
+            id,
+            crate::auto_title::TitleJob {
+                generation,
+                provider: request.provider,
+            },
+        );
+        generation
+    }
+
+    #[test]
+    fn auto_title_uses_one_separate_model_request_and_preserves_history_and_native_override() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, id) = test.update(|cx| new_chat(cx, paths.clone(), temp.path()));
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                state.preferences.auto_titles.codex_model_id = "lightweight-title-model".into();
+                state.show_prompt_title(id);
+                assert_eq!(
+                    state.thread(id).unwrap().title,
+                    "Fix sidebar alignment and resize behavior"
+                );
+                let request = state.prepare_auto_title(id).unwrap();
+                assert_eq!(request.provider, "codex");
+                assert_eq!(request.model, "lightweight-title-model");
+                assert_eq!(request.assistant, "Aligned the rows and added resizing.");
+                assert!(state.prepare_auto_title(id).is_none());
+                assert!(
+                    state.store.load_app().unwrap().projects[0]
+                        .auto_title_pending
+                        .is_empty()
+                );
+                let generation = Uuid::new_v4();
+                state.title_jobs.insert(
+                    id,
+                    crate::auto_title::TitleJob {
+                        generation,
+                        provider: "codex".into(),
+                    },
+                );
+                // A later foreground turn must not make the background title call
+                // trip the manual rename's busy-thread guard.
+                state.conversations[&id]
+                    .lock()
+                    .unwrap()
+                    .set_phase(fx_agent::Phase::Running);
+                state.finish_auto_title(id, generation, Ok("Improve sidebar layout".into()));
+                assert_eq!(state.thread(id).unwrap().title, "Improve sidebar layout");
+                assert!(state.last_error.is_none());
+                assert_eq!(state.conversations[&id].lock().unwrap().messages().len(), 2);
+                assert_eq!(
+                    state.snapshot.projects[0].thread_overrides[0]
+                        .title
+                        .as_deref(),
+                    Some("Improve sidebar layout")
+                );
+                assert!(!state.has_title_jobs());
+            })
+        });
+        let restored = test.update(|cx| cx.new(|cx| AppState::restore(paths, cx)));
+        test.update(|cx| {
+            restored.update(cx, |state, _| {
+                assert_eq!(state.thread(id).unwrap().title, "Improve sidebar layout");
+                assert!(state.prepare_auto_title(id).is_none());
+            })
+        });
+    }
+
+    #[test]
+    fn imported_manual_archived_deleted_and_opted_out_chats_reject_automatic_names() {
+        for action in [
+            "manual-before",
+            "manual-during",
+            "archive",
+            "delete",
+            "off",
+            "provider-change",
+            "imported",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let test = gpui::TestAppContext::single();
+            let (state, id) = test
+                .update(|cx| new_chat(cx, AppPaths::at(temp.path().join("state")), temp.path()));
+            test.update(|cx| {
+                state.update(cx, |state, _| {
+                    if action == "imported" {
+                        state.snapshot.projects[0].auto_title_pending.clear();
+                        assert!(state.prepare_auto_title(id).is_none());
+                        return;
+                    }
+                    if action == "manual-before" {
+                        assert!(state.rename_thread(id, "My chosen name"));
+                        assert!(state.prepare_auto_title(id).is_none());
+                        return;
+                    }
+                    let generation = pending_job(state, id);
+                    match action {
+                        "manual-during" => assert!(state.rename_thread(id, "My chosen name")),
+                        "archive" => assert!(state.set_thread_archived(id, true)),
+                        "delete" => assert!(state.delete_thread(id)),
+                        "off" => state.preferences.auto_titles.enabled = false,
+                        "provider-change" => {
+                            state.snapshot.projects[0].agents[0]
+                                .configuration
+                                .provider_id = Some("claude".into())
+                        }
+                        _ => unreachable!(),
+                    }
+                    state.finish_auto_title(id, generation, Ok("Stale generated name".into()));
+                    assert!(!state.has_title_jobs());
+                    assert!(
+                        state
+                            .thread(id)
+                            .is_none_or(|agent| agent.title != "Stale generated name"),
+                        "{action}"
+                    );
+                })
+            });
+        }
+    }
+
+    #[test]
+    fn failed_generation_keeps_fallback_and_cannot_repeat_after_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, id) = test.update(|cx| new_chat(cx, paths.clone(), temp.path()));
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                state.show_prompt_title(id);
+                let fallback = state.thread(id).unwrap().title.clone();
+                let generation = pending_job(state, id);
+                state.finish_auto_title(id, generation, Err("provider unavailable".into()));
+                assert_eq!(state.thread(id).unwrap().title, fallback);
+                assert!(state.last_error.is_none());
+                assert!(state.prepare_auto_title(id).is_none());
+            })
+        });
+        let restored = test.update(|cx| cx.new(|cx| AppState::restore(paths, cx)));
+        test.update(|cx| assert!(restored.read(cx).auto_title_record(id).is_none()));
+    }
+
+    #[test]
+    fn first_successful_exchange_ignores_prior_failed_or_cancelled_turns() {
+        use crate::session::SessionUpdate;
+        use fx_agent::codex::TurnOutcome;
+
+        for cancelled in [false, true] {
+            for partial_response in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let test = gpui::TestAppContext::single();
+                let (state, id) = test.update(|cx| {
+                    new_chat(cx, AppPaths::at(temp.path().join("state")), temp.path())
+                });
+                test.update(|cx| {
+                    state.update(cx, |state, _| {
+                        let mut messages = vec![ConversationMessage::text(
+                            MessageRole::User,
+                            "Abandoned first request",
+                        )];
+                        if partial_response {
+                            messages.push(ConversationMessage::text(
+                                MessageRole::Assistant,
+                                "Incomplete earlier response",
+                            ));
+                        }
+                        state.conversations[&id]
+                            .lock()
+                            .unwrap()
+                            .replace_messages(messages);
+                        state.apply_update(Some(id), SessionUpdate::Accepted);
+                        state.apply_update(
+                            Some(id),
+                            if cancelled {
+                                SessionUpdate::Finished {
+                                    outcome: TurnOutcome::Cancelled {
+                                        thread_id: "test".into(),
+                                        events: vec![],
+                                    },
+                                }
+                            } else {
+                                SessionUpdate::Failed {
+                                    reason: "first turn failed".into(),
+                                }
+                            },
+                        );
+                        assert!(state.auto_title_record(id).is_some());
+                        {
+                            let mut conversation = state.conversations[&id].lock().unwrap();
+                            conversation.append(ConversationMessage::text(
+                                MessageRole::User,
+                                "Fix the successful request instead",
+                            ));
+                            conversation.append(ConversationMessage::text(
+                                MessageRole::Assistant,
+                                "The requested fix is complete.",
+                            ));
+                        }
+                        state.apply_update(Some(id), SessionUpdate::Accepted);
+                        assert_eq!(
+                            state.thread(id).unwrap().title,
+                            "Fix the successful request instead"
+                        );
+                        // Inspect the same preparation used on Completed, without
+                        // launching a real provider or hiding which exchange it saw.
+                        let request = state.prepare_auto_title(id).unwrap();
+                        assert_eq!(request.user, "Fix the successful request instead");
+                        assert_eq!(request.assistant, "The requested fix is complete.");
+                        assert!(state.prepare_auto_title(id).is_none());
+                    })
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn completed_exchange_without_assistant_keeps_eligibility_for_next_completion() {
+        use crate::session::SessionUpdate;
+        use fx_agent::codex::TurnOutcome;
+
+        let temp = tempfile::tempdir().unwrap();
+        let test = gpui::TestAppContext::single();
+        let (state, id) =
+            test.update(|cx| new_chat(cx, AppPaths::at(temp.path().join("state")), temp.path()));
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                state.conversations[&id]
+                    .lock()
+                    .unwrap()
+                    .replace_messages(vec![ConversationMessage::text(
+                        MessageRole::User,
+                        "First request has no response",
+                    )]);
+                let completed = || SessionUpdate::Finished {
+                    outcome: TurnOutcome::Completed {
+                        thread_id: "test".into(),
+                        stop_reason: "end_turn".into(),
+                        events: vec![],
+                    },
+                };
+                state.apply_update(Some(id), completed());
+                assert!(state.auto_title_record(id).is_some());
+                assert_eq!(
+                    state.store.load_app().unwrap().projects[0].auto_title_pending,
+                    vec![id]
+                );
+                {
+                    let mut conversation = state.conversations[&id].lock().unwrap();
+                    conversation.append(ConversationMessage::text(
+                        MessageRole::User,
+                        "The next request",
+                    ));
+                    conversation.append(ConversationMessage::text(
+                        MessageRole::Assistant,
+                        "A complete response",
+                    ));
+                }
+                state.apply_update(Some(id), completed());
+                assert!(state.auto_title_record(id).is_none());
+                assert!(
+                    state.store.load_app().unwrap().projects[0]
+                        .auto_title_pending
+                        .is_empty()
+                );
+            })
+        });
+    }
+
+    #[test]
+    fn disabling_then_reenabling_titles_rejects_the_previous_pending_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let test = gpui::TestAppContext::single();
+        let (state, id) =
+            test.update(|cx| new_chat(cx, AppPaths::at(temp.path().join("state")), temp.path()));
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                state.show_prompt_title(id);
+                let fallback = state.thread(id).unwrap().title.clone();
+                let generation = pending_job(state, id);
+                state.preferences.auto_titles.enabled = false;
+                state.cancel_title_jobs();
+                state.preferences.auto_titles.enabled = true;
+                state.finish_auto_title(id, generation, Ok("Old generation result".into()));
+                assert_eq!(state.thread(id).unwrap().title, fallback);
+                assert!(!state.has_title_jobs());
+                assert!(state.prepare_auto_title(id).is_none());
+            })
+        });
+    }
+
+    #[test]
+    fn no_paid_request_is_prepared_when_attempt_persistence_fails_or_titles_are_off() {
+        for fail_save in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let test = gpui::TestAppContext::single();
+            let (state, id) = test
+                .update(|cx| new_chat(cx, AppPaths::at(temp.path().join("state")), temp.path()));
+            test.update(|cx| {
+                state.update(cx, |state, _| {
+                    if fail_save {
+                        std::fs::remove_file(state.paths.projects_file()).unwrap();
+                        std::fs::create_dir(state.paths.projects_file()).unwrap();
+                    } else {
+                        state.preferences.auto_titles.enabled = false;
+                    }
+                    assert!(state.prepare_auto_title(id).is_none());
+                    assert!(!state.has_title_jobs());
+                    if !fail_save {
+                        state.preferences.auto_titles.enabled = true;
+                        assert!(state.prepare_auto_title(id).is_none());
+                    }
+                })
+            });
+        }
+    }
 }
 
 #[cfg(test)]

@@ -936,25 +936,7 @@ fn convert_turns(
                         .or(item["tool"].as_str())
                         .unwrap_or(kind)
                         .to_string();
-                    let input = item
-                        .get("input")
-                        .or(item.get("arguments"))
-                        .cloned()
-                        .unwrap_or_else(|| {
-                            let mut input = item.clone();
-                            if let Some(map) = input.as_object_mut() {
-                                for key in [
-                                    "aggregatedOutput",
-                                    "output",
-                                    "result",
-                                    "error",
-                                    "contentItems",
-                                ] {
-                                    map.remove(key);
-                                }
-                            }
-                            input
-                        });
+                    let input = super::session::tool_input(item);
                     push(
                         MessageRole::Assistant,
                         vec![MessageContent::ToolUse {
@@ -1442,6 +1424,33 @@ for line in sys.stdin:
         assert_eq!(messages, again);
         let other = convert_turns("other-thread", turns.as_array().unwrap(), &json!({})).unwrap();
         assert_ne!(messages[0].id, other[0].id);
+    }
+
+    #[test]
+    fn native_command_details_match_live_items_even_with_separate_input_fields() {
+        let item = json!({"type":"commandExecution", "id":"command", "command":["cat","file with spaces.txt"], "cwd":"/project", "input":{"timeout_ms":1000}, "status":"completed", "aggregatedOutput":"contents"});
+        let turns = json!([{"id":"turn", "items":[item]}]);
+        let messages = convert_turns("thread", turns.as_array().unwrap(), &json!({})).unwrap();
+        let MessageContent::ToolUse { input, .. } = &messages[0].content[0] else {
+            panic!("missing tool use");
+        };
+        let native_input: Value = serde_json::from_str(input).unwrap();
+        assert_eq!(native_input["command"], "cat file with spaces.txt");
+        assert_eq!(
+            native_input["command_argv"],
+            json!(["cat", "file with spaces.txt"])
+        );
+        assert_eq!(native_input["timeout_ms"], 1000);
+        assert_eq!(native_input["cwd"], "/project");
+        let events =
+            super::super::session::parse_notification("item/started", &json!({"item":item}));
+        let crate::ProviderEvent::ToolUse { input, .. } = &events[0] else {
+            panic!("missing live tool use");
+        };
+        assert_eq!(native_input, serde_json::from_str::<Value>(input).unwrap());
+        assert!(
+            matches!(&messages[1].content[0], MessageContent::ToolResult { content, .. } if content == "contents")
+        );
     }
 
     #[test]

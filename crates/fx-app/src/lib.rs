@@ -12,9 +12,11 @@
 
 pub mod approvals;
 mod archived_chats;
+mod auto_title;
 mod claude_session_lease;
 pub mod composer;
 mod configuration;
+mod conversation_changes;
 pub mod inspector;
 mod native_sync;
 pub mod project_picker;
@@ -26,6 +28,7 @@ pub mod sidebar;
 pub mod state;
 pub mod text_field;
 mod thread_actions;
+mod title_settings;
 pub mod transcript;
 pub mod workspace_ui;
 
@@ -216,6 +219,7 @@ impl FlowX {
         }
         if !self.polling
             && (self.state.read(cx).any_busy()
+                || self.state.read(cx).has_title_jobs()
                 || ui.read(cx).is_checking()
                 || provider_catalog::is_refreshing())
         {
@@ -232,6 +236,7 @@ impl FlowX {
                             let ui = workspace_ui::handle(cx);
                             ui.update(cx, |ui, cx| ui.poll(cx));
                             let busy = this.state.read(cx).any_busy()
+                                || this.state.read(cx).has_title_jobs()
                                 || ui.read(cx).is_checking()
                                 || provider_catalog::is_refreshing();
                             this.polling = busy;
@@ -852,6 +857,7 @@ fn center_column(
                 ))
                 .into_any_element()
         })
+        .child(conversation_changes::view(state.clone(), cx))
         .child(composer_row(
             state.clone(),
             conversation.as_deref(),
@@ -1128,6 +1134,17 @@ pub fn dispatch_menu_choice(owner: &str, chosen: &str, window: &mut Window, cx: 
         let sheet = workspace_ui::handle(cx).read(cx).settings.clone();
         if let Some(sheet) = sheet
             && let Some(editor) = sheet.read(cx).provider_defaults()
+        {
+            editor.update(cx, |editor, cx| {
+                editor.apply(owner, chosen, cx);
+            });
+        }
+        return;
+    }
+    if owner.starts_with("settings-titles:") {
+        let sheet = workspace_ui::handle(cx).read(cx).settings.clone();
+        if let Some(sheet) = sheet
+            && let Some(editor) = sheet.read(cx).title_settings()
         {
             editor.update(cx, |editor, cx| {
                 editor.apply(owner, chosen, cx);

@@ -11,6 +11,7 @@ pub mod codex;
 pub mod conversation;
 pub mod native;
 pub mod provider;
+pub mod title;
 
 pub use conversation::{Conversation, DeltaPolicy, Phase};
 pub use provider::{

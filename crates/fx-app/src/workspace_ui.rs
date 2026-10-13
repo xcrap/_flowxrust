@@ -84,6 +84,7 @@ fn apply_settings(
     draft: SettingsDraft,
     baseline: SettingsDraft,
     defaults: (fx_store::ProviderDefaults, fx_store::ProviderDefaults),
+    auto_titles: fx_store::AutoTitlePreferences,
     cx: &mut App,
 ) {
     let saved = fx_store::PersistedPreferences {
@@ -93,6 +94,7 @@ fn apply_settings(
         text_size: draft.text_size.label().to_ascii_lowercase(),
         codex_defaults: defaults.0,
         claude_defaults: defaults.1,
+        auto_titles,
     };
     match state.read(cx).store.save_preferences(&saved) {
         Err(error) => {
@@ -106,6 +108,9 @@ fn apply_settings(
             if committed {
                 state.update(cx, |state, cx| {
                     state.preferences = saved;
+                    if !state.preferences.auto_titles.enabled {
+                        state.cancel_title_jobs();
+                    }
                     state.last_error = Some(format!(
                         "Settings were saved, but the recovery copy could not be updated: {error}"
                     ));
@@ -123,6 +128,9 @@ fn apply_settings(
         Ok(()) => {
             state.update(cx, |state, cx| {
                 state.preferences = saved;
+                if !state.preferences.auto_titles.enabled {
+                    state.cancel_title_jobs();
+                }
                 cx.notify();
             });
             global::set(draft.apply_to(&global::current()));
@@ -161,13 +169,28 @@ pub fn open_settings(state: Entity<AppState>, window: &mut Window, cx: &mut App)
         cx,
     );
     let apply_defaults = defaults.clone();
+    let title_settings = crate::title_settings::TitleSettings::new(
+        preferences.auto_titles,
+        state.read(cx).menu_layer.clone(),
+        cx,
+    );
+    let apply_titles = title_settings.clone();
     let baseline = SettingsDraft::from_theme(&global::current());
     let sheet = SettingsSheet::open(
         window,
         cx,
         Box::new(move |draft, window, cx| {
             let defaults = apply_defaults.read(cx).values();
-            apply_settings(&state, &apply_ui, draft, baseline, defaults, cx);
+            let auto_titles = apply_titles.read(cx).values();
+            apply_settings(
+                &state,
+                &apply_ui,
+                draft,
+                baseline,
+                defaults,
+                auto_titles,
+                cx,
+            );
             window.blur();
         }),
         Box::new(move |window, cx| {
@@ -185,6 +208,7 @@ pub fn open_settings(state: Entity<AppState>, window: &mut Window, cx: &mut App)
     sheet.update(cx, |sheet, cx| {
         sheet.set_archives(archives);
         sheet.set_provider_defaults(defaults, cx);
+        sheet.set_title_settings(title_settings, cx);
     });
     ui.update(cx, |ui, cx| {
         ui.settings = Some(sheet);
@@ -1074,6 +1098,7 @@ mod tests {
                 appearance,
                 appearance,
                 (codex.clone(), claude.clone()),
+                state.read(cx).preferences.auto_titles.clone(),
                 cx,
             );
             assert_eq!(state.read(cx).preferences.codex_defaults, codex);
@@ -1093,11 +1118,138 @@ mod tests {
                 appearance,
                 appearance,
                 (codex.clone(), claude.clone()),
+                state.read(cx).preferences.auto_titles.clone(),
                 cx,
             );
             let saved = state.read(cx).store.load_preferences().unwrap();
             assert_eq!(saved.codex_defaults, codex);
             assert_eq!(saved.claude_defaults, claude);
+        });
+    }
+
+    #[test]
+    fn chat_name_settings_navigate_select_and_persist_only_on_done() {
+        use gpui::{MouseButton, VisualTestContext, px, size};
+        let temp = tempfile::tempdir().unwrap();
+        let mut test = gpui::TestAppContext::single();
+        let (_health_sender, health_receiver) = mpsc::channel();
+        let (state, ui) = test.update(|cx| {
+            let ui = handle(cx);
+            ui.update(cx, |ui, _| ui.health_results = Some(health_receiver));
+            let state = state(cx, temp.path());
+            crate::AppHandle::install(state.clone(), cx);
+            (state, ui)
+        });
+        let for_view = state.clone();
+        let window = test.add_window(move |_, _| crate::FlowX::new(for_view));
+        let mut visual = VisualTestContext::from_window(window.into(), &test);
+        visual.simulate_resize(size(px(1280.0), px(900.0)));
+        test.refresh().unwrap();
+        window
+            .update(&mut test, |_, window, cx| {
+                open_settings(state.clone(), window, cx)
+            })
+            .unwrap();
+        test.refresh().unwrap();
+        test.update(|_| {});
+        let nav = visual
+            .debug_bounds("settings-nav-chat-names")
+            .unwrap()
+            .center();
+        visual.simulate_mouse_down(nav, MouseButton::Left, Default::default());
+        visual.simulate_mouse_up(nav, MouseButton::Left, Default::default());
+        test.refresh().unwrap();
+        let picker = visual
+            .debug_bounds("settings-titles:codex")
+            .unwrap()
+            .center();
+        visual.simulate_mouse_down(picker, MouseButton::Left, Default::default());
+        visual.simulate_mouse_up(picker, MouseButton::Left, Default::default());
+        let expected_model = crate::provider_catalog::models("codex")[0].id.clone();
+        visual.simulate_keystrokes("down enter");
+        test.read(|cx| {
+            let sheet = ui
+                .read(cx)
+                .settings
+                .clone()
+                .expect("picker selection must not submit settings");
+            assert_eq!(
+                sheet
+                    .read(cx)
+                    .title_settings()
+                    .unwrap()
+                    .read(cx)
+                    .values()
+                    .codex_model_id,
+                expected_model
+            );
+            assert_eq!(
+                state.read(cx).preferences.auto_titles,
+                fx_store::AutoTitlePreferences::default()
+            );
+        });
+        let enabled = visual.debug_bounds("settings-titles-enabled").unwrap();
+        let off = gpui::point(
+            enabled.left() + enabled.size.width / 4.0,
+            enabled.center().y,
+        );
+        visual.simulate_mouse_down(off, MouseButton::Left, Default::default());
+        visual.simulate_mouse_up(off, MouseButton::Left, Default::default());
+        test.refresh().unwrap();
+        test.read(|cx| {
+            let editor = ui
+                .read(cx)
+                .settings
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .title_settings()
+                .unwrap();
+            assert!(!editor.read(cx).values().enabled);
+            assert!(state.read(cx).preferences.auto_titles.enabled);
+        });
+        visual.simulate_keystrokes("enter");
+        test.read(|cx| {
+            assert!(ui.read(cx).settings.is_none());
+            let saved = state.read(cx).store.load_preferences().unwrap();
+            assert!(!saved.auto_titles.enabled);
+            assert_eq!(saved.auto_titles.codex_model_id, expected_model);
+            assert_eq!(saved.auto_titles, state.read(cx).preferences.auto_titles);
+            assert_eq!(
+                saved.codex_defaults,
+                state.read(cx).preferences.codex_defaults
+            );
+        });
+        window
+            .update(&mut test, |_, window, cx| {
+                open_settings(state.clone(), window, cx)
+            })
+            .unwrap();
+        test.refresh().unwrap();
+        test.update(|cx| {
+            let editor = ui
+                .read(cx)
+                .settings
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .title_settings()
+                .unwrap();
+            editor.update(cx, |editor, cx| editor.set_enabled(true, cx));
+        });
+        visual.simulate_keystrokes("escape");
+        test.read(|cx| {
+            assert!(ui.read(cx).settings.is_none());
+            assert!(!state.read(cx).preferences.auto_titles.enabled);
+            assert!(
+                !state
+                    .read(cx)
+                    .store
+                    .load_preferences()
+                    .unwrap()
+                    .auto_titles
+                    .enabled
+            );
         });
     }
 
@@ -1123,6 +1275,7 @@ mod tests {
                 draft,
                 SettingsDraft::from_theme(&before),
                 (defaults.clone(), Default::default()),
+                state.read(cx).preferences.auto_titles.clone(),
                 cx,
             );
             assert_eq!(state.read(cx).preferences.codex_defaults, defaults);
@@ -1176,6 +1329,7 @@ mod tests {
                 draft,
                 SettingsDraft::from_theme(&before),
                 (changed_defaults, Default::default()),
+                state.read(cx).preferences.auto_titles.clone(),
                 cx,
             );
             assert_eq!(state.read(cx).preferences, original);
