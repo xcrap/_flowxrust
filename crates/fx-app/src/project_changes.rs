@@ -220,7 +220,13 @@ mod tests {
     struct TestView(Entity<ProjectChanges>);
     impl Render for TestView {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            div().w_full().h_full().child(self.0.clone())
+            div()
+                .w_full()
+                .h_full()
+                .on_mouse_down(gpui::MouseButton::Left, |_, _, _| {
+                    panic!("a change-indicator click must not reach the title-bar drag handler")
+                })
+                .child(fx_design::components::titlebar_control(self.0.clone()))
         }
     }
 

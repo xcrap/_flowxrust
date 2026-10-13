@@ -482,6 +482,8 @@ fn title_bar(
     sidebar_progress: f32,
     cx: &mut Context<FlowX>,
 ) -> AnyElement {
+    use fx_design::components::titlebar_control;
+
     let theme = global::current();
     let snapshot = state.read(cx);
     let sidebar_visible = snapshot.sidebar_visible;
@@ -509,6 +511,13 @@ fn title_bar(
         .border_b(px(fx_design::theme::BorderWidth::HAIRLINE))
         .border_color(Colors::border_subtle(&theme))
         .bg(Colors::sidebar_bg(&theme))
+        .on_mouse_down(MouseButton::Left, |event, window, _| {
+            if event.click_count == 2 {
+                window.zoom_window();
+            } else {
+                window.start_window_move();
+            }
+        })
         .child(
             div()
                 .w(px(sidebar_controls_width))
@@ -519,7 +528,7 @@ fn title_bar(
                 .justify_end()
                 .pl(px(TRAFFIC_LIGHT_GUTTER))
                 .pr(px_len(Spacing::MD))
-                .child(fx_design::components::icon_button(
+                .child(titlebar_control(fx_design::components::icon_button(
                     fx_design::components::IconButtonProps::new(
                         Icon::SIDEBAR_LEFT,
                         "Toggle sidebar · ⌘B",
@@ -534,7 +543,7 @@ fn title_bar(
                             cx.notify();
                         });
                     },
-                )),
+                ))),
         )
         .child(
             div()
@@ -546,13 +555,6 @@ fn title_bar(
                 .flex()
                 .items_center()
                 .px(px_len(Spacing::SM))
-                .on_mouse_down(MouseButton::Left, |event, window, _| {
-                    if event.click_count == 2 {
-                        window.zoom_window();
-                    } else {
-                        window.start_window_move();
-                    }
-                })
                 .child(fx_design::components::window_title(
                     &title,
                     project.as_deref(),
@@ -565,8 +567,8 @@ fn title_bar(
                 0.0,
             )
         }))
-        .child(project_changes::view(state.clone(), cx))
-        .child(fx_design::components::icon_button(
+        .child(titlebar_control(project_changes::view(state.clone(), cx)))
+        .child(titlebar_control(fx_design::components::icon_button(
             fx_design::components::IconButtonProps::new(Icon::PLUS, "New conversation · ⌘N")
                 .small()
                 .ghost()
@@ -578,8 +580,8 @@ fn title_bar(
                     cx.notify();
                 })
             },
-        ))
-        .child(fx_design::components::icon_button(
+        )))
+        .child(titlebar_control(fx_design::components::icon_button(
             fx_design::components::IconButtonProps::new(Icon::SIDEBAR_RIGHT, "Changes · ⌘G")
                 .small()
                 .ghost()
@@ -591,7 +593,7 @@ fn title_bar(
                     cx.notify();
                 })
             },
-        ))
+        )))
         .into_any_element()
 }
 
@@ -1342,6 +1344,46 @@ mod tests {
         window
             .update(&mut test, |_window, _entity, _cx| {})
             .expect("the window is still alive");
+    }
+
+    #[test]
+    fn titlebar_controls_click_without_starting_a_window_drag() {
+        use gpui::VisualTestContext;
+
+        let mut test = gpui::TestAppContext::single();
+        let (_dir, state) = test.update(seeded);
+        let for_view = state.clone();
+        let window = test.add_window(move |_, _| FlowX::new(for_view));
+        let mut visual = VisualTestContext::from_window(window.into(), &test);
+        visual.simulate_resize(size(px(1280.0), px(800.0)));
+        test.refresh().unwrap();
+        let (sidebar, inspector, count) = test.read(|cx| {
+            let state = state.read(cx);
+            (
+                state.sidebar_visible,
+                state.snapshot.right_panel_visible,
+                state.active_agents().len(),
+            )
+        });
+
+        // The test platform deliberately panics on start_window_move. These
+        // real clicks prove the new parent drag region never steals a control.
+        for selector in [
+            "icon-button:Toggle sidebar · ⌘B",
+            "icon-button:Changes · ⌘G",
+            "icon-button:New conversation · ⌘N",
+        ] {
+            let point = visual.debug_bounds(selector).unwrap().center();
+            visual.simulate_mouse_down(point, MouseButton::Left, Default::default());
+            visual.simulate_mouse_up(point, MouseButton::Left, Default::default());
+            test.refresh().unwrap();
+        }
+        test.read(|cx| {
+            let state = state.read(cx);
+            assert_eq!(state.sidebar_visible, !sidebar);
+            assert_eq!(state.snapshot.right_panel_visible, !inspector);
+            assert_eq!(state.active_agents().len(), count + 1);
+        });
     }
 
     #[test]

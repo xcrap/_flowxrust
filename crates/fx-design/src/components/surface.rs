@@ -1,6 +1,6 @@
 //! Surfaces and separators: cards, dividers, and the flat panel look.
 
-use gpui::{IntoElement, ParentElement, Styled, StyledText, div};
+use gpui::{InteractiveElement, IntoElement, MouseButton, ParentElement, Styled, StyledText, div};
 
 use super::rich_text::{InlineSpan, InlineStyle, inline_run};
 use crate::styled::{FxStyled, px_len};
@@ -177,6 +177,16 @@ pub fn window_title(title: &str, context: Option<&str>) -> impl IntoElement {
         .text_ellipsis()
         .line_clamp(1)
         .child(StyledText::new(text).with_runs(runs))
+}
+
+/// Keep a title-bar control's mouse press out of its draggable parent. The
+/// wrapper hugs the control so the surrounding padding remains draggable.
+pub fn titlebar_control(control: impl IntoElement) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_shrink_0()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .child(control)
 }
 
 /// The hairline thickness used for every card and panel edge.
