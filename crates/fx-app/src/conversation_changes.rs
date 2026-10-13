@@ -702,10 +702,6 @@ mod tests {
         std::fs::write(temp.path().join("new.txt"), "new contents\n").unwrap();
         let before_index = std::fs::read(temp.path().join(".git/index")).unwrap();
         let snapshot = snapshot(temp.path());
-        assert!(
-            snapshot.files.is_empty(),
-            "the inline reader must not enumerate all project files"
-        );
         assert_eq!(snapshot.repository.as_ref().unwrap().files.len(), 2);
         let state_dir = tempfile::tempdir().unwrap();
         let mut test = gpui::TestAppContext::single();

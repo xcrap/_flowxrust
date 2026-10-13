@@ -1,6 +1,6 @@
-//! Bounded, read-only repository and file reads for the inspector.
+//! Bounded, read-only Git status and changed-file previews.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
@@ -44,20 +44,17 @@ pub async fn finish_read<T>(
 pub struct Snapshot {
     pub root: PathBuf,
     pub repository: Option<GitRepositoryInfo>,
-    pub files: Vec<String>,
     pub notice: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Selection {
-    File(String),
     Change(GitFileStatus),
 }
 
 impl Selection {
     pub fn path(&self) -> &str {
         match self {
-            Self::File(path) => path,
             Self::Change(status) => &status.path,
         }
     }
@@ -122,20 +119,9 @@ fn require_success(output: CommandOutput) -> Result<CommandOutput, String> {
     }
 }
 
-/// Load a repository snapshot, or a bounded directory listing for a folder
-/// without Git. Errors remain visible instead of resembling a clean tree.
-pub async fn snapshot(root: &Path) -> Result<Snapshot, String> {
-    read_snapshot(root, true).await
-}
-
-/// The inline conversation surface needs only Git status, not a recursive file
-/// listing. Keeping that separate avoids walking non-repository project folders
-/// and enumerating every tracked file on its background refresh.
+/// Read only the working-tree changes. Ordinary folders report no repository;
+/// they are never recursively enumerated as a general-purpose file browser.
 pub async fn changes_snapshot(root: &Path) -> Result<Snapshot, String> {
-    read_snapshot(root, false).await
-}
-
-async fn read_snapshot(root: &Path, include_files: bool) -> Result<Snapshot, String> {
     let root = root
         .canonicalize()
         .map_err(|error| format!("Cannot open this project: {error}"))?;
@@ -149,16 +135,10 @@ async fn read_snapshot(root: &Path, include_files: bool) -> Result<Snapshot, Str
         if !probe.stderr.contains("not a git repository") {
             return require_success(probe).map(|_| unreachable!());
         }
-        let (files, truncated) = if include_files {
-            directory_files(&root)?
-        } else {
-            (Vec::new(), false)
-        };
         return Ok(Snapshot {
             root,
             repository: None,
-            files,
-            notice: truncated.then(|| format!("Showing the first {MAX_FILES} files.")),
+            notice: None,
         });
     }
     let root = PathBuf::from(probe.stdout.trim_end_matches('\n'));
@@ -176,50 +156,15 @@ async fn read_snapshot(root: &Path, include_files: bool) -> Result<Snapshot, Str
         )
         .await?,
     )?;
-    let list_output = if include_files {
-        Some(require_success(
-            command(
-                &root,
-                &[
-                    "ls-files",
-                    "--cached",
-                    "--others",
-                    "--exclude-standard",
-                    "-z",
-                ],
-                MAX_LIST_BYTES,
-            )
-            .await?,
-        )?)
-    } else {
-        None
-    };
     let mut status = GitStatusParser::parse_status(complete_records(&status_output.stdout));
-    let truncated = status_output.truncated
-        || list_output.as_ref().is_some_and(|list| list.truncated)
-        || status.files.len() > MAX_FILES;
+    let truncated = status_output.truncated || status.files.len() > MAX_FILES;
     status.files.truncate(MAX_FILES);
     let info = GitStatusParser::make_info(&status, &HashMap::new(), &HashMap::new(), false, 1);
-    let mut files: Vec<_> = complete_records(
-        list_output
-            .as_ref()
-            .map(|list| list.stdout.as_str())
-            .unwrap_or_default(),
-    )
-    .split_terminator('\0')
-    .filter(|path| !path.is_empty())
-    .map(String::from)
-    .collect::<BTreeSet<_>>()
-    .into_iter()
-    .collect();
-    let truncated = truncated || files.len() > MAX_FILES;
-    files.truncate(MAX_FILES);
     Ok(Snapshot {
         root,
         repository: Some(info),
-        files,
         notice: truncated
-            .then(|| format!("File lists are limited to {MAX_FILES} entries and 1 MiB.")),
+            .then(|| format!("Changed-file lists are limited to {MAX_FILES} entries and 1 MiB.")),
     })
 }
 
@@ -228,46 +173,12 @@ fn complete_records(text: &str) -> &str {
     text.rfind('\0').map_or("", |last| &text[..=last])
 }
 
-fn directory_files(root: &Path) -> Result<(Vec<String>, bool), String> {
-    let mut pending = vec![root.to_path_buf()];
-    let mut files = Vec::new();
-    let mut inspected = 0usize;
-    while let Some(directory) = pending.pop() {
-        let entries = std::fs::read_dir(&directory)
-            .map_err(|error| format!("Cannot list {}: {error}", directory.display()))?;
-        for entry in entries {
-            let entry = entry.map_err(|error| format!("Cannot read a directory entry: {error}"))?;
-            if entry.file_name() == ".git" {
-                continue;
-            }
-            inspected += 1;
-            if files.len() >= MAX_FILES || inspected > MAX_FILES * 4 {
-                files.sort();
-                return Ok((files, true));
-            }
-            let path = entry.path();
-            let kind = entry.file_type().map_err(|error| error.to_string())?;
-            if kind.is_dir() {
-                pending.push(path);
-            } else if kind.is_file() || kind.is_symlink() {
-                files.push(
-                    path.strip_prefix(root)
-                        .unwrap()
-                        .to_string_lossy()
-                        .into_owned(),
-                );
-            }
-        }
-    }
-    files.sort();
-    Ok((files, false))
-}
-
 pub async fn preview(root: &Path, selected: &Selection) -> Result<Preview, String> {
     validate_relative_path(selected.path())?;
     match selected {
-        Selection::File(path) => read_file(root, path, false),
-        Selection::Change(status) if status.is_untracked() => read_file(root, &status.path, true),
+        Selection::Change(status) if status.is_untracked() => {
+            read_untracked_file(root, &status.path)
+        }
         Selection::Change(status) => {
             let mut budget = DiffBudget::new(MAX_PREVIEW_BYTES);
             for (enabled, cached, heading) in [
@@ -308,7 +219,7 @@ fn validate_relative_path(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn read_file(root: &Path, relative: &str, as_added: bool) -> Result<Preview, String> {
+fn read_untracked_file(root: &Path, relative: &str) -> Result<Preview, String> {
     let path = root.join(relative);
     let metadata = std::fs::symlink_metadata(&path)
         .map_err(|error| format!("Cannot read {relative}: {error}"))?;
@@ -354,17 +265,13 @@ fn read_file(root: &Path, relative: &str, as_added: bool) -> Result<Preview, Str
     }
     let text = String::from_utf8(bytes)
         .map_err(|_| "This file is not UTF-8 text. Open it in its usual editor.".to_string())?;
-    let text = if as_added {
-        format!(
-            "Untracked file\n{}",
-            text.lines()
-                .map(|line| format!("+{line}\n"))
-                .collect::<String>()
-        )
-    } else {
-        text
-    };
-    Ok(make_preview(text, as_added, truncated))
+    let text = format!(
+        "Untracked file\n{}",
+        text.lines()
+            .map(|line| format!("+{line}\n"))
+            .collect::<String>()
+    );
+    Ok(make_preview(text, true, truncated))
 }
 
 fn make_preview(mut text: String, diff: bool, truncated: bool) -> Preview {
@@ -442,6 +349,10 @@ mod tests {
         temp
     }
 
+    fn untracked(path: &str) -> Selection {
+        Selection::Change(GitFileStatus::new(path, "?", "?"))
+    }
+
     #[test]
     fn the_background_reader_works_when_called_from_a_small_dispatch_stack() {
         let temp = repository();
@@ -456,25 +367,27 @@ mod tests {
                         .enable_all()
                         .build()
                         .unwrap()
-                        .block_on(snapshot(&for_snapshot))
+                        .block_on(changes_snapshot(&for_snapshot))
                 })
                 .unwrap()
                 .blocking_recv()
                 .unwrap()
                 .unwrap();
-                assert!(current.files.contains(&"small.txt".to_string()));
+                let changes = current.repository.unwrap().files;
+                assert_eq!(changes.len(), 1);
+                assert_eq!(changes[0].path, "small.txt");
                 let shown = spawn_read(move || {
                     tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
                         .unwrap()
-                        .block_on(preview(&root, &Selection::File("small.txt".into())))
+                        .block_on(preview(&root, &untracked("small.txt")))
                 })
                 .unwrap()
                 .blocking_recv()
                 .unwrap()
                 .unwrap();
-                assert_eq!(shown.text, "small-stack preview\n");
+                assert_eq!(shown.text, "Untracked file\n+small-stack preview\n");
             })
             .unwrap();
         caller.join().unwrap();
@@ -485,6 +398,7 @@ mod tests {
         let temp = repository();
         let file = temp.path().join("file with spaces.txt");
         std::fs::write(&file, "base\n").unwrap();
+        std::fs::write(temp.path().join("unchanged.txt"), "untouched\n").unwrap();
         git(temp.path(), &["add", "."]);
         git(temp.path(), &["commit", "-qm", "initial"]);
         std::fs::write(&file, "staged\n").unwrap();
@@ -492,10 +406,10 @@ mod tests {
         std::fs::write(&file, "working\n").unwrap();
         std::fs::write(temp.path().join("new.txt"), "new content\n").unwrap();
         let before_index = std::fs::read(temp.path().join(".git/index")).unwrap();
-        let snapshot = snapshot(temp.path()).await.unwrap();
-        assert_eq!(snapshot.files, ["file with spaces.txt", "new.txt"]);
+        let snapshot = changes_snapshot(temp.path()).await.unwrap();
         let info = snapshot.repository.unwrap();
         assert_eq!(info.files.len(), 2);
+        assert!(info.files.iter().all(|file| file.path != "unchanged.txt"));
         let change = info
             .files
             .iter()
@@ -517,10 +431,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unborn_repository_and_plain_folder_both_offer_file_previews() {
+    async fn an_unborn_repository_shows_untracked_changes_while_a_plain_folder_has_no_repository() {
         let temp = repository();
         std::fs::write(temp.path().join("new.txt"), "hello\n").unwrap();
-        let current = snapshot(temp.path()).await.unwrap();
+        let current = changes_snapshot(temp.path()).await.unwrap();
         assert!(!current.repository.as_ref().unwrap().has_commits);
         let change = current.repository.unwrap().files.remove(0);
         assert!(
@@ -532,24 +446,18 @@ mod tests {
         );
         let plain = tempfile::tempdir().unwrap();
         std::fs::write(plain.path().join("readme.txt"), "plain text").unwrap();
-        let current = snapshot(plain.path()).await.unwrap();
+        let current = changes_snapshot(plain.path()).await.unwrap();
         assert!(current.repository.is_none());
-        assert_eq!(current.files, ["readme.txt"]);
-        assert_eq!(
-            preview(&current.root, &Selection::File("readme.txt".into()))
-                .await
-                .unwrap()
-                .text,
-            "plain text"
-        );
+        assert!(current.notice.is_none());
+        assert_eq!(current.root, plain.path().canonicalize().unwrap());
     }
 
     #[tokio::test]
     async fn binary_large_and_external_files_have_truthful_bounded_previews() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = repository();
         std::fs::write(temp.path().join("binary"), b"a\0b").unwrap();
         assert!(
-            preview(temp.path(), &Selection::File("binary".into()))
+            preview(temp.path(), &untracked("binary"))
                 .await
                 .unwrap()
                 .text
@@ -560,21 +468,17 @@ mod tests {
             "line\n".repeat(MAX_PREVIEW_BYTES),
         )
         .unwrap();
-        let large = preview(temp.path(), &Selection::File("large".into()))
-            .await
-            .unwrap();
+        let large = preview(temp.path(), &untracked("large")).await.unwrap();
         assert_eq!(large.lines.len(), MAX_PREVIEW_LINES);
         assert!(large.notice.is_some());
         assert!(large.text.len() <= MAX_PREVIEW_BYTES);
         assert!(
-            preview(temp.path(), &Selection::File("../outside".into()))
+            preview(temp.path(), &untracked("../outside"))
                 .await
                 .is_err()
         );
         std::os::unix::fs::symlink("/etc/passwd", temp.path().join("outside")).unwrap();
-        let link = preview(temp.path(), &Selection::File("outside".into()))
-            .await
-            .unwrap();
+        let link = preview(temp.path(), &untracked("outside")).await.unwrap();
         assert_eq!(link.text, "Symbolic link → /etc/passwd");
     }
 

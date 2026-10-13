@@ -187,13 +187,13 @@ fn default_max_panel_width() -> f32 {
     600.0
 }
 
-/// Which tab the inspector shows.
+/// Kept for saved-workspace compatibility; the inspector only shows changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum RightPanelTab {
     #[default]
+    #[serde(alias = "files")]
     Changes,
-    Files,
 }
 
 /// One project's persisted state.
@@ -686,7 +686,7 @@ mod tests {
             let app: PersistedApp = serde_json::from_str(&json).unwrap();
             assert_eq!(app.sidebar_width, expected, "value: {value}");
             assert!(!app.sidebar_visible);
-            assert_eq!(app.right_panel_tab, RightPanelTab::Files);
+            assert_eq!(app.right_panel_tab, RightPanelTab::Changes);
         }
         for width in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             let mut app = PersistedApp {
@@ -907,13 +907,13 @@ mod tests {
             }],
             active_project_id: Some(Uuid::from_u128(1)),
             right_panel_visible: true,
-            right_panel_tab: RightPanelTab::Files,
+            right_panel_tab: RightPanelTab::Changes,
             ..Default::default()
         };
         let json = serde_json::to_string(&app).unwrap();
         let back: PersistedApp = serde_json::from_str(&json).unwrap();
         assert_eq!(back.projects.len(), 1);
-        assert_eq!(back.right_panel_tab, RightPanelTab::Files);
+        assert_eq!(back.right_panel_tab, RightPanelTab::Changes);
         assert_eq!(
             back.projects[0].workspaces[0].browser_url,
             "http://localhost:3000"

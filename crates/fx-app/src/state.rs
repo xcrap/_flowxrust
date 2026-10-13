@@ -18,9 +18,7 @@ use fx_design::components::{ContextRegistry, MenuLayer};
 use fx_design::theme::{
     AccentColor, AppearanceMode, BaseTone, Layout, TextSizePreset, Theme, global,
 };
-use fx_store::{
-    AppPaths, PersistedApp, PersistedConversation, PersistedPreferences, RightPanelTab, Store,
-};
+use fx_store::{AppPaths, PersistedApp, PersistedConversation, PersistedPreferences, Store};
 
 use crate::text_field::TextField;
 use gpui::{App, AppContext, Context, Entity};
@@ -836,14 +834,6 @@ impl AppState {
 
     pub fn toggle_inspector(&mut self) {
         self.snapshot.right_panel_visible = !self.snapshot.right_panel_visible;
-    }
-
-    pub fn inspector_tab(&self) -> RightPanelTab {
-        self.snapshot.right_panel_tab
-    }
-
-    pub fn set_inspector_tab(&mut self, tab: RightPanelTab) {
-        self.snapshot.right_panel_tab = tab;
     }
 
     pub fn right_panel_width(&self) -> f32 {

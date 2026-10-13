@@ -1,4 +1,4 @@
-//! Live, read-only changes and files inspector.
+//! Live, read-only changed-file inspector.
 
 #[path = "git_inspector.rs"]
 pub(crate) mod repository;
@@ -7,14 +7,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use fx_design::components::{
-    DividerAxis, IconButtonProps, SegmentedOption, divider_with_axis, icon_button,
-    segmented_control,
-};
+use fx_design::components::{DividerAxis, IconButtonProps, divider_with_axis, icon_button};
 use fx_design::icon::Icon;
 use fx_design::styled::{FxRefinement, FxStyled, px_len};
 use fx_design::theme::{BorderWidth, Colors, IconSize, Layout, Radii, Spacing, TextRole, global};
-use fx_store::RightPanelTab;
 use gpui::prelude::*;
 use gpui::{
     AnyElement, AnyView, App, ClipboardItem, Context, Entity, SharedString, Task, Window, div, px,
@@ -33,7 +29,6 @@ impl gpui::Global for InspectorHandle {}
 struct Inspector {
     state: Entity<AppState>,
     project: Option<String>,
-    tab: RightPanelTab,
     active: bool,
     generation: u64,
     selection_generation: u64,
@@ -78,7 +73,6 @@ impl Inspector {
         Self {
             state,
             project: None,
-            tab: RightPanelTab::Changes,
             active: true,
             generation: 0,
             selection_generation: 0,
@@ -103,7 +97,6 @@ impl Inspector {
             .read(cx)
             .active_project()
             .map(|project| project.root_path.clone());
-        let tab = self.state.read(cx).snapshot.right_panel_tab;
         if self.project != project {
             self.project = project;
             self.generation += 1;
@@ -113,11 +106,6 @@ impl Inspector {
             self.loading = false;
             self.clear_selection();
             self.refresh(cx);
-            cx.notify();
-        }
-        if self.tab != tab {
-            self.tab = tab;
-            self.clear_selection();
             cx.notify();
         }
         if self.poll_task.is_none() {
@@ -164,7 +152,7 @@ impl Inspector {
                 .enable_all()
                 .build()
                 .map_err(|error| error.to_string())?;
-            runtime.block_on(repository::snapshot(&PathBuf::from(project)))
+            runtime.block_on(repository::changes_snapshot(&PathBuf::from(project)))
         });
         self.read_task = Some(cx.spawn(async move |this, cx| {
             let result = repository::finish_read(task).await;
@@ -180,9 +168,6 @@ impl Inspector {
                         if let Some(selected) = this.selected.clone() {
                             let snapshot = this.snapshot.as_ref().unwrap();
                             let refreshed = match selected {
-                                Selection::File(path) if snapshot.files.contains(&path) => {
-                                    Some(Selection::File(path))
-                                }
                                 Selection::Change(status) => snapshot
                                     .repository
                                     .as_ref()
@@ -191,7 +176,6 @@ impl Inspector {
                                     })
                                     .cloned()
                                     .map(Selection::Change),
-                                _ => None,
                             };
                             if let Some(selected) = refreshed {
                                 this.select(selected, cx);
@@ -257,11 +241,7 @@ impl Inspector {
     }
 
     fn header(&self, cx: &Context<Self>) -> AnyElement {
-        let options = [
-            SegmentedOption::new(RightPanelTab::Changes, "Changes"),
-            SegmentedOption::new(RightPanelTab::Files, "Files"),
-        ];
-        let for_tabs = self.state.clone();
+        let theme = global::current();
         div()
             .h(px(INSPECTOR_HEADER_HEIGHT))
             .debug_selector(|| "inspector-header".into())
@@ -270,15 +250,16 @@ impl Inspector {
             .items_center()
             .gap(px_len(Spacing::XXS))
             .px(px_len(Spacing::MD))
-            .child(segmented_control(&options, &self.tab, move |tab, _, cx| {
-                for_tabs.update(cx, |state, cx| {
-                    state.set_inspector_tab(*tab);
-                    cx.notify();
-                });
-            }))
+            .child(
+                div()
+                    .debug_selector(|| "inspector-heading".into())
+                    .fx_body_medium()
+                    .text_color(Colors::fg(&theme))
+                    .child("Changes"),
+            )
             .child(div().flex_1())
             .child(icon_button(
-                IconButtonProps::new(Icon::ARROW_CLOCKWISE, "Refresh files and changes")
+                IconButtonProps::new(Icon::ARROW_CLOCKWISE, "Refresh changes")
                     .small()
                     .ghost()
                     .enabled(self.project.is_some() && !self.loading),
@@ -309,11 +290,10 @@ impl Inspector {
         let count = self
             .snapshot
             .as_ref()
-            .map(|snapshot| match self.tab {
-                RightPanelTab::Changes => repository
+            .map(|_| {
+                repository
                     .map(|repo| format!("{} changed", repo.files.len()))
-                    .unwrap_or_default(),
-                RightPanelTab::Files => format!("{} files", snapshot.files.len()),
+                    .unwrap_or_default()
             })
             .unwrap_or_else(|| {
                 if self.loading {
@@ -360,7 +340,7 @@ impl Inspector {
         let Some(snapshot) = &self.snapshot else {
             return note(
                 if self.project.is_none() {
-                    "Select a project to browse its files."
+                    "Select a project to view its changes."
                 } else if self.loading {
                     "Reading project…"
                 } else {
@@ -369,37 +349,17 @@ impl Inspector {
                 false,
             );
         };
-        let selections = match self.tab {
-            RightPanelTab::Changes => {
-                let Some(repo) = &snapshot.repository else {
-                    return note(
-                        "This folder has no Git repository. Its files are available in the Files tab.",
-                        false,
-                    );
-                };
-                if repo.files.is_empty() {
-                    return inspector_empty(
-                        Icon::CHECKMARK_CIRCLE_FILL,
-                        "Working tree clean",
-                        "File changes will appear here as you work.",
-                    );
-                }
-                repo.files
-                    .iter()
-                    .cloned()
-                    .map(Selection::Change)
-                    .collect::<Vec<_>>()
-            }
-            RightPanelTab::Files => snapshot
-                .files
-                .iter()
-                .cloned()
-                .map(Selection::File)
-                .collect(),
+        let Some(repo) = &snapshot.repository else {
+            return note("This folder has no Git repository to track changes.", false);
         };
-        if selections.is_empty() {
-            return note("This folder contains no visible files.", false);
+        if repo.files.is_empty() {
+            return inspector_empty(
+                Icon::CHECKMARK_CIRCLE_FILL,
+                "Working tree clean",
+                "File changes will appear here as you work.",
+            );
         }
+        let selections = repo.files.iter().cloned().map(Selection::Change);
         let theme = global::current();
         let mut list = div()
             .id("inspector.file-list")
@@ -419,7 +379,6 @@ impl Inspector {
             let path = selection.path().to_string();
             let status = match &selection {
                 Selection::Change(status) => status.status(),
-                _ => String::new(),
             };
             let (filename, parent) = split_file_path(&path);
             let status_ink = if status.contains('U') {
@@ -590,7 +549,7 @@ impl Inspector {
             lines = lines.child(note("Empty file.", false));
         }
         for (index, line) in preview.lines.iter().enumerate() {
-            let style = preview_row_style(line, matches!(selected, Selection::Change(_)));
+            let style = preview_row_style(line, true);
             let (fg, bg) = match style {
                 PreviewRowStyle::Section => (Colors::fg(&theme), Colors::bg_elevated(&theme)),
                 PreviewRowStyle::Metadata => {
@@ -803,16 +762,15 @@ mod tests {
             test.refresh().unwrap();
             let mut visual = gpui::VisualTestContext::from_window(window.into(), &test);
             let root = visual.debug_bounds("inspector-root").unwrap();
-            let tabs = visual.debug_bounds("segmented-control").unwrap();
-            let refresh = visual
-                .debug_bounds("icon-button:Refresh files and changes")
-                .unwrap();
+            let heading = visual.debug_bounds("inspector-heading").unwrap();
+            assert!(visual.debug_bounds("segmented-control").is_none());
+            let refresh = visual.debug_bounds("icon-button:Refresh changes").unwrap();
             assert!(visual.debug_bounds("icon-button:Hide inspector").is_none());
             assert_eq!(root.size.width, px(width));
-            assert!(tabs.left() > root.left());
-            assert!(tabs.right() < refresh.left());
+            assert!(heading.left() > root.left());
+            assert!(heading.right() < refresh.left());
             assert_eq!(root.right() - refresh.right(), px(Spacing::MD));
-            assert_eq!(tabs.center().y, refresh.center().y);
+            assert_eq!(heading.center().y, refresh.center().y);
         }
     }
 
@@ -895,22 +853,49 @@ mod tests {
     }
 
     #[test]
-    fn selecting_a_painted_file_row_loads_and_paints_its_contents() {
+    fn selecting_a_changed_file_paints_its_diff_without_showing_unchanged_files() {
         let temp = tempfile::tempdir().unwrap();
-        std::fs::write(temp.path().join("sample.txt"), "hello from a file\n").unwrap();
+        let root = temp.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        std::fs::write(root.join("sample.txt"), "before the edit\n").unwrap();
+        std::fs::write(root.join("unchanged.txt"), "leave this file alone\n").unwrap();
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.name=FlowX QA",
+            "-c",
+            "user.email=qa@example.invalid",
+            "commit",
+            "-qm",
+            "Initial fixture",
+        ]);
+        std::fs::write(root.join("sample.txt"), "after the edit\n").unwrap();
+        let snapshot = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(repository::changes_snapshot(&root))
+            .unwrap();
+        let changed = &snapshot.repository.as_ref().unwrap().files;
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].path, "sample.txt");
         let mut test = gpui::TestAppContext::single();
         let paths = fx_store::AppPaths::at(temp.path().join("state"));
         let state = test.update(|cx| cx.new(|cx| AppState::restore(paths, cx)));
-        let root = temp.path().to_path_buf();
         let window = test.add_window(move |_, _| {
             let mut inspector = Inspector::new(state);
-            inspector.tab = RightPanelTab::Files;
-            inspector.snapshot = Some(Arc::new(Snapshot {
-                root,
-                repository: None,
-                files: vec!["sample.txt".into()],
-                notice: None,
-            }));
+            inspector.snapshot = Some(Arc::new(snapshot));
             inspector
         });
         test.refresh().unwrap();
@@ -937,10 +922,9 @@ mod tests {
                     inspector.selected.as_ref().map(Selection::path),
                     Some("sample.txt")
                 );
-                assert_eq!(
-                    inspector.preview.as_ref().unwrap().text,
-                    "hello from a file\n"
-                );
+                let diff = &inspector.preview.as_ref().unwrap().text;
+                assert!(diff.contains("-before the edit"));
+                assert!(diff.contains("+after the edit"));
             })
             .unwrap();
     }

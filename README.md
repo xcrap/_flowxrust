@@ -46,8 +46,8 @@ not complete.** The remaining work is listed below.
 - Settings preview base tone, accent, text size and appearance immediately across
   the window. Done saves the choices; Cancel restores the previous appearance.
   Provider runtime checks report failures.
-- Read-only Changes and Files tabs: repository status, staged/unstaged text
-  diffs, file previews and refresh. Reads are bounded, and preview paths are
+- A read-only Changes inspector shows only changed files, with staged/unstaged
+  diffs, new-file previews and refresh. Reads are bounded, and preview paths are
   checked against the project root.
 - A working-tree tray above the composer opens file diffs directly in the chat.
   It refreshes every five seconds and after a turn, even with the inspector

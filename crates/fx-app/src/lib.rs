@@ -592,13 +592,10 @@ fn title_bar(
             },
         ))
         .child(fx_design::components::icon_button(
-            fx_design::components::IconButtonProps::new(
-                Icon::SIDEBAR_RIGHT,
-                "Files and changes · ⌘G",
-            )
-            .small()
-            .ghost()
-            .selected(show_inspector),
+            fx_design::components::IconButtonProps::new(Icon::SIDEBAR_RIGHT, "Changes · ⌘G")
+                .small()
+                .ghost()
+                .selected(show_inspector),
             move |_, _, cx| {
                 for_inspector.update(cx, |state, cx| {
                     state.toggle_inspector();
