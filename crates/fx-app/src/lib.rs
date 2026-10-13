@@ -544,8 +544,7 @@ fn title_bar(
                 .min_w_0()
                 .h_full()
                 .flex()
-                .flex_col()
-                .justify_center()
+                .items_center()
                 .px(px_len(Spacing::SM))
                 .on_mouse_down(MouseButton::Left, |event, window, _| {
                     if event.click_count == 2 {
@@ -554,24 +553,10 @@ fn title_bar(
                         window.start_window_move();
                     }
                 })
-                .child(
-                    div()
-                        .fx_body_medium()
-                        .text_color(Colors::fg(&theme))
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .whitespace_nowrap()
-                        .child(SharedString::from(title)),
-                )
-                .children(project.map(|name| {
-                    div()
-                        .fx_caption()
-                        .text_color(Colors::fg_secondary(&theme))
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .whitespace_nowrap()
-                        .child(SharedString::from(name))
-                })),
+                .child(fx_design::components::window_title(
+                    &title,
+                    project.as_deref(),
+                )),
         )
         .children(busy.then(|| {
             fx_design::components::activity_dot(

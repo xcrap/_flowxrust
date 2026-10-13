@@ -1,9 +1,10 @@
 //! Surfaces and separators: cards, dividers, and the flat panel look.
 
-use gpui::{IntoElement, ParentElement, Styled, div};
+use gpui::{IntoElement, ParentElement, Styled, StyledText, div};
 
+use super::rich_text::{InlineSpan, InlineStyle, inline_run};
 use crate::styled::{FxStyled, px_len};
-use crate::theme::{BorderWidth, Colors, Radii, Spacing, global};
+use crate::theme::{BorderWidth, Colors, Radii, Spacing, TextRole, global};
 
 /// Which way a divider runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -137,6 +138,45 @@ pub fn section_header(label: impl Into<gpui::SharedString>) -> impl IntoElement 
         .fx_overline()
         .text_color(Colors::fg_secondary(&theme))
         .child(label.into())
+}
+
+/// Window title and optional context share one baseline and truncate together.
+pub fn window_title(title: &str, context: Option<&str>) -> impl IntoElement {
+    let theme = global::current();
+    let mut text = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    let title_end = text.len();
+    let mut runs = vec![inline_run(
+        &InlineSpan {
+            range: 0..title_end,
+            style: InlineStyle::default(),
+        },
+        TextRole::BodyMedium,
+        &theme,
+    )];
+    if let Some(context) = context.filter(|context| !context.trim().is_empty()) {
+        text.push_str(" · ");
+        text.push_str(&context.split_whitespace().collect::<Vec<_>>().join(" "));
+        let mut context_run = inline_run(
+            &InlineSpan {
+                range: title_end..text.len(),
+                style: InlineStyle::default(),
+            },
+            TextRole::Body,
+            &theme,
+        );
+        context_run.color = Colors::fg_secondary(&theme).into();
+        runs.push(context_run);
+    }
+    div()
+        .w_full()
+        .min_w_0()
+        .fx_body_medium()
+        // GPUI 0.2.2 caches nowrap's unconstrained first measurement. A one-line
+        // clamp remeasures at the final width so the ellipsis is actually drawn.
+        .whitespace_normal()
+        .text_ellipsis()
+        .line_clamp(1)
+        .child(StyledText::new(text).with_runs(runs))
 }
 
 /// The hairline thickness used for every card and panel edge.

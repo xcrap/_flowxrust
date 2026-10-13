@@ -43,6 +43,6 @@ pub use status::{
 };
 pub use surface::{
     DividerAxis, card, card_default, divider, divider_with_axis, empty_state, inline_notice, panel,
-    section_divider, section_header,
+    section_divider, section_header, window_title,
 };
 pub use tooltip::tooltip;
