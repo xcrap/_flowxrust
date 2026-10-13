@@ -77,18 +77,13 @@
 //! - **`focusComposer()` on appear.** A function view cannot tell a first render
 //!   from a repaint, and focusing on every pass would pull the caret out of the
 //!   terminal and the browser. The caller focuses the field.
-//!
-//! The context ring around the primary control draws an empty track rather than
-//! a real fill: `ComposerChrome` carries no usage reading, and
-//! `UsageTotals::context_fraction` is the caller's to pass once the chrome grows
-//! a field for it.
 
 use std::rc::Rc;
 
 use fx_agent::conversation::state::VISIBLE_QUEUED_PROMPTS;
 use fx_design::components::{
-    BadgeTone, ICON_BUTTON_SIZE, IconButtonProps, SegmentedOption, badge, context_ring_icon,
-    icon_button, segmented_control,
+    BadgeTone, IconButtonProps, SegmentedOption, TurnAction, badge, icon_button, segmented_control,
+    turn_action_button,
 };
 use fx_design::icon::Icon;
 use fx_design::styled::{FxStyled, px_len};
@@ -462,50 +457,23 @@ fn control_row(
 
 /// The one control whose meaning depends on the turn: Send, or Stop.
 fn primary_action(chrome: &ComposerChrome, can_send: bool) -> AnyElement {
-    let theme = global::current();
-    let (icon, tint, enabled, label) = if chrome.busy {
-        // Error, as in the original: this is the only destructive control on
-        // screen, and it should read as one.
-        (
-            Icon::STOP_FILL,
-            Colors::error(&theme),
-            chrome.handler().is_some(),
-            SharedString::from("Stop this turn"),
-        )
+    let (action, enabled) = if chrome.busy {
+        (TurnAction::Stop, chrome.handler().is_some())
     } else {
-        (
-            Icon::ARROW_UP,
-            Colors::accent(&theme),
-            can_send,
-            SharedString::from("Send this prompt"),
-        )
+        (TurnAction::Send, can_send && chrome.handler().is_some())
     };
 
     // Stop stays live in a disabled composer. A turn that cannot be interrupted
     // is the one failure mode with no way out of it, and the alternative — a
     // greyed-out stop on a running turn — has no way out of it either.
-    // The ring draws an empty progress track: `ComposerChrome` carries no
-    // context reading, so there is nothing to put in it yet.
-    let progress = None;
-
-    // The ring control owns its own element id, so the tooltip hangs off a
-    // wrapper sized to it rather than off the ring itself. The wrapper is what
-    // the narrow-width measurement looks at.
     div()
         .id("composer.primary")
         .flex_shrink_0()
         .debug_selector(|| PRIMARY_SELECTOR.to_string())
-        .tooltip(move |window, cx| fx_design::components::tooltip(label.clone(), window, cx))
-        .child(context_ring_icon(
-            icon,
-            progress,
-            tint,
-            ICON_BUTTON_SIZE,
+        .child(turn_action_button(
+            "composer.turn-action",
+            action,
             enabled,
-            // No hover state: this is a function view with nothing to hold one
-            // in, and the original's ring carries no hover tint of its own
-            // either.
-            false,
             fire(
                 chrome.handler(),
                 if chrome.busy {
@@ -1005,6 +973,72 @@ mod tests {
             },
             "",
         );
+    }
+
+    #[test]
+    fn send_and_stop_share_a_generous_target_and_stop_stays_live_during_transition() {
+        use std::cell::RefCell;
+
+        use gpui::{Modifiers, MouseButton};
+
+        let mut test = TestAppContext::single();
+        let actions = Rc::new(RefCell::new(Vec::new()));
+        let recorded = actions.clone();
+        let chrome = live().on_action(move |action, _, _| recorded.borrow_mut().push(action));
+        let field = test.update(|cx| cx.new(TextField::new));
+        let window = test.add_window(move |_, _| Harness::new(field, chrome, "a draft"));
+        test.refresh().expect("send paints");
+        let mut visual = VisualTestContext::from_window(*window.deref(), &test);
+        let send = visual.debug_bounds(PRIMARY_SELECTOR).expect("send target");
+        assert_eq!(
+            send.size,
+            size(
+                px(Layout::COMPOSER_ACTION_SIZE),
+                px(Layout::COMPOSER_ACTION_SIZE)
+            )
+        );
+        visual.simulate_mouse_move(send.center(), None, Modifiers::default());
+        test.refresh().expect("hover transition paints");
+        visual.simulate_mouse_down(send.center(), MouseButton::Left, Modifiers::default());
+        visual.simulate_mouse_up(send.center(), MouseButton::Left, Modifiers::default());
+        assert_eq!(*actions.borrow(), vec![ComposerAction::Submit]);
+
+        window
+            .update(&mut test, |harness, _, cx| {
+                // Streaming can disable input, but must leave Stop reachable.
+                harness.chrome.busy = true;
+                harness.chrome.enabled = false;
+                cx.notify();
+            })
+            .expect("the turn starts");
+        test.refresh().expect("send fades into stop");
+        let stop = visual.debug_bounds(PRIMARY_SELECTOR).expect("stop target");
+        let glyph = visual
+            .debug_bounds("turn-action-stop-glyph")
+            .expect("solid stop glyph");
+        assert_eq!(
+            send, stop,
+            "the control must not shift when its action changes"
+        );
+        assert_eq!(glyph.size, size(px(Spacing::MD), px(Spacing::MD)));
+        assert_eq!(glyph.center(), stop.center());
+        visual.simulate_mouse_down(stop.center(), MouseButton::Left, Modifiers::default());
+        visual.simulate_mouse_up(stop.center(), MouseButton::Left, Modifiers::default());
+        assert_eq!(
+            *actions.borrow(),
+            vec![ComposerAction::Submit, ComposerAction::Stop]
+        );
+
+        window
+            .update(&mut test, |harness, _, cx| {
+                harness.chrome.busy = false;
+                cx.notify();
+            })
+            .expect("the turn finishes with input still disabled");
+        test.refresh().expect("disabled send paints");
+        visual.simulate_mouse_down(stop.center(), MouseButton::Left, Modifiers::default());
+        visual.simulate_mouse_up(stop.center(), MouseButton::Left, Modifiers::default());
+        assert_eq!(actions.borrow().len(), 2, "disabled send is inert");
     }
 
     #[test]

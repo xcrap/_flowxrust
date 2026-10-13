@@ -151,6 +151,7 @@ impl Layout {
     pub const SETTINGS_BODY_HEIGHT: f32 = 512.0;
     pub const CONTROL_HEIGHT: f32 = 30.0;
     pub const CONTROL_COMPACT_HEIGHT: f32 = 28.0;
+    pub const COMPOSER_ACTION_SIZE: f32 = 36.0;
     pub const SIDEBAR_ROW_HEIGHT: f32 = 30.0;
     pub const PANE_HEADER_HEIGHT: f32 = 44.0;
     pub const COMMAND_PALETTE_WIDTH: f32 = 560.0;
