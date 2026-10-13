@@ -2,10 +2,12 @@
 
 use std::collections::HashMap;
 use std::io::Read;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
-use fx_core::git::{self, CommandOutput, CommandSpec, GitStatusParser};
+use fx_core::git::{self, CommandOutput, CommandSpec, GitStatusParser, LineCounts};
 use fx_core::policy::diff_budget::DiffBudget;
 use fx_core::{GitFileStatus, GitRepositoryInfo};
 
@@ -13,6 +15,7 @@ pub const MAX_FILES: usize = 2_000;
 pub const MAX_PREVIEW_BYTES: usize = 128 * 1024;
 pub const MAX_PREVIEW_LINES: usize = 1_000;
 const MAX_LIST_BYTES: usize = 1024 * 1024;
+const MAX_UNTRACKED_TOTAL_BYTES: usize = 4 * 1024 * 1024;
 
 /// macOS dispatch workers have small stacks. Tokio's nested Git read futures
 /// can exceed those stacks in debug builds even with heap-backed read buffers.
@@ -159,12 +162,156 @@ pub async fn changes_snapshot(root: &Path) -> Result<Snapshot, String> {
     let mut status = GitStatusParser::parse_status(complete_records(&status_output.stdout));
     let truncated = status_output.truncated || status.files.len() > MAX_FILES;
     status.files.truncate(MAX_FILES);
-    let info = GitStatusParser::make_info(&status, &HashMap::new(), &HashMap::new(), false, 1);
+    let mut notices = Vec::new();
+    if truncated {
+        notices.push(format!(
+            "Changed-file lists and line totals are partial: limited to {MAX_FILES} entries and 1 MiB."
+        ));
+    }
+    let ((mut unstaged, unstaged_notice), (staged, staged_notice)) = tokio::join!(
+        numstat(&root, false, status.needs_unstaged_stats),
+        numstat(&root, true, status.needs_staged_stats),
+    );
+    notices.extend(unstaged_notice);
+    notices.extend(staged_notice);
+    let mut remaining = MAX_UNTRACKED_TOTAL_BYTES;
+    let mut uncounted = 0;
+    for file in &status.files {
+        if file.staged_status != "?" || file.unstaged_status != "?" {
+            continue;
+        }
+        match untracked_counts(&root, &file.path, &mut remaining) {
+            Ok(counts) => {
+                unstaged.insert(file.path.clone(), counts);
+            }
+            Err(_) => uncounted += 1,
+        }
+    }
+    if uncounted > 0 {
+        notices.push(format!(
+            "Line totals are partial: {uncounted} new file(s) could not be counted within the read limits."
+        ));
+    }
+    let info = GitStatusParser::make_info(&status, &unstaged, &staged, false, 1);
     Ok(Snapshot {
         root,
         repository: Some(info),
-        notice: truncated
-            .then(|| format!("Changed-file lists are limited to {MAX_FILES} entries and 1 MiB.")),
+        notice: (!notices.is_empty()).then(|| notices.join(" ")),
+    })
+}
+
+async fn numstat(
+    root: &Path,
+    cached: bool,
+    enabled: bool,
+) -> (HashMap<String, LineCounts>, Option<String>) {
+    if !enabled {
+        return (HashMap::new(), None);
+    }
+    let mut args = vec![
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-color",
+        "--numstat",
+        "-z",
+    ];
+    if cached {
+        args.push("--cached");
+    }
+    let stage = if cached { "staged" } else { "unstaged" };
+    match command(root, &args, MAX_LIST_BYTES)
+        .await
+        .and_then(require_success)
+    {
+        Ok(output) => (
+            GitStatusParser::parse_numstat(&output.stdout),
+            output.truncated.then(|| {
+                format!(
+                    "Line totals are partial: {stage} statistics exceeded the 1 MiB read limit."
+                )
+            }),
+        ),
+        Err(error) => (
+            HashMap::new(),
+            Some(format!(
+                "Line totals are partial: {stage} statistics are unavailable. {error}"
+            )),
+        ),
+    }
+}
+
+/// Untracked files do not appear in Git's numstat. Count their complete text
+/// within both a per-file and per-refresh budget; never follow a final symlink.
+fn untracked_counts(
+    root: &Path,
+    relative: &str,
+    remaining: &mut usize,
+) -> Result<LineCounts, String> {
+    validate_relative_path(relative)?;
+    let path = root.join(relative);
+    let parent = path
+        .parent()
+        .ok_or("Missing parent directory")?
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    if !parent.starts_with(root) {
+        return Err("The file resolves outside the project.".into());
+    }
+    let metadata = std::fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+    let bytes = if metadata.file_type().is_symlink() {
+        // Git stores the link destination itself as the blob, never its target.
+        let bytes = std::fs::read_link(&path)
+            .map_err(|error| error.to_string())?
+            .as_os_str()
+            .as_bytes()
+            .to_vec();
+        if bytes.len() > *remaining {
+            return Err("Link exceeds the remaining read budget".into());
+        }
+        *remaining -= bytes.len();
+        bytes
+    } else {
+        if !metadata.is_file() {
+            return Err("Not a regular file".into());
+        }
+        let limit = MAX_PREVIEW_BYTES.min(*remaining);
+        if metadata.len() > limit as u64 {
+            return Err("File exceeds the remaining read budget".into());
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&path)
+            .map_err(|error| error.to_string())?;
+        if !file
+            .metadata()
+            .map_err(|error| error.to_string())?
+            .is_file()
+        {
+            return Err("Not a regular file".into());
+        }
+        let mut bytes = Vec::new();
+        file.take((limit + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|error| error.to_string())?;
+        *remaining = remaining.saturating_sub(bytes.len());
+        if bytes.len() > limit {
+            return Err("File grew beyond the remaining read budget".into());
+        }
+        bytes
+    };
+    // Match Git's binary heuristic over the first 8,000 bytes. Non-UTF-8 text
+    // can still contain ordinary newlines and has meaningful line counts.
+    let binary = bytes.iter().take(8_000).any(|byte| *byte == 0);
+    Ok(LineCounts {
+        additions: if binary || bytes.is_empty() {
+            0
+        } else {
+            bytes.iter().filter(|byte| **byte == b'\n').count()
+                + usize::from(bytes.last() != Some(&b'\n'))
+        },
+        deletions: 0,
     })
 }
 
@@ -407,8 +554,10 @@ mod tests {
         std::fs::write(temp.path().join("new.txt"), "new content\n").unwrap();
         let before_index = std::fs::read(temp.path().join(".git/index")).unwrap();
         let snapshot = changes_snapshot(temp.path()).await.unwrap();
+        assert!(snapshot.notice.is_none(), "{:?}", snapshot.notice);
         let info = snapshot.repository.unwrap();
         assert_eq!(info.files.len(), 2);
+        assert_eq!((info.additions, info.deletions), (3, 2));
         assert!(info.files.iter().all(|file| file.path != "unchanged.txt"));
         let change = info
             .files
@@ -416,6 +565,11 @@ mod tests {
             .find(|file| file.path == "file with spaces.txt")
             .unwrap()
             .clone();
+        assert_eq!((change.staged_additions, change.staged_deletions), (1, 1));
+        assert_eq!(
+            (change.unstaged_additions, change.unstaged_deletions),
+            (1, 1)
+        );
         let shown = preview(&snapshot.root, &Selection::Change(change))
             .await
             .unwrap();
@@ -428,6 +582,94 @@ mod tests {
             before_index,
             "reads must not refresh or mutate the index"
         );
+    }
+
+    #[tokio::test]
+    async fn real_line_totals_include_deletions_new_files_renames_and_binary_file_status() {
+        let temp = repository();
+        let root = temp.path();
+        std::fs::write(root.join("delete.txt"), "one\ntwo\nthree\n").unwrap();
+        let original = (0..12)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        std::fs::write(root.join("old\tname.txt"), &original).unwrap();
+        std::fs::write(root.join("binary"), b"before\0bytes").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "initial"]);
+        git(root, &["mv", "old\tname.txt", "new\nname.txt"]);
+        std::fs::write(
+            root.join("new\nname.txt"),
+            original.replace("line 0\n", "changed\n"),
+        )
+        .unwrap();
+        std::fs::write(root.join("staged.txt"), "one\ntwo\n").unwrap();
+        git(root, &["add", "."]);
+        std::fs::remove_file(root.join("delete.txt")).unwrap();
+        std::fs::write(root.join("new.txt"), "one\nlast line without a newline").unwrap();
+        std::fs::write(root.join("binary"), b"after\0bytes").unwrap();
+        let before_index = std::fs::read(root.join(".git/index")).unwrap();
+        let snapshot = changes_snapshot(root).await.unwrap();
+        assert!(snapshot.notice.is_none(), "{:?}", snapshot.notice);
+        let info = snapshot.repository.unwrap();
+        assert_eq!(info.status_file_count, 5);
+        assert_eq!((info.additions, info.deletions), (5, 4));
+        let renamed = info
+            .files
+            .iter()
+            .find(|file| file.path == "new\nname.txt")
+            .unwrap();
+        assert_eq!(renamed.staged_status, "R");
+        assert_eq!((renamed.staged_additions, renamed.staged_deletions), (1, 1));
+        let binary = info
+            .files
+            .iter()
+            .find(|file| file.path == "binary")
+            .unwrap();
+        assert_eq!((binary.additions(), binary.deletions()), (0, 0));
+        assert!(binary.has_unstaged_changes());
+        assert_eq!(
+            std::fs::read(root.join(".git/index")).unwrap(),
+            before_index
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_counts_are_visible_and_symlinks_never_count_their_targets() {
+        let temp = repository();
+        let root = temp.path();
+        std::fs::write(root.join("large.txt"), "line\n".repeat(MAX_PREVIEW_BYTES)).unwrap();
+        std::fs::write(root.join("small.txt"), "one\ntwo\n").unwrap();
+        std::fs::write(root.join("binary"), b"new\0binary").unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), "outside\n".repeat(100)).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("link")).unwrap();
+        let snapshot = changes_snapshot(root).await.unwrap();
+        assert!(snapshot.notice.unwrap().contains("Line totals are partial"));
+        let info = snapshot.repository.unwrap();
+        assert_eq!(info.status_file_count, 4);
+        assert_eq!((info.additions, info.deletions), (3, 0));
+        let mut budget = 1;
+        assert!(untracked_counts(&root.canonicalize().unwrap(), "small.txt", &mut budget).is_err());
+        assert_eq!(budget, 1, "oversized files are not opened");
+        std::os::unix::fs::symlink(outside.path().parent().unwrap(), root.join("external"))
+            .unwrap();
+        let through_link = format!(
+            "external/{}",
+            outside.path().file_name().unwrap().to_str().unwrap()
+        );
+        assert!(
+            untracked_counts(&root.canonicalize().unwrap(), &through_link, &mut budget).is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_numstat_reports_incomplete_counts() {
+        // A repository can disappear between the status and numstat reads.
+        let temp = repository();
+        std::fs::remove_dir_all(temp.path().join(".git")).unwrap();
+        let (counts, notice) = numstat(temp.path(), true, true).await;
+        assert!(counts.is_empty());
+        assert!(notice.unwrap().contains("statistics are unavailable"));
     }
 
     #[tokio::test]

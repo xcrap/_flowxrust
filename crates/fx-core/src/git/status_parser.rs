@@ -108,31 +108,46 @@ impl GitStatusParser {
 
     /// Parse `git diff --numstat -z`.
     ///
-    /// Each NUL-separated record is `adds<TAB>dels<TAB>path`. A binary file
-    /// reports `-` for both counts but keeps its path in the same third field —
-    /// verified against git rather than assumed — so a `-` simply parses as
-    /// zero.
+    /// Ordinary records are `adds<TAB>dels<TAB>path<NUL>`. Renames and copies
+    /// leave that path empty and append `old<NUL>new<NUL>` instead; statistics
+    /// belong to the destination path, as they do in porcelain status. Binary
+    /// files report `-` for both counts and contribute no textual line changes.
     pub fn parse_numstat(output: &str) -> HashMap<String, LineCounts> {
-        output
-            .split('\0')
-            .filter(|record| !record.is_empty())
-            .filter_map(|record| {
-                let mut parts = record.splitn(3, '\t');
-                let additions = parts.next()?.trim();
-                let deletions = parts.next()?.trim();
-                let path = parts.next()?;
-                if path.is_empty() {
-                    return None;
+        let mut counts = HashMap::new();
+        // split_terminator alone also returns a final unterminated record.
+        // Keep only complete records so a capped read cannot invent a path.
+        let complete = output.rfind('\0').map_or("", |last| &output[..=last]);
+        let mut records = complete.split_terminator('\0');
+        while let Some(record) = records.next() {
+            let mut parts = record.splitn(3, '\t');
+            let (Some(additions), Some(deletions), Some(path)) =
+                (parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            let path = if path.is_empty() {
+                let (Some(_source), Some(destination)) = (records.next(), records.next()) else {
+                    break;
+                };
+                destination
+            } else {
+                path
+            };
+            let line_counts = if additions == "-" && deletions == "-" {
+                LineCounts::default()
+            } else if let (Ok(additions), Ok(deletions)) = (additions.parse(), deletions.parse()) {
+                LineCounts {
+                    additions,
+                    deletions,
                 }
-                Some((
-                    path.to_string(),
-                    LineCounts {
-                        additions: additions.parse().unwrap_or(0),
-                        deletions: deletions.parse().unwrap_or(0),
-                    },
-                ))
-            })
-            .collect()
+            } else {
+                continue;
+            };
+            if !path.is_empty() {
+                counts.insert(path.to_string(), line_counts);
+            }
+        }
+        counts
     }
 
     /// Assemble repository info from a successful status read plus its two
@@ -431,6 +446,32 @@ mod tests {
         let out = z(&["1\t2\todd\tname.rs"]);
         let counts = GitStatusParser::parse_numstat(&out);
         assert!(counts.contains_key("odd\tname.rs"), "{:?}", counts.keys());
+    }
+
+    #[test]
+    fn numstat_rename_counts_use_the_complete_destination_path() {
+        let out = z(&[
+            "3\t2\t",
+            "old\tname.rs",
+            "new\nname.rs",
+            "-\t-\t",
+            "old.bin",
+            "new.bin",
+            "1\t0\tother.rs",
+        ]);
+        let counts = GitStatusParser::parse_numstat(&out);
+        assert_eq!(counts.len(), 3);
+        assert_eq!(
+            counts["new\nname.rs"],
+            LineCounts {
+                additions: 3,
+                deletions: 2
+            }
+        );
+        assert_eq!(counts["new.bin"], LineCounts::default());
+        assert!(!counts.contains_key("old\tname.rs"));
+        assert!(GitStatusParser::parse_numstat("3\t2\t\0old.rs\0partial").is_empty());
+        assert!(GitStatusParser::parse_numstat("3\t2\tpartial").is_empty());
     }
 
     #[test]

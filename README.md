@@ -33,6 +33,9 @@ not complete.** The remaining work is listed below.
   drafts are preserved. These actions manage FlowX's saved records locally.
 - Interactive tool approvals and grouped questions, including masked secret
   answers. Responses return to the thread that requested them.
+- Assistant replies render Markdown links, inline code, emphasis, lists and code
+  blocks. Imported image attachments show bounded thumbnails; recognized provider
+  attachment envelopes are replaced by the prompt and its attachments.
 - Compact activity groups show progress and action counts without flooding the
   transcript. Open a group to inspect commands, with earlier actions paged in.
 - Automatic names for new chats after their first successful exchange, using a
@@ -49,10 +52,11 @@ not complete.** The remaining work is listed below.
 - A read-only Changes inspector shows only changed files, with staged/unstaged
   diffs, new-file previews and refresh. Reads are bounded, and preview paths are
   checked against the project root.
-- A working-tree tray above the composer opens file diffs directly in the chat.
-  It refreshes every five seconds and after a turn, even with the inspector
-  closed. It shows shared project changes, including edits from other chats and
-  editors; it does not automatically commit, fetch, or push.
+- A compact title-bar indicator shows green added-line and red removed-line
+  counts and toggles the Changes inspector. It disappears for clean working
+  trees and refreshes every five seconds and after a turn. Binary-only changes
+  and incomplete line counts show a file count instead. Changes include the
+  whole project; FlowX does not automatically commit, fetch, or push.
 
 The test suite covers pure policies, storage recovery, GPUI views and provider
 process behavior through local fake servers. It also exercises saving a session
@@ -141,8 +145,8 @@ support location. `RUST_LOG` controls diagnostic logging.
 | --- | --- |
 | Terminal | Implement the `fx-term` sessions and GPUI renderer, input, resizing, lifecycle and multiple terminal panes. The planned Ghostty VT integration requires Zig. |
 | Embedded browser | Choose and implement the WebKit bridge or an alternative preview approach, then restore browser split behavior. |
-| Images | Attachment import, decoding, resizing/conversion, storage, provider submission, previews and cache lifecycle. |
-| Transcript | Full Markdown and code presentation, text selection/copy behavior, and remaining Swift transcript interactions. |
+| Images | Composer attachment import, resizing/conversion, storage, provider submission and broader cache lifecycle. Native-history image previews are implemented. |
+| Transcript | Markdown tables, syntax highlighting, text selection/copy behavior, and remaining Swift transcript interactions. |
 | Swift data migration | Import the Swift application’s project layout, settings and unsent drafts. Provider-native history is discovered independently. |
 | Thread management | Synchronize local rename/archive/delete actions with provider-native lifecycle APIs and complete remaining sidebar parity. |
 | Composer | Complete attachment controls, follow-up queueing and steering behavior. |

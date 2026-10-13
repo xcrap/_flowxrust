@@ -11,6 +11,7 @@ pub mod diff_row_layout;
 pub mod file_index;
 pub mod image_correlation;
 pub mod transcript_grouping;
+pub mod transcript_presentation;
 
 pub use conversation_scroll::{
     ConversationScrollPolicy, ConversationScrollRestoration, ScrollMetrics,

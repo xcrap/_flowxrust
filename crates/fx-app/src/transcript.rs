@@ -27,6 +27,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
+use crate::attachments::{ImageInput, preview as image_attachment};
 use fx_agent::conversation::state::RiskLevelSerde;
 use fx_agent::conversation::{PendingApproval, PendingQuestion, QuestionOption};
 use fx_core::Timestamp;
@@ -34,7 +35,8 @@ use fx_core::policy::conversation_scroll::{ConversationScrollPolicy, ScrollMetri
 use fx_core::policy::transcript_grouping::{
     QUESTION_TOOL_NAME, TranscriptActivityGroupingPolicy, TranscriptActivitySegment,
 };
-use fx_core::{ConversationImageAssetReference, ConversationMessage, MessageContent, MessageRole};
+use fx_core::policy::transcript_presentation::{MentionedAttachment, user_prompt};
+use fx_core::{ConversationMessage, MessageContent, MessageRole};
 use fx_design::components::surface::banner;
 use fx_design::components::{
     BadgeTone, ButtonStyle, DividerAxis, badge, button, divider_with_axis, empty_state, panel,
@@ -520,7 +522,7 @@ pub fn view(conversation: &crate::Conversation, window: &mut Window, cx: &mut Ap
 
     for row in &rows {
         column = column.child(match row {
-            Row::Message(message) => message_row(message),
+            Row::Message(message) => message_row(message, cx),
             Row::Activity(group) => activity_group(group, conversation, frame),
         });
     }
@@ -699,15 +701,77 @@ fn pin_to_bottom(handle: &ScrollHandle) {
 // ── Messages ───────────────────────────────────────────────────────────────
 
 /// One transcript row. A bubble for the reader's own prompts, prose for the rest.
-fn message_row(message: &ConversationMessage) -> AnyElement {
+fn message_row(message: &ConversationMessage, cx: &App) -> AnyElement {
     let theme = global::current();
     let is_user = message.role == MessageRole::User;
 
+    let paths = crate::AppHandle::get(cx).map(|handle| handle.0.read(cx).paths.clone());
+    let mentioned: Vec<MentionedAttachment> = if is_user {
+        message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                MessageContent::Text { text } => Some(user_prompt(text).attachments),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let image_mentions: Vec<_> = mentioned.iter().filter(|file| file.is_image).collect();
+    let mut image_index = 0;
     let mut blocks = Vec::new();
-    for block in &message.content {
-        if let Some(element) = content_block(block) {
+    for (index, block) in message.content.iter().enumerate() {
+        let clean_text = match block {
+            MessageContent::Text { text } if is_user => Some(MessageContent::Text {
+                text: user_prompt(text).text.to_string(),
+            }),
+            _ => None,
+        };
+        let image_mention = if block.is_image() {
+            let mention = image_mentions.get(image_index).copied();
+            image_index += 1;
+            mention
+        } else {
+            None
+        };
+        if let Some(element) = content_block(
+            clean_text.as_ref().unwrap_or(block),
+            SharedString::from(format!("attachment:{}:{index}", message.id)),
+            paths.as_ref(),
+            image_mention,
+            !is_user,
+        ) {
             blocks.push(element);
         }
+    }
+    // Native histories may carry only the attachment envelope. Its explicit
+    // local image references recover those previews without duplicating the
+    // image blocks supplied by providers that include both representations.
+    for (index, attachment) in image_mentions.iter().enumerate().skip(image_index) {
+        blocks.push(
+            image_attachment(
+                SharedString::from(format!("attachment:{}:mentioned:{index}", message.id)),
+                ImageInput::Mentioned(attachment.path.clone()),
+                attachment.name.clone(),
+            )
+            .into_any_element(),
+        );
+    }
+    for attachment in mentioned.iter().filter(|file| !file.is_image) {
+        blocks.push(
+            div()
+                .min_w_0()
+                .whitespace_normal()
+                .fx_caption()
+                .child(SharedString::from(format!(
+                    "{} — {}",
+                    attachment.name,
+                    attachment.path.display()
+                )))
+                .into_any_element(),
+        );
     }
     // A message whose blocks all render to nothing still gets a row. A restored
     // transcript can carry one, and dropping it silently is indistinguishable
@@ -760,11 +824,20 @@ fn message_row(message: &ConversationMessage) -> AnyElement {
 }
 
 /// One content block, or `None` when it has nothing to show.
-fn content_block(block: &MessageContent) -> Option<AnyElement> {
+fn content_block(
+    block: &MessageContent,
+    attachment_id: SharedString,
+    paths: Option<&fx_store::AppPaths>,
+    mention: Option<&MentionedAttachment>,
+    markdown: bool,
+) -> Option<AnyElement> {
     match block {
         MessageContent::Text { text } => {
             if text.trim().is_empty() {
                 return None;
+            }
+            if markdown {
+                return Some(crate::markdown::render(text, attachment_id));
             }
             Some(
                 div()
@@ -784,11 +857,26 @@ fn content_block(block: &MessageContent) -> Option<AnyElement> {
             };
             Some(mono_panel(&label, code, BlockTone::Standard))
         }
-        MessageContent::Image { data, mime_type } => Some(attachment_notice(&format!(
-            "Image attachment ({mime_type}, {} bytes)",
-            data.len()
-        ))),
-        MessageContent::ImageAsset(reference) => Some(asset_notice(reference)),
+        MessageContent::Image { data, .. } => Some(
+            image_attachment(
+                attachment_id,
+                ImageInput::inline(data),
+                mention
+                    .map(|file| file.name.clone())
+                    .unwrap_or_else(|| "Image attachment".into()),
+            )
+            .into_any_element(),
+        ),
+        MessageContent::ImageAsset(reference) => Some(
+            image_attachment(
+                attachment_id,
+                ImageInput::asset(paths, reference),
+                mention
+                    .map(|file| file.name.clone())
+                    .unwrap_or_else(|| "Image attachment".into()),
+            )
+            .into_any_element(),
+        ),
         MessageContent::ToolUse { name, input, .. } => {
             if name.eq_ignore_ascii_case(QUESTION_TOOL_NAME) {
                 Some(question_card(input))
@@ -891,43 +979,6 @@ fn inline_tool_result(content: &str, is_error: bool) -> AnyElement {
         .into_any_element()
 }
 
-/// The transcript's own picture of an inline image.
-///
-/// Decoding needs an image cache and a downsample step, which belongs with a
-/// message-image view rather than here. Until that lands the row says what it
-/// is instead of drawing an empty box, because a blank rectangle is
-/// indistinguishable from a failed decode.
-fn attachment_notice(detail: &str) -> AnyElement {
-    let theme = global::current();
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px_len(Spacing::SM))
-        .rounded(px_len(Radii::MD))
-        .px(px_len(Spacing::MD))
-        .py(px_len(Spacing::SM))
-        .bg(Colors::bg_surface(&theme))
-        .border(px_len(BorderWidth::HAIRLINE))
-        .border_color(Colors::border_subtle(&theme))
-        .child(Icon::PHOTO.render(IconSize::Regular, Colors::fg_tertiary(&theme), &theme))
-        .child(
-            div()
-                .min_w_0()
-                .fx_caption()
-                .text_color(Colors::fg_secondary(&theme))
-                .child(SharedString::from(detail.to_string())),
-        )
-        .into_any_element()
-}
-
-fn asset_notice(reference: &ConversationImageAssetReference) -> AnyElement {
-    attachment_notice(&format!(
-        "Image attachment ({}, {} bytes)",
-        reference.mime_type, reference.byte_count
-    ))
-}
-
 /// An empty transcript says so, rather than showing nothing.
 ///
 /// A blank column is indistinguishable from a transcript that failed to load.
@@ -983,7 +1034,10 @@ fn streaming_tail(
                                 .flex_1()
                                 .min_w_0()
                                 .fx_body()
-                                .child(SharedString::from(text.to_string())),
+                                .child(crate::markdown::render(
+                                    text,
+                                    format!("streaming-markdown:{}", conversation.id),
+                                )),
                         )
                         // The caret is exactly one body line tall. GPUI has no
                         // caret, and a bar taller than the line it sits in reads
@@ -2697,7 +2751,7 @@ mod tests {
     }
 
     #[test]
-    fn images_paint_as_a_notice_rather_than_an_empty_box() {
+    fn unavailable_images_paint_as_compact_fallbacks() {
         let mut conversation = Conversation::new(Uuid::nil());
         conversation.append(message(
             MessageRole::User,
@@ -2706,7 +2760,7 @@ mod tests {
                     data: vec![1, 2, 3],
                     mime_type: "image/png".into(),
                 },
-                MessageContent::ImageAsset(ConversationImageAssetReference {
+                MessageContent::ImageAsset(fx_core::ConversationImageAssetReference {
                     project_id: Uuid::nil(),
                     agent_id: Uuid::nil(),
                     message_id: Uuid::nil(),

@@ -12,13 +12,15 @@
 
 pub mod approvals;
 mod archived_chats;
+mod attachments;
 mod auto_title;
 mod claude_session_lease;
 pub mod composer;
 mod configuration;
-mod conversation_changes;
 pub mod inspector;
+mod markdown;
 mod native_sync;
+mod project_changes;
 pub mod project_picker;
 pub mod provider_catalog;
 mod provider_settings;
@@ -578,6 +580,7 @@ fn title_bar(
                 0.0,
             )
         }))
+        .child(project_changes::view(state.clone(), cx))
         .child(fx_design::components::icon_button(
             fx_design::components::IconButtonProps::new(Icon::PLUS, "New conversation · ⌘N")
                 .small()
@@ -854,7 +857,6 @@ fn center_column(
                 ))
                 .into_any_element()
         })
-        .child(conversation_changes::view(state.clone(), cx))
         .child(composer_row(
             state.clone(),
             conversation.as_deref(),

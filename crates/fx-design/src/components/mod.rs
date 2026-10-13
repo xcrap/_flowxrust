@@ -4,17 +4,21 @@
 //! Every component resolves its colors, sizes, and radii from the token layer,
 //! so a theme change reaches all of them at once.
 
+pub mod attachment;
 pub mod button;
+pub mod change_indicator;
 pub mod collapsible;
 pub mod context_menu;
 pub mod menu;
 pub mod menu_model;
+pub mod rich_text;
 pub mod segmented;
 pub mod status;
 pub mod surface;
 pub mod tooltip;
 pub mod turn_action;
 
+pub use change_indicator::change_indicator;
 pub use turn_action::{TurnAction, turn_action_button};
 
 pub use collapsible::collapsible;

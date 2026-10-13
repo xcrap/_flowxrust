@@ -62,6 +62,10 @@ glob = "0.3"
 libc = "0.2"
 walkdir = "2"
 
+# Native transcript Markdown parsing and validated link destinations.
+pulldown-cmark = { version = "0.13", default-features = false }
+url = "2.5"
+
 # Time.
 # `now` is separate from `clock` as of chrono 0.4.45; both are needed for `DateTime::now()`.
 chrono = { version = "0.4", default-features = false, features = ["clock", "now", "std", "serde"] }

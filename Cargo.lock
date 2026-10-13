@@ -2137,12 +2137,15 @@ dependencies = [
  "fx-design",
  "fx-store",
  "gpui",
+ "image",
  "libc",
+ "pulldown-cmark",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "url",
  "uuid",
 ]
 
@@ -4349,6 +4352,17 @@ checksum = "4dcd034599e63b970727f70d79e02d62390a4a84f7c6b827c27c46d5ac3fa622"
 dependencies = [
  "ar_archive_writer",
  "cc",
+]
+
+[[package]]
+name = "pulldown-cmark"
+version = "0.13.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9f068eba8e7071c5f9511831b44f32c740d5adf574e990f946ddb53db2f314e"
+dependencies = [
+ "bitflags 2.13.2",
+ "memchr",
+ "unicase",
 ]
 
 [[package]]
