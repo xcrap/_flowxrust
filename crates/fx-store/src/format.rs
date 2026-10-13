@@ -41,22 +41,68 @@ pub struct ProviderDefaults {
     pub agent_access: Option<AgentAccess>,
 }
 
-/// Separate lightweight models used once to name a newly created chat.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+/// One lightweight provider and model used to name every newly created chat.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AutoTitlePreferences {
     pub enabled: bool,
-    pub codex_model_id: String,
-    pub claude_model_id: String,
+    pub provider_id: String,
+    pub model_id: String,
 }
 
 impl Default for AutoTitlePreferences {
     fn default() -> Self {
         Self {
             enabled: true,
-            codex_model_id: "gpt-5.6-luna".into(),
-            claude_model_id: "haiku".into(),
+            provider_id: "codex".into(),
+            model_id: Self::default_model_id("codex").into(),
         }
+    }
+}
+
+impl AutoTitlePreferences {
+    pub fn default_model_id(provider: &str) -> &'static str {
+        match provider {
+            "claude" => "haiku",
+            _ => "gpt-5.6-luna",
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for AutoTitlePreferences {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let mut result = Self::default();
+        if let Some(enabled) = value.get("enabled").and_then(|value| value.as_bool()) {
+            result.enabled = enabled;
+        }
+        let provider_value = value.get("provider_id");
+        let provider = provider_value.and_then(|value| value.as_str());
+        if let Some(provider @ ("codex" | "claude")) = provider {
+            result.provider_id = provider.into();
+        }
+        // A future/invalid provider must not carry its model into Codex. Older
+        // preferences used one model per chat provider; preserve the Codex one
+        // as the shared choice when migrating that format.
+        if provider_value.is_none() || matches!(provider, Some("codex" | "claude")) {
+            let legacy_key = if result.provider_id == "claude" {
+                "claude_model_id"
+            } else {
+                "codex_model_id"
+            };
+            result.model_id = value
+                .get("model_id")
+                .and_then(|value| value.as_str())
+                .filter(|model| !model.trim().is_empty())
+                .or_else(|| {
+                    value
+                        .get(legacy_key)
+                        .and_then(|value| value.as_str())
+                        .filter(|model| !model.trim().is_empty())
+                })
+                .unwrap_or_else(|| Self::default_model_id(&result.provider_id))
+                .into();
+        }
+        Ok(result)
     }
 }
 
@@ -574,6 +620,53 @@ mod tests {
         assert_eq!(decoded.codex_defaults.effort, None);
         assert_eq!(decoded.codex_defaults.agent_access, None);
         assert_eq!(decoded.claude_defaults, ProviderDefaults::default());
+    }
+
+    #[test]
+    fn legacy_title_models_migrate_to_one_shared_codex_choice() {
+        let preferences: PersistedPreferences = serde_json::from_str(
+            r#"{"auto_titles":{"enabled":false,"codex_model_id":"custom-small-model","claude_model_id":"haiku"}}"#,
+        ).unwrap();
+        assert_eq!(
+            preferences.auto_titles,
+            AutoTitlePreferences {
+                enabled: false,
+                provider_id: "codex".into(),
+                model_id: "custom-small-model".into(),
+            }
+        );
+        let written = serde_json::to_value(&preferences.auto_titles).unwrap();
+        assert!(written.get("codex_model_id").is_none());
+        assert!(written.get("claude_model_id").is_none());
+        assert_eq!(written["provider_id"], "codex");
+        assert_eq!(written["model_id"], "custom-small-model");
+    }
+
+    #[test]
+    fn shared_title_preferences_round_trip_and_recover_fields_independently() {
+        let preferences = AutoTitlePreferences {
+            enabled: false,
+            provider_id: "claude".into(),
+            model_id: "custom-haiku".into(),
+        };
+        let written = serde_json::to_string(&preferences).unwrap();
+        assert_eq!(
+            serde_json::from_str::<AutoTitlePreferences>(&written).unwrap(),
+            preferences
+        );
+        let malformed: AutoTitlePreferences =
+            serde_json::from_str(r#"{"enabled":false,"provider_id":"claude","model_id":42}"#)
+                .unwrap();
+        assert!(!malformed.enabled);
+        assert_eq!(malformed.provider_id, "claude");
+        assert_eq!(malformed.model_id, "haiku");
+        let unknown: AutoTitlePreferences =
+            serde_json::from_str(r#"{"provider_id":"future-provider","model_id":"foreign-model"}"#)
+                .unwrap();
+        assert_eq!(unknown, AutoTitlePreferences::default());
+        let invalid: AutoTitlePreferences =
+            serde_json::from_str(r#"{"provider_id":42,"model_id":"foreign-model"}"#).unwrap();
+        assert_eq!(invalid, AutoTitlePreferences::default());
     }
 
     #[test]

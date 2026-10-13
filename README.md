@@ -38,10 +38,11 @@ not complete.** The remaining work is listed below.
   attachment envelopes are replaced by the prompt and its attachments.
 - Compact activity groups show progress and action counts without flooding the
   transcript. Open a group to inspect commands, with earlier actions paged in.
-- Automatic names for new chats after their first successful exchange, using a
-  separate lightweight model: Codex GPT-5.6-Luna or Claude Haiku by default.
-  **Settings → Chat names** changes these models or turns naming off. Each name
-  uses one additional provider request; manual names and imported chats are kept.
+- Automatic names for new chats from the first prompt, using one shared provider
+  and lightweight model for every chat (Codex GPT-5.6-Luna by default).
+  **Settings → Chat defaults → Chat names** changes the provider and model or
+  turns naming off. Each name uses one additional provider request; manual names
+  and imported chats are kept.
 - Saved transcripts, provider session IDs, token/context totals, drafts and
   unsent prompts. Drafts clear after provider acceptance; a failed submission
   remains retryable. Recovery copies are bounded on read, and unreadable or

@@ -107,10 +107,10 @@ fn apply_settings(
                 .is_ok_and(|primary| primary == saved);
             if committed {
                 state.update(cx, |state, cx| {
-                    state.preferences = saved;
-                    if !state.preferences.auto_titles.enabled {
+                    if state.preferences.auto_titles != saved.auto_titles {
                         state.cancel_title_jobs();
                     }
+                    state.preferences = saved;
                     state.last_error = Some(format!(
                         "Settings were saved, but the recovery copy could not be updated: {error}"
                     ));
@@ -127,10 +127,10 @@ fn apply_settings(
         }
         Ok(()) => {
             state.update(cx, |state, cx| {
-                state.preferences = saved;
-                if !state.preferences.auto_titles.enabled {
+                if state.preferences.auto_titles != saved.auto_titles {
                     state.cancel_title_jobs();
                 }
+                state.preferences = saved;
                 cx.notify();
             });
             global::set(draft.apply_to(&global::current()));
@@ -1128,7 +1128,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_name_settings_navigate_select_and_persist_only_on_done() {
+    fn chat_names_inside_chat_defaults_select_and_persist_only_on_done() {
         use gpui::{MouseButton, VisualTestContext, px, size};
         let temp = tempfile::tempdir().unwrap();
         let mut test = gpui::TestAppContext::single();
@@ -1152,15 +1152,17 @@ mod tests {
             .unwrap();
         test.refresh().unwrap();
         test.update(|_| {});
-        let nav = visual
-            .debug_bounds("settings-nav-chat-names")
-            .unwrap()
-            .center();
-        visual.simulate_mouse_down(nav, MouseButton::Left, Default::default());
-        visual.simulate_mouse_up(nav, MouseButton::Left, Default::default());
+        assert!(visual.debug_bounds("settings-nav-chat-names").is_none());
+        let defaults = visual.debug_bounds("settings-page-chat-defaults").unwrap();
+        assert!(visual.debug_bounds("settings-chat-names").is_some());
+        visual.simulate_event(gpui::ScrollWheelEvent {
+            position: defaults.center(),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.0), px(-1000.0))),
+            ..Default::default()
+        });
         test.refresh().unwrap();
         let picker = visual
-            .debug_bounds("settings-titles:codex")
+            .debug_bounds("settings-titles:model")
             .unwrap()
             .center();
         visual.simulate_mouse_down(picker, MouseButton::Left, Default::default());
@@ -1180,7 +1182,7 @@ mod tests {
                     .unwrap()
                     .read(cx)
                     .values()
-                    .codex_model_id,
+                    .model_id,
                 expected_model
             );
             assert_eq!(
@@ -1213,7 +1215,7 @@ mod tests {
             assert!(ui.read(cx).settings.is_none());
             let saved = state.read(cx).store.load_preferences().unwrap();
             assert!(!saved.auto_titles.enabled);
-            assert_eq!(saved.auto_titles.codex_model_id, expected_model);
+            assert_eq!(saved.auto_titles.model_id, expected_model);
             assert_eq!(saved.auto_titles, state.read(cx).preferences.auto_titles);
             assert_eq!(
                 saved.codex_defaults,

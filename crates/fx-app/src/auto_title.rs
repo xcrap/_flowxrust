@@ -8,6 +8,7 @@ use uuid::Uuid;
 pub(crate) struct TitleJob {
     pub generation: Uuid,
     pub provider: String,
+    pub model: String,
 }
 
 #[cfg(not(test))]

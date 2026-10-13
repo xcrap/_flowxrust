@@ -1,4 +1,4 @@
-//! Reversible settings for the independent models that name new chats.
+//! Reversible settings for the shared provider that names all new chats.
 
 use fx_agent::Model;
 use fx_design::components::segmented::{SegmentedOption, segmented_control};
@@ -70,79 +70,71 @@ impl TitleSettings {
     }
 
     pub(crate) fn apply(&mut self, owner: &str, chosen: &str, cx: &mut Context<Self>) -> bool {
-        let Some(provider) = owner.strip_prefix(PREFIX) else {
-            return false;
-        };
-        let current = match provider {
-            "codex" => &mut self.draft.codex_model_id,
-            "claude" => &mut self.draft.claude_model_id,
+        match owner.strip_prefix(PREFIX) {
+            Some("provider") if matches!(chosen, "codex" | "claude") => {
+                if self.draft.provider_id != chosen {
+                    self.draft.provider_id = chosen.into();
+                    self.draft.model_id = AutoTitlePreferences::default_model_id(chosen).into();
+                }
+            }
+            Some("model") => {
+                let models = provider_catalog::models(&self.draft.provider_id);
+                let default = AutoTitlePreferences::default_model_id(&self.draft.provider_id);
+                if chosen != self.draft.model_id
+                    && chosen != default
+                    && !models.iter().any(|model| model.id == chosen)
+                {
+                    return false;
+                }
+                self.draft.model_id = chosen.into();
+            }
             _ => return false,
-        };
-        let models = provider_catalog::models(provider);
-        let default = default_model_id(provider);
-        if chosen != current.as_str()
-            && chosen != default
-            && !models.iter().any(|model| model.id == chosen)
-        {
-            return false;
         }
-        *current = chosen.to_owned();
         cx.notify();
         true
     }
 
-    fn model_row(&self, provider: &str, label: &'static str, cx: &App) -> AnyElement {
+    fn picker_row(
+        &self,
+        field: &str,
+        label: &'static str,
+        display: String,
+        model: MenuModel,
+        cx: &App,
+    ) -> AnyElement {
         let theme = global::current();
-        let selected = if provider == "codex" {
-            &self.draft.codex_model_id
-        } else {
-            &self.draft.claude_model_id
-        };
-        let models = provider_catalog::models(provider);
-        let display = provider_catalog::model(provider, selected)
-            .map(|model| model.display_name)
-            .unwrap_or_else(|| {
-                if provider == "claude" && selected == "haiku" {
-                    "Haiku".into()
-                } else {
-                    selected.clone()
-                }
-            });
-        let owner = format!("{PREFIX}{provider}");
+        let owner = format!("{PREFIX}{field}");
         let selector = owner.clone();
         let expanded = self.menu_layer.read(cx).is_owner(&owner);
-        card(
-            div()
-                .w_full()
-                .min_w_0()
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap(px_len(Spacing::MD))
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .fx_body()
-                        .text_color(Colors::fg(&theme))
-                        .child(label),
-                )
-                .child(
-                    div()
-                        .min_w_0()
-                        .debug_selector(move || selector.clone())
-                        .child(menu_trigger(
-                            MenuTrigger::new(
-                                model_menu(provider, selected, &models),
-                                SharedString::from(owner),
-                                SharedString::from(display),
-                            )
-                            .expanded(expanded),
-                            &self.menu_layer,
-                        )),
-                ),
-            Spacing::MD,
-        )
-        .into_any_element()
+        div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px_len(Spacing::MD))
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .fx_caption()
+                    .text_color(Colors::fg_secondary(&theme))
+                    .child(label),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .debug_selector(move || selector.clone())
+                    .child(menu_trigger(
+                        MenuTrigger::new(
+                            model,
+                            SharedString::from(owner),
+                            SharedString::from(display),
+                        )
+                        .expanded(expanded),
+                        &self.menu_layer,
+                    )),
+            )
+            .into_any_element()
     }
 }
 
@@ -150,32 +142,48 @@ impl Render for TitleSettings {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = global::current();
         let this = cx.entity();
+        let provider = &self.draft.provider_id;
+        let models = provider_catalog::models(provider);
+        let display = provider_catalog::model(provider, &self.draft.model_id)
+            .map(|model| model.display_name)
+            .unwrap_or_else(|| {
+                if provider == "claude" && self.draft.model_id == "haiku" {
+                    "Haiku".into()
+                } else {
+                    self.draft.model_id.clone()
+                }
+            });
         div().w_full().min_w_0().flex().flex_col().gap(px_len(Spacing::MD))
+            .debug_selector(|| "settings-chat-names".into())
             .child(section_header("Chat names"))
-            .child(div().fx_caption().text_color(Colors::fg_secondary(&theme)).child("Generate a short name after the first successful exchange in a new chat."))
-            .child(
-                div().w_full().flex().items_center().justify_between().gap(px_len(Spacing::MD))
-                    .child(div().fx_body().child("Automatic names"))
-                    .child(div().debug_selector(|| "settings-titles-enabled".into()).child(segmented_control(
-                        &[SegmentedOption::new(false, "Off"), SegmentedOption::new(true, "On")],
-                        &self.draft.enabled,
-                        move |enabled, _, cx| this.update(cx, |editor, cx| editor.set_enabled(*enabled, cx)),
-                    ))),
-            )
-            .child(div().fx_caption().text_color(Colors::fg_secondary(&theme)).child("Each chat uses its own provider and the title model below. These choices are independent of your conversation models."))
-            .child(self.model_row("codex", "Codex title model", cx))
-            .child(self.model_row("claude", "Claude title model", cx))
-            .child(div().fx_caption().text_color(Colors::fg_tertiary(&theme)).child("One separate model request per new chat. Names you set yourself are kept."))
+            .child(div().fx_caption().text_color(Colors::fg_secondary(&theme)).child("Name every new chat from its first prompt using the same provider and model."))
+            .child(card(
+                div().w_full().min_w_0().flex().flex_col().gap(px_len(Spacing::SM))
+                    .child(
+                        div().w_full().flex().items_center().justify_between().gap(px_len(Spacing::MD))
+                            .child(div().fx_body().child("Automatic names"))
+                            .child(div().debug_selector(|| "settings-titles-enabled".into()).child(segmented_control(
+                                &[SegmentedOption::new(false, "Off"), SegmentedOption::new(true, "On")],
+                                &self.draft.enabled,
+                                move |enabled, _, cx| this.update(cx, |editor, cx| editor.set_enabled(*enabled, cx)),
+                            ))),
+                    )
+                    .child(self.picker_row("provider", "Provider", if provider == "claude" { "Claude" } else { "Codex" }.into(), provider_menu(provider), cx))
+                    .child(self.picker_row("model", "Model", display, model_menu(provider, &self.draft.model_id, &models), cx)),
+                Spacing::MD,
+            ))
+            .child(div().fx_caption().text_color(Colors::fg_tertiary(&theme)).child("One naming request per new chat. Names you set yourself are kept."))
     }
 }
 
-fn default_model_id(provider: &str) -> String {
-    let defaults = AutoTitlePreferences::default();
-    if provider == "codex" {
-        defaults.codex_model_id
-    } else {
-        defaults.claude_model_id
-    }
+fn provider_menu(selected: &str) -> MenuModel {
+    MenuModel::new(vec![MenuSection::new(
+        "title-provider",
+        vec![
+            MenuItem::new("codex", "Codex").selected(selected == "codex"),
+            MenuItem::new("claude", "Claude").selected(selected == "claude"),
+        ],
+    )])
 }
 
 fn model_menu(provider: &str, selected: &str, models: &[Model]) -> MenuModel {
@@ -183,16 +191,16 @@ fn model_menu(provider: &str, selected: &str, models: &[Model]) -> MenuModel {
         .iter()
         .map(|model| MenuItem::new(&model.id, &model.display_name).selected(model.id == selected))
         .collect();
-    let default = default_model_id(provider);
+    let default = AutoTitlePreferences::default_model_id(provider);
     if !models.iter().any(|model| model.id == default) {
         items.insert(
             0,
             MenuItem::new(
-                &default,
+                default,
                 if provider == "claude" {
                     "Haiku"
                 } else {
-                    default.as_str()
+                    default
                 },
             )
             .subtitle("Default title model")
@@ -212,6 +220,34 @@ fn model_menu(provider: &str, selected: &str, models: &[Model]) -> MenuModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn changing_the_shared_provider_selects_its_lightweight_model_and_reset_restores_both() {
+        let test = gpui::TestAppContext::single();
+        test.update(|cx| {
+            let menus = cx.new(|_| MenuLayer::default());
+            let baseline = AutoTitlePreferences {
+                model_id: "saved-small-model".into(),
+                ..AutoTitlePreferences::default()
+            };
+            let editor = TitleSettings::new(baseline.clone(), menus, cx);
+            editor.update(cx, |editor, cx| {
+                assert!(editor.apply("settings-titles:provider", "codex", cx));
+                assert_eq!(editor.values(), baseline);
+                assert!(editor.apply("settings-titles:provider", "claude", cx));
+                assert_eq!(editor.values().provider_id, "claude");
+                assert_eq!(editor.values().model_id, "haiku");
+                assert!(!editor.apply("settings-titles:provider", "unknown", cx));
+                assert!(!editor.apply("settings-titles:model", "foreign-model", cx));
+                assert_eq!(editor.values().model_id, "haiku");
+                assert!(editor.apply("settings-titles:provider", "codex", cx));
+                assert_eq!(editor.values().model_id, "gpt-5.6-luna");
+                editor.reset(cx);
+                assert_eq!(editor.values(), baseline);
+                assert!(!editor.is_dirty());
+            });
+        });
+    }
 
     #[test]
     fn a_saved_unavailable_title_model_and_the_lightweight_default_remain_choices() {

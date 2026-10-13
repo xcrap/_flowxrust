@@ -414,7 +414,6 @@ const SHEET_ID: &str = "settings.sheet";
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum SettingsPage {
     ChatDefaults,
-    ChatNames,
     #[default]
     Appearance,
     Providers,
@@ -422,9 +421,8 @@ enum SettingsPage {
 }
 
 impl SettingsPage {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 4] = [
         Self::ChatDefaults,
-        Self::ChatNames,
         Self::Appearance,
         Self::Providers,
         Self::Archives,
@@ -433,7 +431,6 @@ impl SettingsPage {
     fn label(self) -> &'static str {
         match self {
             Self::ChatDefaults => "Chat defaults",
-            Self::ChatNames => "Chat names",
             Self::Appearance => "Appearance",
             Self::Providers => "Providers",
             Self::Archives => "Archived chats",
@@ -443,7 +440,6 @@ impl SettingsPage {
     fn key(self) -> &'static str {
         match self {
             Self::ChatDefaults => "chat-defaults",
-            Self::ChatNames => "chat-names",
             Self::Appearance => "appearance",
             Self::Providers => "providers",
             Self::Archives => "archives",
@@ -453,7 +449,6 @@ impl SettingsPage {
     fn icon(self) -> Icon {
         match self {
             Self::ChatDefaults => Icon::BUBBLE_LEFT_AND_BUBBLE_RIGHT,
-            Self::ChatNames => Icon::PENCIL_LINE,
             Self::Appearance => Icon::GEARSHAPE,
             Self::Providers => Icon::TERMINAL,
             Self::Archives => Icon::ARCHIVEBOX,
@@ -574,8 +569,9 @@ impl SettingsSheet {
 
     fn page_available(&self, page: SettingsPage) -> bool {
         match page {
-            SettingsPage::ChatDefaults => self.provider_defaults.is_some(),
-            SettingsPage::ChatNames => self.title_settings.is_some(),
+            SettingsPage::ChatDefaults => {
+                self.provider_defaults.is_some() || self.title_settings.is_some()
+            }
             SettingsPage::Archives => self.archives.is_some(),
             _ => true,
         }
@@ -614,6 +610,7 @@ impl SettingsSheet {
             cx.notify();
         }));
         self.title_settings = Some(editor);
+        self.page = SettingsPage::ChatDefaults;
         cx.notify();
     }
 
@@ -876,9 +873,12 @@ impl SettingsSheet {
         let for_close = this.clone();
         let content = match self.page {
             SettingsPage::ChatDefaults => div()
+                .w_full()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px_len(Spacing::XXL))
                 .children(self.provider_defaults.clone())
-                .into_any_element(),
-            SettingsPage::ChatNames => div()
                 .children(self.title_settings.clone())
                 .into_any_element(),
             SettingsPage::Appearance => self.appearance_section(this),
@@ -2013,7 +2013,7 @@ mod tests {
         });
         editor.update(&mut mounted.test, |editor, cx| {
             editor.set_enabled(false, cx);
-            assert!(editor.apply("settings-titles:codex", fx_core::DEFAULT_CODEX_MODEL_ID, cx));
+            assert!(editor.apply("settings-titles:model", fx_core::DEFAULT_CODEX_MODEL_ID, cx));
         });
         mounted.test.refresh().unwrap();
         assert!(mounted.read(|sheet| sheet.can_reset()));

@@ -128,13 +128,14 @@ pub fn section_divider() -> impl IntoElement {
     divider()
 }
 
-/// A section header: an uppercase label in the sidebar style.
+/// A section header in the sidebar style, wrapping in narrow panels.
 pub fn section_header(label: impl Into<gpui::SharedString>) -> impl IntoElement {
     let theme = global::current();
     div()
+        .w_full()
+        .min_w_0()
         .fx_overline()
         .text_color(Colors::fg_secondary(&theme))
-        .truncate()
         .child(label.into())
 }
 
