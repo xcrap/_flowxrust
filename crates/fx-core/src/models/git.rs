@@ -20,6 +20,14 @@ pub struct GitFileStatus {
     pub unstaged_additions: usize,
     #[serde(rename = "unstagedDeletions", default)]
     pub unstaged_deletions: usize,
+    /// Where a rename or copy came from. Committing only the destination would
+    /// leave the source's deletion behind.
+    #[serde(
+        rename = "originalPath",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub original_path: Option<String>,
 }
 
 impl GitFileStatus {
@@ -36,6 +44,7 @@ impl GitFileStatus {
             staged_deletions: 0,
             unstaged_additions: 0,
             unstaged_deletions: 0,
+            original_path: None,
         }
     }
 
@@ -98,6 +107,10 @@ pub struct GitRepositoryInfo {
     pub ahead_count: usize,
     #[serde(rename = "behindCount", default)]
     pub behind_count: usize,
+    /// The branch tracks an upstream the remote no longer has, so status
+    /// reports no ahead count even though every local commit is unpublished.
+    #[serde(rename = "upstreamGone", default)]
+    pub upstream_gone: bool,
     #[serde(default)]
     pub additions: usize,
     #[serde(default)]
@@ -138,7 +151,8 @@ impl GitRepositoryInfo {
         self.is_git_repo
             && self.has_remote
             && !self.is_detached_head()
-            && (self.ahead_count > 0 || (self.upstream_branch.is_empty() && self.has_commits))
+            && (self.ahead_count > 0
+                || (self.has_commits && (self.upstream_branch.is_empty() || self.upstream_gone)))
     }
 
     /// How many files have unstaged work.
@@ -255,6 +269,22 @@ mod tests {
 
         info.has_remote = false;
         assert!(!info.can_push(), "no remote");
+    }
+
+    #[test]
+    fn a_gone_upstream_is_pushable_once_there_is_a_commit() {
+        // `git clone` of an empty repository tracks `origin/main` before the
+        // remote has it, and status reports `[gone]` with no ahead count.
+        let mut info = GitRepositoryInfo {
+            is_git_repo: true,
+            has_remote: true,
+            upstream_branch: "origin/main".into(),
+            upstream_gone: true,
+            ..Default::default()
+        };
+        assert!(!info.can_push(), "nothing to push before the first commit");
+        info.has_commits = true;
+        assert!(info.can_push());
     }
 
     #[test]

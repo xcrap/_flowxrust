@@ -45,7 +45,7 @@ use std::time::Duration;
 
 use fx_core::AgentAccess;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
@@ -85,6 +85,14 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 /// How long a closing process is given to end on its own before it is killed.
 const CLOSE_GRACE: Duration = Duration::from_millis(750);
 
+/// How long a stopped turn's process group gets to exit on SIGTERM before it
+/// is killed.
+const TERMINATE_GRACE: Duration = Duration::from_millis(500);
+
+/// The id FlowX gives its interrupt control request. One process serves one
+/// turn, so one id is enough.
+const INTERRUPT_REQUEST_ID: &str = "flowx-interrupt";
+
 /// Why a Claude turn could not be driven.
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
@@ -108,6 +116,8 @@ pub enum TransportError {
     NotAControl { id: String, expected: &'static str },
     #[error("{reason}")]
     Vanished { reason: String },
+    #[error("{reason}")]
+    Failed { reason: String },
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error("could not encode a message for Claude Code: {0}")]
@@ -149,6 +159,8 @@ impl Exit {
 pub enum TurnEnd {
     /// Claude sent `result`. What the process did afterwards is irrelevant.
     Completed { stop_reason: String },
+    /// Claude sent a `result` that reported an error, and this is its reason.
+    Failed { reason: String },
     /// The process ended without one.
     Vanished { reason: String },
 }
@@ -170,6 +182,7 @@ impl TurnEnd {
     pub fn into_result(self) -> Result<String, TransportError> {
         match self {
             Self::Completed { stop_reason } => Ok(stop_reason),
+            Self::Failed { reason } => Err(TransportError::Failed { reason }),
             Self::Vanished { reason } => Err(TransportError::Vanished { reason }),
         }
     }
@@ -455,6 +468,9 @@ enum Write {
 struct Inner {
     /// The process, taken once it is reaped.
     child: Mutex<Option<Child>>,
+    /// The process's own group, which the tools it runs inherit. Kept apart
+    /// from `child` because the group outlives a reaped leader.
+    group: Option<crate::process::Group>,
     /// The parser, shared so an approval can be answered from a task other than
     /// the one reading the stream.
     parser: Mutex<ClaudeStreamParser>,
@@ -503,6 +519,8 @@ impl ClaudeTransport {
             // captures it: a CLI that cannot start explains itself here.
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // Its own group, so Stop can reach the tools it runs as well as itself.
+        crate::process::in_own_group(&mut command);
         if let Some(directory) = &launch.working_directory {
             command.current_dir(directory);
         }
@@ -514,6 +532,7 @@ impl ClaudeTransport {
         let mut child = command
             .spawn()
             .map_err(|error| TransportError::Spawn(format!("{}: {error}", launch.executable)))?;
+        let group = crate::process::Group::led_by(&child);
 
         let stdout_pipe = child.stdout.take();
         let stdout = take_pipe(&mut child, stdout_pipe, "stdout")?;
@@ -529,16 +548,25 @@ impl ClaudeTransport {
 
         let (stderr_tx, stderr_rx) = oneshot::channel::<String>();
         tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            let mut buffer = String::new();
-            while let Ok(Some(line)) = lines.next_line().await {
-                push_stderr(&mut buffer, &line);
+            // Raw bytes, capped as they are read. A line reader stopped at the
+            // first byte that was not UTF-8, which closed the pipe under a CLI
+            // still writing to it, and `\r`-only progress output was one line
+            // that grew without bound before any cap applied.
+            let mut stderr = stderr;
+            let mut buffer = Vec::new();
+            let mut chunk = [0u8; 8 * 1024];
+            while let Ok(read) = stderr.read(&mut chunk).await {
+                if read == 0 {
+                    break;
+                }
+                crate::process::keep_tail(&mut buffer, &chunk[..read], MAX_STDERR_BYTES);
             }
-            let _ = stderr_tx.send(buffer);
+            let _ = stderr_tx.send(crate::process::decode(&buffer));
         });
 
         let inner = Arc::new(Inner {
             child: Mutex::new(Some(child)),
+            group,
             parser: Mutex::new(ClaudeStreamParser::new()),
             input: Mutex::new(TurnInput::new()),
             exited: Mutex::new(None),
@@ -592,7 +620,12 @@ impl ClaudeTransport {
         prompt: &str,
         images: &[impl AsRef<Path>],
     ) -> Result<(), TransportError> {
-        let envelope = self.inner.input.lock().await.user_message(prompt, images)?;
+        // The gate stays locked until the write is queued. Checked under the
+        // lock and queued after it, a close could land in between: its `Close`
+        // went first, the writer stopped there, and the prompt the caller was
+        // told had been sent was discarded.
+        let mut input = self.inner.input.lock().await;
+        let envelope = input.user_message(prompt, images)?;
         self.write(envelope).await
     }
 
@@ -629,8 +662,29 @@ impl ClaudeTransport {
     /// The path for a request shape the parser does not model:
     /// [`crate::claude::stream::refuse_control`] produces one.
     pub async fn respond(&self, response: Value) -> Result<(), TransportError> {
-        let envelope = self.inner.input.lock().await.answer(response)?;
+        // One critical section with the queueing, as in `send_prompt`.
+        let mut input = self.inner.input.lock().await;
+        let envelope = input.answer(response)?;
         self.write(envelope).await
+    }
+
+    /// Ask Claude to stop the turn it is running.
+    ///
+    /// The SDK's own interrupt control request, which is what lets Claude end
+    /// its turn and its tools itself before the process is signalled.
+    pub async fn interrupt(&self) -> Result<(), TransportError> {
+        self.respond(json!({
+            "type": "control_request",
+            "request_id": INTERRUPT_REQUEST_ID,
+            "request": { "subtype": "interrupt" },
+        }))
+        .await
+    }
+
+    /// Whether Claude has shown it read the prompt — any frame that answers
+    /// it, including thinking, usage and lifecycle frames that are never shown.
+    pub async fn prompt_consumed(&self) -> bool {
+        self.inner.parser.lock().await.prompt_consumed()
     }
 
     /// The control requests still waiting on an answer.
@@ -705,6 +759,12 @@ impl StreamReader {
                 Some(StreamItem::Event(ProviderEvent::Done { stop_reason })) => {
                     return TurnEnd::decide(Some(stop_reason), None);
                 }
+                // An errored `result` is the end of the turn too. Waiting past
+                // it for the process to exit reported the exit status instead of
+                // the reason Claude gave.
+                Some(StreamItem::Event(ProviderEvent::Error(reason))) => {
+                    return TurnEnd::Failed { reason };
+                }
                 Some(StreamItem::Event(_)) => {}
                 Some(StreamItem::Exited(exit)) => return TurnEnd::decide(None, Some(&exit)),
                 None => {
@@ -748,9 +808,29 @@ impl ClaudeTransport {
             .await
             .is_err()
         {
-            let _ = child.start_kill();
+            crate::process::stop_leader(&mut child, CLOSE_GRACE).await;
+        }
+    }
+
+    /// Stop the process and everything it started, for Stop or a failed turn.
+    ///
+    /// The input is closed first, for the reason `close` gives, and the
+    /// process gets the same moment to end on its own. Then the whole process
+    /// group gets SIGTERM, a grace period, and SIGKILL — whether or not Claude
+    /// itself has gone, because a tool it started can outlive it. A caller
+    /// stopping a turn sends [`Self::interrupt`] before this.
+    pub async fn terminate(&self) {
+        self.close_input().await;
+        let mut slot = self.inner.child.lock().await;
+        if let Some(child) = slot.as_mut() {
             let _ = tokio::time::timeout(CLOSE_GRACE, child.wait()).await;
         }
+        match (self.inner.group, slot.as_mut()) {
+            (Some(group), leader) => group.terminate(leader, TERMINATE_GRACE).await,
+            (None, Some(child)) => crate::process::stop_leader(child, TERMINATE_GRACE).await,
+            (None, None) => {}
+        }
+        slot.take();
     }
 
     async fn write(&self, envelope: Value) -> Result<(), TransportError> {
@@ -862,27 +942,6 @@ async fn write_stdin_loop(
     }
 }
 
-/// Append one line of stderr, keeping the most recent bytes.
-///
-/// The tail is kept rather than the head: the last thing a CLI writes before it
-/// dies is the reason it died, and a cap that kept the head would preserve the
-/// banner and drop the diagnosis.
-fn push_stderr(buffer: &mut String, line: &str) {
-    buffer.push_str(line);
-    buffer.push('\n');
-    let overflow = buffer.len().saturating_sub(MAX_STDERR_BYTES);
-    if overflow == 0 {
-        return;
-    }
-    // `String::drain` panics on a range that is not on a character boundary, and
-    // a byte count is not one, so the cut is walked forward rather than assumed.
-    let mut start = overflow;
-    while start < buffer.len() && !buffer.is_char_boundary(start) {
-        start += 1;
-    }
-    buffer.drain(..start);
-}
-
 /// Wait for the process, so its exit status is known.
 ///
 /// Bounded, and a process still running after the grace period is killed:
@@ -935,8 +994,12 @@ fn base64(bytes: &[u8]) -> String {
 }
 
 /// Close stdin, once.
+///
+/// The `Close` is queued with the gate still locked, so no write can be told
+/// it was accepted and then land behind it.
 async fn close_stdin(input: &Mutex<TurnInput>, stdin: &mpsc::Sender<Write>) {
-    if input.lock().await.close() {
+    let mut input = input.lock().await;
+    if input.close() {
         let _ = stdin.send(Write::Close).await;
     }
 }
@@ -1439,31 +1502,6 @@ mod tests {
     }
 
     #[test]
-    fn stderr_keeps_the_most_recent_bytes() {
-        // The last thing a CLI writes before it dies is the reason it died, so a
-        // cap that kept the head would keep the banner and drop the diagnosis.
-        let mut buffer = String::new();
-        push_stderr(&mut buffer, "banner");
-        push_stderr(&mut buffer, &".".repeat(MAX_STDERR_BYTES * 2));
-        push_stderr(&mut buffer, "the real error");
-        assert!(buffer.contains("the real error"), "{buffer}");
-        assert!(!buffer.contains("banner"), "the head was kept");
-        assert!(buffer.len() <= MAX_STDERR_BYTES + 8, "{}", buffer.len());
-    }
-
-    #[test]
-    fn stderr_is_bounded_without_splitting_a_character() {
-        let mut buffer = "é".repeat(MAX_STDERR_BYTES / 2);
-        push_stderr(&mut buffer, "done");
-        assert!(
-            buffer.len() <= MAX_STDERR_BYTES + 8,
-            "stderr grew without bound: {}",
-            buffer.len()
-        );
-        assert!(buffer.ends_with("done\n"));
-    }
-
-    #[test]
     fn an_exit_with_stderr_quotes_it() {
         let exit = Exit {
             stderr: "  Error: not logged in  ".into(),
@@ -1806,11 +1844,131 @@ mod process {
             .await
             .expect("written");
 
-        // Nothing completes the turn, so this ends at the process instead.
+        // Claude's own reason, not the exit status the process left behind
+        // once it had given it.
         let end = tokio::time::timeout(Duration::from_secs(5), reader.wait_for_end())
             .await
             .expect("the stream ended");
-        assert!(!end.is_completed(), "{end:?}");
+        assert_eq!(
+            end,
+            TurnEnd::Failed {
+                reason: "hit a limit".into()
+            }
+        );
+        assert!(
+            matches!(end.into_result(), Err(TransportError::Failed { reason }) if reason == "hit a limit")
+        );
+    }
+
+    #[tokio::test]
+    async fn stopping_a_turn_interrupts_claude_and_ends_the_tools_it_started() {
+        // Stop used to close input and kill Claude alone, with no interrupt,
+        // and Claude was not in a group of its own: the tool it was running
+        // kept going after the turn ended.
+        let Some(server) = FakeClaude::new() else {
+            return;
+        };
+        let mut transport = connect(&server).await.expect("started");
+        let reader = transport.reader().await;
+        transport
+            .send_prompt("!spawn-and-hang", &[] as &[&Path])
+            .await
+            .expect("written");
+        let pid = server.child_pid().await.expect("the tool started");
+        let _reap = crate::process::testing::KillOnDrop(pid);
+        tokio::time::timeout(Duration::from_secs(5), reader.next_event())
+            .await
+            .expect("the init frame arrived");
+
+        transport.interrupt().await.expect("interrupt written");
+        transport.terminate().await;
+
+        let interrupt = server
+            .received_matching(1, Duration::from_secs(5), |message| {
+                message["type"] == "control_request"
+            })
+            .await;
+        assert_eq!(
+            interrupt[0]["request"]["subtype"], "interrupt",
+            "{interrupt:?}"
+        );
+        assert!(
+            crate::process::testing::gone_within(pid, Duration::from_secs(5)).await,
+            "the tool Claude started outlived the stop"
+        );
+    }
+
+    #[tokio::test]
+    async fn stderr_that_is_not_text_does_not_stop_its_capture() {
+        // A line reader stopped at the first invalid byte and closed the pipe,
+        // so the CLI's next diagnostic — the one that says why — failed to
+        // write at all.
+        let Some(server) = FakeClaude::new() else {
+            return;
+        };
+        let mut transport = connect(&server).await.expect("started");
+        let reader = transport.reader().await;
+        transport
+            .send_prompt("!noisy-death", &[] as &[&Path])
+            .await
+            .expect("written");
+        let end = tokio::time::timeout(Duration::from_secs(5), reader.wait_for_end())
+            .await
+            .expect("the stream ended");
+        match end {
+            TurnEnd::Vanished { reason } => {
+                assert!(reason.contains("the real reason"), "{reason}")
+            }
+            other => panic!("expected the process's own reason, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_write_accepted_while_input_closes_is_delivered_before_the_close() {
+        // The gate used to be checked under its lock and the write queued after
+        // the lock was released. A close in between queued its `Close` first,
+        // the writer stopped there, and the write the caller had been told was
+        // sent was discarded. The window is the encoding of a large message,
+        // and the writer is held up behind a pipe the process is not reading,
+        // so the `Close` waits in the queue instead of ending it at once.
+        let Some(server) = FakeClaude::new() else {
+            return;
+        };
+        let transport = Arc::new(connect(&server).await.expect("started"));
+        transport
+            .send_prompt("!stall", &[] as &[&Path])
+            .await
+            .expect("written");
+        transport
+            .send_prompt(&"x".repeat(1024 * 1024), &[] as &[&Path])
+            .await
+            .expect("queued behind the full pipe");
+        let writer = transport.clone();
+        let late = tokio::spawn(async move {
+            writer
+                .send_prompt(
+                    &format!("late {}", "y".repeat(4 * 1024 * 1024)),
+                    &[] as &[&Path],
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        transport.close_input().await;
+        let accepted = late.await.unwrap().is_ok();
+
+        server
+            .exited_within(Duration::from_secs(20))
+            .await
+            .expect("the process saw its input close");
+        let delivered = server.received().iter().any(|message| {
+            message["message"]["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("late "))
+        });
+        assert!(
+            !accepted || delivered,
+            "a write the transport accepted never reached the process"
+        );
     }
 
     #[tokio::test]

@@ -5,8 +5,12 @@
 //! reads — the in-memory model should not have to know any of that.
 //!
 //! The rule this file follows throughout: **decoding must never fail because of
-//! one bad value.** A project whose thread list is malformed loses that thread,
-//! not the whole file.
+//! one bad value.** An unknown enum value reads as its default. A project,
+//! thread, workspace, or binding that does not decode at all is set aside and
+//! hidden, not dropped: it is written back unchanged on the next save, so a
+//! file shared with a newer build does not lose what only that build can read.
+
+use std::collections::BTreeMap;
 
 use fx_core::{Agent, AgentAccess, ConversationMessage, Project, Timestamp};
 use serde::{Deserialize, Serialize};
@@ -115,6 +119,138 @@ where
     Ok(serde_json::from_value(value).unwrap_or_default())
 }
 
+/// List elements that did not decode, kept verbatim for the next save.
+///
+/// Skipping them would be quieter, and the next save would then delete them:
+/// a thread written by a newer build would be gone by the time that build read
+/// the file again. They are never shown, only carried, and land at the end of
+/// their list when written back.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Unreadable(BTreeMap<&'static str, Vec<serde_json::Value>>);
+
+impl Unreadable {
+    pub fn is_empty(&self) -> bool {
+        self.0.values().all(Vec::is_empty)
+    }
+
+    /// The elements of one list, by its key in the file.
+    pub fn elements(&self, key: &str) -> &[serde_json::Value] {
+        self.0.get(key).map_or(&[], Vec::as_slice)
+    }
+
+    /// Remove `key`'s list from `object` and decode it one element at a time.
+    ///
+    /// A value that is not a list is left where it is, for the strict decode to
+    /// refuse: there is no element to keep, and guessing would lose it.
+    fn take<T: serde::de::DeserializeOwned>(
+        &mut self,
+        object: &mut serde_json::Value,
+        key: &'static str,
+    ) -> Vec<T> {
+        let Some(map) = object.as_object_mut() else {
+            return Vec::new();
+        };
+        if !map.get(key).is_some_and(serde_json::Value::is_array) {
+            return Vec::new();
+        }
+        let Some(serde_json::Value::Array(elements)) = map.remove(key) else {
+            return Vec::new();
+        };
+        let mut readable = Vec::with_capacity(elements.len());
+        for element in elements {
+            match T::deserialize(&element) {
+                Ok(value) => readable.push(value),
+                Err(error) => {
+                    tracing::warn!(list = key, %error, "keeping a saved entry this build cannot read");
+                    self.0.entry(key).or_default().push(element);
+                }
+            }
+        }
+        readable
+    }
+
+    /// Append every kept element to its list in `object`.
+    fn restore(&self, object: &mut serde_json::Value) {
+        let Some(map) = object.as_object_mut() else {
+            return;
+        };
+        for (key, elements) in &self.0 {
+            if elements.is_empty() {
+                continue;
+            }
+            let list = map
+                .entry(*key)
+                .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+            if let serde_json::Value::Array(list) = list {
+                list.extend(elements.iter().cloned());
+            }
+        }
+    }
+
+    /// Serialize through the derived impl, then put the kept elements back.
+    fn write_back<S: serde::Serializer>(
+        &self,
+        derived: Result<serde_json::Value, serde_json::Error>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let mut value = derived.map_err(serde::ser::Error::custom)?;
+        self.restore(&mut value);
+        value.serialize(serializer)
+    }
+}
+
+// `Self::deserialize` and `Self::serialize` below are the derived, strict impls
+// that `remote = "Self"` generates as inherent functions. Calling the trait
+// instead would recurse.
+
+impl<'de> Deserialize<'de> for PersistedApp {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut value = serde_json::Value::deserialize(deserializer)?;
+        let mut unreadable = Unreadable::default();
+        let projects = unreadable.take(&mut value, "projects");
+        let mut app = Self::deserialize(value).map_err(serde::de::Error::custom)?;
+        app.projects = projects;
+        app.unreadable = unreadable;
+        Ok(app)
+    }
+}
+
+impl Serialize for PersistedApp {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.unreadable.is_empty() {
+            return Self::serialize(self, serializer);
+        }
+        let derived = Self::serialize(self, serde_json::value::Serializer);
+        self.unreadable.write_back(derived, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for PersistedProject {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut value = serde_json::Value::deserialize(deserializer)?;
+        let mut unreadable = Unreadable::default();
+        let agents = unreadable.take(&mut value, "agents");
+        let workspaces = unreadable.take(&mut value, "workspaces");
+        let native_bindings = unreadable.take(&mut value, "native_bindings");
+        let mut record = Self::deserialize(value).map_err(serde::de::Error::custom)?;
+        record.agents = agents;
+        record.workspaces = workspaces;
+        record.native_bindings = native_bindings;
+        record.unreadable = unreadable;
+        Ok(record)
+    }
+}
+
+impl Serialize for PersistedProject {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.unreadable.is_empty() {
+            return Self::serialize(self, serializer);
+        }
+        let derived = Self::serialize(self, serde_json::value::Serializer);
+        self.unreadable.write_back(derived, serializer)
+    }
+}
+
 /// User preferences use stable strings so storage stays independent of UI types.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -129,6 +265,9 @@ pub struct PersistedPreferences {
     pub claude_defaults: ProviderDefaults,
     #[serde(deserialize_with = "deserialize_or_default")]
     pub auto_titles: AutoTitlePreferences,
+    /// What a prompt sent while a turn runs does: `"steer"` guides the running
+    /// turn, `"queue"` waits for it. Steering by default, as the original.
+    pub follow_up_mode: String,
 }
 
 impl Default for PersistedPreferences {
@@ -141,6 +280,7 @@ impl Default for PersistedPreferences {
             codex_defaults: ProviderDefaults::default(),
             claude_defaults: ProviderDefaults::default(),
             auto_titles: AutoTitlePreferences::default(),
+            follow_up_mode: "steer".into(),
         }
     }
 }
@@ -148,10 +288,17 @@ impl Default for PersistedPreferences {
 // ── Projects ───────────────────────────────────────────────────────────────
 
 /// The project and layout snapshot.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// The derives are `remote = "Self"` so the hand-written impls below can wrap
+/// them: the `projects` list is decoded one element at a time first.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub struct PersistedApp {
     #[serde(default)]
     pub projects: Vec<PersistedProject>,
+    /// Projects this build could not read, written back unchanged.
+    #[serde(skip)]
+    pub unreadable: Unreadable,
     #[serde(rename = "activeProjectId")]
     pub active_project_id: Option<Uuid>,
     #[serde(rename = "activeAgentId")]
@@ -175,6 +322,14 @@ pub struct PersistedApp {
     pub max_right_panel_width: f32,
     #[serde(rename = "rightPanelTab", default)]
     pub right_panel_tab: RightPanelTab,
+    /// Where the main window was. Absent until the window first moves.
+    #[serde(
+        rename = "windowFrame",
+        default,
+        deserialize_with = "deserialize_or_default",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub window_frame: Option<crate::window::PersistedWindowFrame>,
 }
 
 /// `Default` is written by hand rather than derived so that a caller
@@ -185,6 +340,7 @@ impl Default for PersistedApp {
     fn default() -> Self {
         Self {
             projects: Vec::new(),
+            unreadable: Unreadable::default(),
             active_project_id: None,
             active_agent_id: None,
             sidebar_visible: default_true(),
@@ -194,6 +350,7 @@ impl Default for PersistedApp {
             min_right_panel_width: default_min_panel_width(),
             max_right_panel_width: default_max_panel_width(),
             right_panel_tab: RightPanelTab::default(),
+            window_frame: None,
         }
     }
 }
@@ -243,11 +400,18 @@ pub enum RightPanelTab {
 }
 
 /// One project's persisted state.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// `remote = "Self"` for the same reason as `PersistedApp`: its thread,
+/// workspace, and binding lists are decoded one element at a time.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub struct PersistedProject {
     pub project: Option<Project>,
     #[serde(default)]
     pub agents: Vec<Agent>,
+    /// Threads, workspaces, and bindings this build could not read.
+    #[serde(skip)]
+    pub unreadable: Unreadable,
     /// Only chats created by FlowX are eligible. Removing an ID before a
     /// request is persisted ensures restart cannot repeat a paid title call.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -277,10 +441,14 @@ pub struct PersistedProject {
     pub missing_native_agent_ids: Vec<Uuid>,
     #[serde(rename = "nativePresentationIds", default)]
     pub native_presentation_ids: Vec<PersistedPresentation>,
+    /// Threads whose turn finished while another thread was selected. The
+    /// sidebar marks each one until it is opened, including after a relaunch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unseen_completion_ids: Vec<Uuid>,
 }
 
 /// Per-thread layout.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PersistedWorkspace {
     #[serde(rename = "agentId")]
     pub agent_id: Uuid,
@@ -341,7 +509,7 @@ pub enum SplitContent {
 }
 
 /// A binding to a provider-native thread.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PersistedBinding {
     #[serde(rename = "agentId")]
     pub agent_id: Uuid,
@@ -359,7 +527,12 @@ pub struct PersistedBinding {
     pub model: Option<String>,
     #[serde(default)]
     pub effort: Option<String>,
-    #[serde(rename = "agentAccess", default)]
+    /// A level this build does not know reads as unset, never as the widest.
+    #[serde(
+        rename = "agentAccess",
+        default,
+        deserialize_with = "deserialize_or_default"
+    )]
     pub agent_access: Option<AgentAccess>,
     #[serde(rename = "isArchived", default)]
     pub is_archived: bool,
@@ -388,7 +561,7 @@ pub struct PersistedThreadOverride {
 }
 
 /// A remembered presentation for a provider thread that is not loaded.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PersistedPresentation {
     #[serde(rename = "providerId")]
     pub provider_id: String,
@@ -542,6 +715,10 @@ pub struct PersistedConversation {
     /// Text still in the composer, independent of a submitted prompt awaiting acknowledgment.
     #[serde(rename = "draftText", default)]
     pub draft_text: String,
+    /// The thread's goal as the provider last reported it, so the row above
+    /// the composer is there before the provider is asked again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<fx_core::models::ConversationGoal>,
 }
 
 /// A prompt that failed to send.
@@ -565,6 +742,7 @@ impl PersistedConversation {
             || !self.draft_text.is_empty()
             || self.session_id.is_some()
             || self.total_tokens > 0
+            || self.goal.is_some()
     }
 
     /// Build a persisted record from a thread's messages.
@@ -588,6 +766,7 @@ impl PersistedConversation {
             reported_context_window: None,
             unsent_prompt: None,
             draft_text: String::new(),
+            goal: None,
         }
     }
 }
@@ -1019,6 +1198,26 @@ mod tests {
     }
 
     #[test]
+    fn a_goal_survives_a_round_trip_and_old_files_have_none() {
+        let goal = fx_core::models::ConversationGoal::from_codex(&serde_json::json!({
+            "threadId": "t", "objective": "Ship it", "status": "active"
+        }))
+        .unwrap();
+        let persisted = PersistedConversation {
+            goal: Some(goal.clone()),
+            ..PersistedConversation::from_messages(Uuid::nil(), Vec::new())
+        };
+        let bytes = serde_json::to_vec(&persisted).unwrap();
+        let read: PersistedConversation = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(read.goal, Some(goal));
+        let legacy: PersistedConversation =
+            serde_json::from_str(r#"{"agentId":"00000000-0000-0000-0000-000000000000"}"#).unwrap();
+        assert_eq!(legacy.goal, None);
+        let preferences: PersistedPreferences = serde_json::from_str("{}").unwrap();
+        assert_eq!(preferences.follow_up_mode, "steer");
+    }
+
+    #[test]
     fn an_unsent_draft_alone_makes_a_transcript_worth_writing() {
         let persisted = PersistedConversation {
             unsent_prompt: Some(PersistedUnsentPrompt::new("draft".into(), 1, None)),
@@ -1067,6 +1266,100 @@ mod tests {
         assert!(app.sidebar_visible, "the default should be visible");
         assert_eq!(app.sidebar_width, 248.0);
         assert!(!app.right_panel_visible);
+    }
+
+    /// A project file as a build with values this one does not know wrote it.
+    fn file_with_entries_this_build_cannot_read(root: &str) -> serde_json::Value {
+        let agent = Uuid::from_u128(1);
+        serde_json::json!({
+            "projects": [
+                {
+                    "project": serde_json::to_value(Project::new(root)).unwrap(),
+                    "agents": [
+                        {"id": agent, "title": "Readable",
+                         "created_at": "2026-01-01T00:00:00Z",
+                         "execution_state": "cancelled",
+                         "configuration": {"agent_access": "readOnly"}},
+                        {"id": "not-a-uuid", "title": "From a newer build",
+                         "created_at": "2026-01-01T00:00:00Z"}
+                    ],
+                    "workspaces": [
+                        {"agentId": agent},
+                        {"agentId": agent, "terminalCount": "three"}
+                    ],
+                    "native_bindings": [
+                        {"agentId": agent, "providerId": "codex", "sessionId": "s1",
+                         "updatedAt": "2026-01-01T00:00:00Z", "agentAccess": "readOnly"},
+                        {"agentId": agent, "providerId": "codex"}
+                    ]
+                },
+                {"project": {"id": 7, "rootPath": ["not", "a", "path"]}}
+            ],
+            "activeProjectId": null,
+            "activeAgentId": null
+        })
+    }
+
+    #[test]
+    fn values_from_a_newer_build_cost_only_the_entries_that_hold_them() {
+        // One unknown value used to fail the whole file, and the backup holds
+        // the same bytes, so every project disappeared.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_string_lossy().into_owned();
+        let app: PersistedApp =
+            serde_json::from_value(file_with_entries_this_build_cannot_read(&root)).unwrap();
+
+        assert_eq!(app.projects.len(), 1);
+        assert_eq!(app.unreadable.elements("projects").len(), 1);
+        let record = &app.projects[0];
+        assert_eq!(record.agents.len(), 1);
+        assert_eq!(
+            record.agents[0].execution_state,
+            fx_core::AgentExecutionState::Idle
+        );
+        assert_eq!(record.agents[0].configuration.agent_access, None);
+        assert_eq!(record.workspaces.len(), 1);
+        assert_eq!(record.native_bindings.len(), 1);
+        assert_eq!(record.native_bindings[0].agent_access, None);
+        for key in ["agents", "workspaces", "native_bindings"] {
+            assert_eq!(record.unreadable.elements(key).len(), 1, "{key}");
+        }
+    }
+
+    #[test]
+    fn an_entry_this_build_cannot_read_is_written_back_unchanged() {
+        // Skipping it and saving would delete it for the build that wrote it.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_string_lossy().into_owned();
+        let original = file_with_entries_this_build_cannot_read(&root);
+        let mut app: PersistedApp = serde_json::from_value(original.clone()).unwrap();
+        app.projects[0].agents[0].title = "Renamed here".into();
+
+        let written = serde_json::to_value(&app).unwrap();
+        assert_eq!(written["projects"][1], original["projects"][1]);
+        let project = &written["projects"][0];
+        assert_eq!(project["agents"][0]["title"], "Renamed here");
+        for key in ["agents", "workspaces", "native_bindings"] {
+            assert_eq!(project[key][1], original["projects"][0][key][1], "{key}");
+        }
+
+        // And again, as a second save reads the first one back.
+        let reread: PersistedApp = serde_json::from_value(written.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&reread).unwrap(), written);
+    }
+
+    #[test]
+    fn a_list_that_is_not_a_list_still_fails_its_record() {
+        // There is no element to set aside, so refusing is the only way to keep
+        // the value: the record is then kept whole by the list around it.
+        let decoded: PersistedApp =
+            serde_json::from_str(r#"{"projects":[{"agents":{"oops":true}}]}"#).unwrap();
+        assert!(decoded.projects.is_empty());
+        assert_eq!(
+            decoded.unreadable.elements("projects"),
+            &[serde_json::json!({"agents": {"oops": true}})]
+        );
+        assert!(serde_json::from_str::<PersistedApp>(r#"{"projects":{}}"#).is_err());
     }
 
     #[test]

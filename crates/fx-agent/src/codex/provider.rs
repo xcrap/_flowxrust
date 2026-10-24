@@ -99,9 +99,9 @@ impl CodexProvider {
     /// The whole operation has one deadline, including handshake and pagination.
     pub async fn discover_models(&self) -> Result<Vec<Model>, ProviderError> {
         tokio::time::timeout(PROBE_TIMEOUT, async {
-            let transport = self.start_session().await?;
-            let result = list_models_with(&transport).await;
-            transport.close().await;
+            let connection = MetadataConnection::open(self).await?;
+            let result = list_models_with(&connection.transport).await;
+            connection.close().await;
             result
         })
         .await
@@ -145,6 +145,47 @@ impl CodexProvider {
     /// The launch specification, before resolution.
     pub fn launch_spec(&self) -> &BinarySpec {
         &self.spec
+    }
+}
+
+/// A short-lived connection for one metadata request.
+///
+/// Nobody reads a metadata connection's notifications, and the queue they land
+/// in is bounded: once more than it holds arrive ahead of the reply, the
+/// reader stops, the reply is never read, and the request waits out its
+/// timeout. So the queue is drained for the life of the connection, server
+/// requests are refused rather than left blocking the server, and the process
+/// is closed afterwards instead of lingering until it is dropped.
+struct MetadataConnection {
+    transport: std::sync::Arc<Transport>,
+    drain: tokio::task::JoinHandle<()>,
+}
+
+impl MetadataConnection {
+    async fn open(provider: &CodexProvider) -> Result<Self, ProviderError> {
+        let mut transport = provider.start_session().await?;
+        let mut events = transport.take_events();
+        let transport = std::sync::Arc::new(transport);
+        let weak = std::sync::Arc::downgrade(&transport);
+        let drain = tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                if let crate::codex::transport::ServerEvent::Request { id, .. } = event
+                    && let Some(transport) = weak.upgrade()
+                {
+                    let _ = transport.refuse(
+                        id,
+                        -32601,
+                        "A metadata request does not run tools or answer prompts.",
+                    );
+                }
+            }
+        });
+        Ok(Self { transport, drain })
+    }
+
+    async fn close(self) {
+        self.transport.close().await;
+        self.drain.abort();
     }
 }
 
@@ -272,20 +313,24 @@ impl Provider for CodexProvider {
         &self,
         working_directory: &str,
     ) -> Result<Vec<ThreadSummary>, ProviderError> {
-        let transport = self.start_session().await?;
-        list_threads_with(&transport, working_directory).await
+        let connection = MetadataConnection::open(self).await?;
+        let result = list_threads_with(&connection.transport, working_directory).await;
+        connection.close().await;
+        result
     }
 
     async fn read_thread(&self, identity: &ThreadIdentity) -> Result<String, ProviderError> {
-        let transport = self.start_session().await?;
-        let result = transport
+        let connection = MetadataConnection::open(self).await?;
+        let result = connection
+            .transport
             .request(
                 "thread/read",
                 Some(json!({ "threadId": identity.session_id })),
             )
             .await
-            .map_err(map_transport_error)?;
-        Ok(thread_transcript(&result))
+            .map_err(map_transport_error);
+        connection.close().await;
+        Ok(thread_transcript(&result?))
     }
 }
 
@@ -563,6 +608,49 @@ mod tests {
             .expect("a session over the fake server");
         transport.close().await;
         drop(provider);
+    }
+
+    #[tokio::test]
+    async fn metadata_requests_are_answered_through_a_notification_flood() {
+        // More notifications ahead of the reply than the transport queues.
+        // Nothing drained them, so the reader stopped with the reply unread and
+        // every metadata request waited out its timeout.
+        let Some(server) = FakeServer::new() else {
+            return;
+        };
+        std::fs::write(server.file("flood"), "").unwrap();
+        let python = std::process::Command::new("/usr/bin/env")
+            .arg("which")
+            .arg("python3")
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .expect("python3 is on PATH");
+        let script = server.script_path().to_string_lossy().into_owned();
+        let provider = CodexProvider::with_spec(
+            RuntimeDiscovery::default().without_extra_directories(),
+            BinarySpec::new("codex", "Codex", vec![python]).with_arguments(vec![script]),
+        );
+        let budget = std::time::Duration::from_secs(10);
+
+        let models = tokio::time::timeout(budget, provider.discover_models())
+            .await
+            .expect("model discovery was not stalled")
+            .expect("models");
+        assert_eq!(models.len(), 2, "{models:?}");
+        let threads = tokio::time::timeout(budget, provider.list_threads("/tmp/project"))
+            .await
+            .expect("the listing was not stalled")
+            .expect("threads");
+        assert_eq!(threads.len(), 1, "{threads:?}");
+        let identity = ThreadIdentity {
+            provider_id: "codex".into(),
+            session_id: "thread-a".into(),
+        };
+        let transcript = tokio::time::timeout(budget, provider.read_thread(&identity))
+            .await
+            .expect("the read was not stalled")
+            .expect("a transcript");
+        assert_eq!(transcript, "hello\n\nhi");
     }
 
     #[tokio::test]

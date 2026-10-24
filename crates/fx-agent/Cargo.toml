@@ -10,6 +10,7 @@ description = "FlowX providers (Codex, Claude) and the conversation engine."
 base64.workspace = true
 chrono.workspace = true
 fx-core.workspace = true
+libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
@@ -20,4 +21,4 @@ async-trait.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", "io-util", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", "io-util", "time", "test-util"] }

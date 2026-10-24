@@ -103,6 +103,26 @@ for line in sys.stdin:
             waiting.extend(["req-a", "req-b"])
         elif behaviour == "hang":
             emit_init()
+        elif behaviour == "stall":
+            # Stops reading for a moment, so FlowX's next writes back up
+            # behind a full pipe.
+            import time
+            time.sleep(1.0)
+        elif behaviour == "spawn-and-hang":
+            # A tool Claude started, in Claude's own process group, still
+            # running when the user presses Stop.
+            import subprocess
+            child = subprocess.Popen(["sleep", "60"])
+            with open(os.path.join(os.path.dirname(RECEIVED), "child.pid"), "w") as handle:
+                handle.write(str(child.pid))
+            emit_init()
+        elif behaviour == "noisy-death":
+            # Not UTF-8 and `\r`-only progress, then the reason, then the exit.
+            sys.stderr.buffer.write(b"\xff\xfe not text\r50%\r60%\r\n")
+            sys.stderr.buffer.flush()
+            import time
+            time.sleep(0.2)
+            die(7, "the real reason")
         elif behaviour == "error":
             emit_init()
             send({"type": "result", "is_error": True, "result": "hit a limit"})
@@ -228,6 +248,24 @@ impl FakeClaude {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// The pid of the tool `!spawn-and-hang` started, once it has started.
+    pub async fn child_pid(&self) -> Option<i32> {
+        let path = self.received.with_file_name("child.pid");
+        tokio::time::timeout(STARTUP_TIMEOUT, async {
+            loop {
+                if let Some(pid) = std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|text| text.trim().parse().ok())
+                {
+                    return pid;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .ok()
     }
 
     /// Every message the server received, oldest first.

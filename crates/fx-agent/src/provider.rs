@@ -87,6 +87,10 @@ pub struct ThreadSummary {
 pub enum ProviderEvent {
     Lifecycle(Lifecycle),
     TextDelta(String),
+    /// The message the deltas were building is complete; the next delta
+    /// starts a new one.
+    TextEnd,
+    /// A whole message that did not stream.
     Text(String),
     ToolUse {
         id: String,
@@ -100,7 +104,11 @@ pub enum ProviderEvent {
     },
     Approval(ApprovalRequest),
     UserInput(UserInputRequest),
+    /// Usage for one turn, added to the thread's totals.
     Usage(Usage),
+    /// The thread's running totals as the provider counts them, which replace
+    /// rather than add to what the conversation holds.
+    CumulativeUsage(Usage),
     ContextUsage {
         used: u64,
         window: u64,

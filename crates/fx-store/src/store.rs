@@ -127,6 +127,23 @@ impl Store {
         Ok(())
     }
 
+    /// Write a transcript that was encoded with [`EncodedConversation::new`].
+    pub fn save_encoded_conversation(
+        &self,
+        project_id: Uuid,
+        agent_id: Uuid,
+        encoded: &EncodedConversation,
+    ) -> Result<(), SaveError> {
+        write::write_atomically(&self.paths.conversation_file(project_id, agent_id), encoded)?;
+        Ok(())
+    }
+
+    /// Whether a thread has a transcript or recovery copy, without reading it.
+    pub fn has_conversation(&self, project_id: Uuid, agent_id: Uuid) -> bool {
+        let path = self.paths.conversation_file(project_id, agent_id);
+        path.exists() || write::has_backup(&path)
+    }
+
     /// Remove one thread's transcript.
     pub fn delete_conversation(&self, project_id: Uuid, agent_id: Uuid) -> std::io::Result<()> {
         write::remove(&self.paths.conversation_file(project_id, agent_id))
@@ -215,6 +232,29 @@ impl Store {
             }
         }
         Ok(removed)
+    }
+}
+
+/// A transcript in its on-disk encoding.
+///
+/// Encoded once so a caller can measure it against
+/// [`crate::format::MAX_CONVERSATION_BYTES`] and compare it with what it last
+/// wrote before deciding to write it. Measure these bytes, not a more compact
+/// encoding: a later read is bounded by the file as written, so a smaller
+/// measure would let through a file that could not be read back.
+pub struct EncodedConversation(Vec<u8>);
+
+impl EncodedConversation {
+    pub fn new(conversation: &PersistedConversation) -> Result<Self, serde_json::Error> {
+        Ok(Self(serde_json::to_vec_pretty(conversation)?))
+    }
+}
+
+impl std::ops::Deref for EncodedConversation {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.0
     }
 }
 
@@ -378,6 +418,42 @@ mod tests {
     }
 
     #[test]
+    fn a_newer_builds_entries_survive_a_load_and_save_without_hiding_the_rest() {
+        let (store, _temp) = store();
+        let mut app = populated();
+        let thread = fx_core::Agent::new("Readable");
+        app.projects[0].agents.push(thread.clone());
+        let mut file = serde_json::to_value(&app).unwrap();
+        file["projects"][0]["agents"][0]["execution_state"] = serde_json::json!("cancelled");
+        let foreign_thread = serde_json::json!({"id": "from-a-newer-build", "title": "Kept"});
+        let foreign_project = serde_json::json!({"project": {"rootPath": 42}});
+        file["projects"][0]["agents"]
+            .as_array_mut()
+            .unwrap()
+            .push(foreign_thread.clone());
+        file["projects"]
+            .as_array_mut()
+            .unwrap()
+            .push(foreign_project.clone());
+        // Both copies hold the same bytes, as they do after any save.
+        let bytes = serde_json::to_vec(&file).unwrap();
+        std::fs::write(store.paths().projects_file(), &bytes).unwrap();
+        std::fs::write(write::backup_path(&store.paths().projects_file()), &bytes).unwrap();
+
+        let loaded = store.load_app().unwrap();
+        assert_eq!(loaded.projects.len(), 1);
+        assert_eq!(loaded.projects[0].agents.len(), 1);
+        assert_eq!(loaded.projects[0].agents[0].id, thread.id);
+
+        store.save_app(&loaded).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(store.paths().projects_file()).unwrap()).unwrap();
+        assert_eq!(saved["projects"][1], foreign_project);
+        assert_eq!(saved["projects"][0]["agents"][1], foreign_thread);
+        assert_eq!(saved["projects"][0]["agents"][0]["execution_state"], "idle");
+    }
+
+    #[test]
     fn a_snapshot_is_repaired_on_read() {
         // A geometry value that could not be opened is repaired before it is
         // ever used, so it is not just repaired on the next write.
@@ -432,6 +508,40 @@ mod tests {
         let loaded = store.load_conversation(project, agent).unwrap().unwrap();
         assert_eq!(loaded.messages.len(), 1);
         assert_eq!(loaded.messages[0].text_content(), "hello");
+    }
+
+    #[test]
+    fn an_encoded_transcript_is_written_as_measured_and_seen_without_a_read() {
+        let (store, _temp) = store();
+        let (project, agent) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        assert!(!store.has_conversation(project, agent));
+        let encoded = EncodedConversation::new(&PersistedConversation::from_messages(
+            agent,
+            vec![message("hello")],
+        ))
+        .unwrap();
+        store
+            .save_encoded_conversation(project, agent, &encoded)
+            .unwrap();
+        let path = store.paths().conversation_file(project, agent);
+        // The limit is checked against these bytes, so they must be the file.
+        assert_eq!(std::fs::read(&path).unwrap(), &*encoded);
+        assert_eq!(std::fs::read(write::backup_path(&path)).unwrap(), &*encoded);
+        assert!(store.has_conversation(project, agent));
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            store.has_conversation(project, agent),
+            "the backup still counts"
+        );
+        assert_eq!(
+            store
+                .load_conversation(project, agent)
+                .unwrap()
+                .unwrap()
+                .messages[0]
+                .text_content(),
+            "hello"
+        );
     }
 
     #[test]

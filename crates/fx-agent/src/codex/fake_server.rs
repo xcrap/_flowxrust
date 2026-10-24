@@ -22,6 +22,17 @@ def send(obj):
     sys.stdout.write(json.dumps(obj) + "\n")
     sys.stdout.flush()
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+with open(os.path.join(HERE, "server.pid"), "w") as pid:
+    pid.write(str(os.getpid()))
+
+def flood():
+    # More notifications than the transport queues, ahead of a reply: a caller
+    # that never drains them never sees the reply either.
+    if os.path.exists(os.path.join(HERE, "flood")):
+        for n in range(2000):
+            send({"jsonrpc": "2.0", "method": "codex/event", "params": {"n": n}})
+
 for line in sys.stdin:
     line = line.strip()
     if not line:
@@ -48,6 +59,7 @@ for line in sys.stdin:
         send({"jsonrpc": "2.0", "method": "item/agentMessage/delta", "params": {"delta": json.dumps(msg)}})
         send({"jsonrpc": "2.0", "method": "turn/completed", "params": {"turn": {"id": "turn-1", "status": "completed"}}})
     elif method == "model/list":
+        flood()
         if (msg.get("params") or {}).get("cursor"):
             data = [{"id": "model-second", "displayName": "Second", "inputModalities": ["text"]}]
             cursor = None
@@ -65,6 +77,16 @@ for line in sys.stdin:
     elif method == "slow":
         time.sleep(0.2)
         send({"jsonrpc": "2.0", "id": mid, "result": {"slow": True}})
+    elif method == "spawn-child":
+        # A tool the server started, in the server's own process group.
+        import subprocess
+        child = subprocess.Popen(["sleep", "60"])
+        send({"jsonrpc": "2.0", "id": mid, "result": {"pid": child.pid}})
+    elif method == "stderr-noise":
+        # Not UTF-8, and progress that only ever returns the carriage.
+        sys.stderr.buffer.write(b"\xff\xfe not text\r50%\r60%\r\n")
+        sys.stderr.buffer.flush()
+        send({"jsonrpc": "2.0", "id": mid, "result": {"noisy": True}})
     elif method == "refuse":
         send({"jsonrpc": "2.0", "id": mid,
               "error": {"code": -32601, "message": "Method not found"}})
@@ -77,6 +99,9 @@ for line in sys.stdin:
         for item in (msg.get("params") or {}).get("input") or []:
             if item.get("type") == "text":
                 prompt = item.get("text") or ""
+        if prompt == "slow-ack":
+            # Long enough for a Stop to arrive between the request and its reply.
+            time.sleep(0.3)
         send({"jsonrpc": "2.0", "id": mid, "result": {"turn": {"id": "turn-1"}}})
         thread = (msg.get("params") or {}).get("threadId")
 
@@ -84,10 +109,21 @@ for line in sys.stdin:
             send({"jsonrpc": "2.0", "method": "turn/completed",
                   "params": {"turn": {"id": "turn-1", "status": "failed",
                                       "error": {"message": "the model refused"}}}})
-        elif prompt == "hang":
+        elif prompt in ("hang", "slow-ack"):
             # Starts, says nothing, and never completes.
             send({"jsonrpc": "2.0", "method": "turn/started",
                   "params": {"turn": {"id": "turn-1"}}})
+        elif prompt == "quiet":
+            # Silent for as long as the test likes — a `sleep 200`, a quiet
+            # build — and then finishes normally.
+            send({"jsonrpc": "2.0", "method": "turn/started",
+                  "params": {"turn": {"id": "turn-1"}}})
+            while not os.path.exists(os.path.join(HERE, "release-quiet")):
+                time.sleep(0.005)
+            send({"jsonrpc": "2.0", "method": "item/agentMessage/delta",
+                  "params": {"delta": "finished after quiet work"}})
+            send({"jsonrpc": "2.0", "method": "turn/completed",
+                  "params": {"turn": {"id": "turn-1", "status": "completed"}}})
         elif prompt == "die-mid-turn":
             send({"jsonrpc": "2.0", "method": "turn/started",
                   "params": {"turn": {"id": "turn-1"}}})
@@ -143,8 +179,12 @@ for line in sys.stdin:
                   "params": {"turn": {"id": "turn-1", "status": "completed",
                                       "usage": {"input_tokens": 12, "output_tokens": 3}}}})
     elif method == "turn/interrupt":
+        # Recorded, so a test can see which turn it was asked to stop.
+        with open("HANDSHAKE_LOG", "a") as log:
+            log.write(json.dumps({"method": method, "params": msg.get("params")}) + "\n")
         send({"jsonrpc": "2.0", "id": mid, "result": {}})
     elif method == "thread/list":
+        flood()
         if os.environ.get("FAKE_NO_LIST"):
             send({"jsonrpc": "2.0", "id": mid,
                   "error": {"code": -32601, "message": "Method not found"}})
@@ -169,6 +209,7 @@ for line in sys.stdin:
                  "updatedAt": 1735689600000}],
                 **({"nextCursor": os.environ["FAKE_PAGES"]} if os.environ.get("FAKE_PAGES") else {})}})
     elif method == "thread/read":
+        flood()
         send({"jsonrpc": "2.0", "id": mid, "result": {"thread": {"turns": [
             {"items": [{"type": "userMessage", "text": "hello"},
                        {"type": "agentMessage", "text": "hi"}]}]}}})
@@ -251,6 +292,12 @@ impl FakeServer {
         } else {
             Err(String::from_utf8_lossy(&output.stderr).into_owned())
         }
+    }
+
+    /// A file beside the script: where the server writes its pid and looks for
+    /// the markers that change its behaviour (`flood`, `release-quiet`).
+    pub fn file(&self, name: &str) -> std::path::PathBuf {
+        self.script.with_file_name(name)
     }
 
     /// The absolute path of the runnable script.

@@ -417,14 +417,16 @@ enum SettingsPage {
     #[default]
     Appearance,
     Providers,
+    Shortcuts,
     Archives,
 }
 
 impl SettingsPage {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::ChatDefaults,
         Self::Appearance,
         Self::Providers,
+        Self::Shortcuts,
         Self::Archives,
     ];
 
@@ -433,6 +435,7 @@ impl SettingsPage {
             Self::ChatDefaults => "Chat defaults",
             Self::Appearance => "Appearance",
             Self::Providers => "Providers",
+            Self::Shortcuts => "Shortcuts",
             Self::Archives => "Archived chats",
         }
     }
@@ -442,6 +445,7 @@ impl SettingsPage {
             Self::ChatDefaults => "chat-defaults",
             Self::Appearance => "appearance",
             Self::Providers => "providers",
+            Self::Shortcuts => "shortcuts",
             Self::Archives => "archives",
         }
     }
@@ -451,6 +455,7 @@ impl SettingsPage {
             Self::ChatDefaults => Icon::BUBBLE_LEFT_AND_BUBBLE_RIGHT,
             Self::Appearance => Icon::GEARSHAPE,
             Self::Providers => Icon::TERMINAL,
+            Self::Shortcuts => Icon::KEYBOARD,
             Self::Archives => Icon::ARCHIVEBOX,
         }
     }
@@ -479,6 +484,9 @@ pub struct SettingsSheet {
     title_settings: Option<Entity<crate::title_settings::TitleSettings>>,
     title_settings_dirty: bool,
     title_settings_subscription: Option<Subscription>,
+    follow_up: Option<Entity<crate::follow_up_settings::FollowUpSettings>>,
+    follow_up_dirty: bool,
+    follow_up_subscription: Option<Subscription>,
     archives: Option<Entity<crate::archived_chats::ArchivedChats>>,
     page: SettingsPage,
     /// Set once either outcome has been reported.
@@ -520,6 +528,9 @@ impl SettingsSheet {
             title_settings: None,
             title_settings_dirty: false,
             title_settings_subscription: None,
+            follow_up: None,
+            follow_up_dirty: false,
+            follow_up_subscription: None,
             archives: None,
             page: SettingsPage::default(),
             settled: false,
@@ -570,7 +581,9 @@ impl SettingsSheet {
     fn page_available(&self, page: SettingsPage) -> bool {
         match page {
             SettingsPage::ChatDefaults => {
-                self.provider_defaults.is_some() || self.title_settings.is_some()
+                self.provider_defaults.is_some()
+                    || self.title_settings.is_some()
+                    || self.follow_up.is_some()
             }
             SettingsPage::Archives => self.archives.is_some(),
             _ => true,
@@ -591,6 +604,11 @@ impl SettingsSheet {
             self.focus.focus(window);
         }
         cx.notify();
+    }
+
+    /// Show the archived chats, for the Threads menu's "Archived chats…".
+    pub(crate) fn show_archives(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_page(SettingsPage::Archives, window, cx);
     }
 
     pub(crate) fn provider_defaults(
@@ -616,6 +634,28 @@ impl SettingsSheet {
 
     pub(crate) fn title_settings(&self) -> Option<Entity<crate::title_settings::TitleSettings>> {
         self.title_settings.clone()
+    }
+
+    /// Show the "While responding" choice on the chat defaults page.
+    pub(crate) fn set_follow_up_settings(
+        &mut self,
+        editor: Entity<crate::follow_up_settings::FollowUpSettings>,
+        cx: &mut Context<Self>,
+    ) {
+        self.follow_up_dirty = editor.read(cx).is_dirty();
+        self.follow_up_subscription = Some(cx.observe(&editor, |sheet, editor, cx| {
+            sheet.follow_up_dirty = editor.read(cx).is_dirty();
+            cx.notify();
+        }));
+        self.follow_up = Some(editor);
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn follow_up_settings(
+        &self,
+    ) -> Option<Entity<crate::follow_up_settings::FollowUpSettings>> {
+        self.follow_up.clone()
     }
 
     fn settings_menu_is_open(&self, cx: &App) -> bool {
@@ -652,6 +692,7 @@ impl SettingsSheet {
         self.draft.is_dirty_against(&self.baseline)
             || self.provider_defaults_dirty
             || self.title_settings_dirty
+            || self.follow_up_dirty
     }
 
     /// Whether Reset has anything to undo.
@@ -715,6 +756,10 @@ impl SettingsSheet {
             editor.update(cx, |editor, cx| editor.reset(cx));
         }
         self.title_settings_dirty = false;
+        if let Some(editor) = &self.follow_up {
+            editor.update(cx, |editor, cx| editor.reset(cx));
+        }
+        self.follow_up_dirty = false;
         self.preview();
         cx.refresh_windows();
         cx.notify();
@@ -879,10 +924,12 @@ impl SettingsSheet {
                 .flex_col()
                 .gap(px_len(Spacing::XXL))
                 .children(self.provider_defaults.clone())
+                .children(self.follow_up.clone())
                 .children(self.title_settings.clone())
                 .into_any_element(),
             SettingsPage::Appearance => self.appearance_section(this),
             SettingsPage::Providers => self.provider_section(this),
+            SettingsPage::Shortcuts => shortcuts_section(),
             SettingsPage::Archives => div()
                 .w_full()
                 .flex()
@@ -1114,6 +1161,69 @@ impl SettingsSheet {
             ))
             .into_any_element()
     }
+}
+
+/// Every key FlowX binds, grouped as the menus group them.
+///
+/// Drawn from the same table that registers the keys, so the page cannot list a
+/// shortcut that does nothing or miss one that does.
+fn shortcuts_section() -> AnyElement {
+    let theme = global::current();
+    let table = crate::commands::key_bindings();
+    let mut section = div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(px_len(Spacing::LG))
+        .child(section_header("Shortcuts"))
+        .child(
+            div()
+                .fx_caption()
+                .text_color(Colors::fg_secondary(&theme))
+                .child("The menus show the same keys beside each command."),
+        );
+    for group in crate::commands::ShortcutGroup::ALL {
+        let rows: Vec<_> = table
+            .iter()
+            .filter(|shortcut| shortcut.group == group)
+            .collect();
+        if rows.is_empty() {
+            continue;
+        }
+        let mut list = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px_len(Spacing::XS))
+            .child(
+                div()
+                    .fx_overline()
+                    .text_color(Colors::fg_tertiary(&theme))
+                    .child(group.title()),
+            );
+        for shortcut in rows {
+            let keys = shortcut.symbols();
+            let selector = format!("shortcut:{keys}");
+            list = list.child(
+                div()
+                    .debug_selector(move || selector.clone())
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px_len(Spacing::MD))
+                    .child(
+                        div()
+                            .fx_body()
+                            .text_color(Colors::fg_secondary(&theme))
+                            .child(SharedString::from(shortcut.label.clone())),
+                    )
+                    .child(fx_design::components::shortcut_chip(keys)),
+            );
+        }
+        section = section.child(list);
+    }
+    section.into_any_element()
 }
 
 /// One provider: its name, its badge, where it was found, and what to do.
@@ -2434,6 +2544,32 @@ mod tests {
         assert!(label.starts_with("~/.local/"));
         assert!(label.contains('…'));
         assert!(label.ends_with("-codex"));
+    }
+
+    #[test]
+    fn the_shortcuts_page_lists_every_key_the_app_binds() {
+        assert!(
+            SettingsPage::ALL.contains(&SettingsPage::Shortcuts),
+            "reachable from the navigation like any other page"
+        );
+        let mut mounted = mount();
+        mounted.choose(|sheet| sheet.page = SettingsPage::Shortcuts);
+        // `refresh` queues the repaint; the next update is what draws it.
+        mounted.test.update(|_| {});
+        let mut visual = VisualTestContext::from_window(mounted.window, &mounted.test);
+        let table = crate::commands::key_bindings();
+        assert!(table.len() > 20, "the table, not a sample of it");
+        for shortcut in table {
+            // `debug_bounds` wants a `'static` selector; a test can afford one.
+            let selector: &'static str =
+                Box::leak(format!("shortcut:{}", shortcut.symbols()).into_boxed_str());
+            assert!(
+                visual.debug_bounds(selector).is_some(),
+                "{} ({}) is bound but not listed",
+                shortcut.label,
+                shortcut.symbols()
+            );
+        }
     }
 
     #[test]

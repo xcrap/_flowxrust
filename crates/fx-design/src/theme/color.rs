@@ -191,9 +191,15 @@ pub struct Palette {
     /// to carry white text.
     pub on_accent_dark: Rgba,
 
+    /// Provider identity, independent of the workspace accent.
+    pub provider_codex: Rgba,
+    pub provider_claude: Rgba,
+
     // Semantic (mode-adapted)
     pub success: Rgba,
     pub warning: Rgba,
+    /// `warning` deep enough to stand alone on a light surface.
+    pub warning_ink: Rgba,
     pub error: Rgba,
     pub info: Rgba,
     pub success_muted: Rgba,
@@ -237,6 +243,12 @@ impl Palette {
         let warning = if dark { h(0xFBBF24) } else { h(0xD97706) };
         let error = if dark { h(0xF87171) } else { h(0xDC2626) };
         let info = if dark { h(0x60A5FA) } else { h(0x2563EB) };
+        // Amber-600 is 2.9:1 on a light elevated surface, under the 3:1 a
+        // graphic needs, so light mode steps down to amber-700 where `warning`
+        // is the only thing carrying the state. Dark amber already clears it.
+        let warning_ink = if dark { warning } else { h(0xB45309) };
+        let provider_codex = if dark { h(0xA99AF5) } else { h(0x6251D8) };
+        let provider_claude = if dark { h(0x55D6A0) } else { h(0x137C53) };
         // The light value is teal-700 so it stays readable as text; #4ECDC4 is
         // only 1.76:1 on a light surface.
         let accent_secondary = if dark { h(0x4ECDC4) } else { h(0x0F766E) };
@@ -277,8 +289,11 @@ impl Palette {
                     ..accent_secondary
                 },
                 on_accent_dark: t.shade(shade::P950),
+                provider_codex,
+                provider_claude,
                 success,
                 warning,
+                warning_ink,
                 error,
                 info,
                 success_muted: tint(success),
@@ -325,8 +340,11 @@ impl Palette {
                     ..accent_secondary
                 },
                 on_accent_dark: t.shade(shade::P950),
+                provider_codex,
+                provider_claude,
                 success,
                 warning,
+                warning_ink,
                 error,
                 info,
                 success_muted: tint(success),
@@ -804,22 +822,25 @@ impl Colors {
     pub fn accent_secondary_muted(t: &Theme) -> Rgba {
         t.palette().accent_secondary_muted
     }
-
-    /// Provider identity stays consistent when the workspace accent changes.
-    pub fn provider_codex(t: &Theme) -> Rgba {
-        if t.is_dark() {
-            h(0xA99AF5)
-        } else {
-            h(0x6251D8)
+    /// The highlight behind selected read-only text.
+    ///
+    /// Stronger than `accent_muted` because a selection is drawn over it too:
+    /// the reader's own prompts sit on an `accent_muted` bubble, and a highlight
+    /// of the same strength would vanish there.
+    pub fn text_selection(t: &Theme) -> Rgba {
+        Rgba {
+            a: if t.is_dark() { 0.34 } else { 0.26 },
+            ..t.accent_color.color()
         }
     }
 
+    /// Provider identity stays consistent when the workspace accent changes.
+    pub fn provider_codex(t: &Theme) -> Rgba {
+        t.palette().provider_codex
+    }
+
     pub fn provider_claude(t: &Theme) -> Rgba {
-        if t.is_dark() {
-            h(0x55D6A0)
-        } else {
-            h(0x137C53)
-        }
+        t.palette().provider_claude
     }
 
     // ── Semantic ───────────────────────────────────────────────────────────
@@ -829,6 +850,12 @@ impl Colors {
     }
     pub fn warning(t: &Theme) -> Rgba {
         t.palette().warning
+    }
+    /// The warning hue for a graphic that alone carries the state, such as a
+    /// gauge's arc: it clears 3:1 on `bg_elevated` in both modes, where
+    /// light-mode `warning` does not.
+    pub fn warning_ink(t: &Theme) -> Rgba {
+        t.palette().warning_ink
     }
     pub fn error(t: &Theme) -> Rgba {
         t.palette().error

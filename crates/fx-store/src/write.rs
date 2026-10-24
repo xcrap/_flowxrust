@@ -69,30 +69,92 @@ pub fn has_backup(path: &Path) -> bool {
 ///
 /// The sequence matters: the primary must land before the copy is replaced, so a
 /// crash between the two leaves the previous good copy in place rather than
-/// losing both.
+/// losing both. The copy is replaced the same way as the primary, never
+/// rewritten in place: truncating it first would leave a moment, during the
+/// write that refreshes it, at which neither file holds a whole snapshot.
 pub fn write_json_atomically<T: serde::Serialize>(
     path: &Path,
     value: &T,
 ) -> Result<(), WriteError> {
+    write_atomically(path, &serde_json::to_vec_pretty(value)?)
+}
+
+/// Write bytes that are already encoded, with the same sequence and recovery
+/// copy as [`write_json_atomically`].
+pub fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), WriteError> {
+    write_bytes(path, bytes, &flush_to_disk)
+}
+
+/// Flushes one open file, or one directory, to stable storage.
+type Flush<'a> = dyn Fn(&std::fs::File) -> std::io::Result<()> + 'a;
+
+fn write_bytes(path: &Path, bytes: &[u8], flush: &Flush<'_>) -> Result<(), WriteError> {
     let parent = path.parent().ok_or_else(|| WriteError::NoParent {
         path: path.display().to_string(),
     })?;
     super::paths::create_private_dir(parent)?;
-
-    let bytes = serde_json::to_vec_pretty(value)?;
-    let temp = temp_sibling(path);
-    std::fs::write(&temp, &bytes)?;
-    std::fs::rename(&temp, path)?;
-    std::fs::write(backup_path(path), &bytes)?;
+    replace(path, parent, bytes, flush)?;
+    replace(&backup_path(path), parent, bytes, flush)?;
+    // The renames are changes to the directory, which has its own flush. One
+    // after both is enough: each name already points at flushed data, so
+    // whichever renames a power cut keeps, both names hold a whole snapshot.
+    flush(&std::fs::File::open(parent)?)?;
     Ok(())
 }
 
-/// A sibling temporary file, so the rename stays on one filesystem and is
-/// therefore atomic.
-fn temp_sibling(path: &Path) -> PathBuf {
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(".tmp");
-    path.with_file_name(name)
+/// Replace one file so that it is never seen partly written, even after a
+/// power cut. The caller flushes the directory.
+///
+/// The temporary sibling keeps the rename on one filesystem, and therefore
+/// atomic. Its name is unique, so two instances saving at once cannot truncate
+/// each other's half-written file, and it is created owner-only, which the
+/// rename carries over.
+fn replace(path: &Path, directory: &Path, bytes: &[u8], flush: &Flush<'_>) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut prefix = path.file_name().unwrap_or_default().to_os_string();
+    prefix.push(".");
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(&prefix).suffix(".tmp");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o600));
+    }
+    let mut temp = builder.tempfile_in(directory)?;
+    temp.write_all(bytes)?;
+    // The data reaches the disk before a name points at it. Otherwise a power
+    // cut can keep the rename and lose the data, leaving an empty file.
+    flush(temp.as_file())?;
+    temp.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
+
+/// Flush a file's data, or a directory's entries, to stable storage.
+///
+/// On macOS `fsync` only hands the data to the drive, which can hold it in a
+/// volatile cache through a power cut; `F_FULLFSYNC` makes the drive write it
+/// out. Some filesystems, network volumes among them, do not support that, so
+/// `fsync` is the fallback — the same order SQLite uses.
+fn flush_to_disk(file: &std::fs::File) -> std::io::Result<()> {
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::os::fd::AsRawFd;
+        let descriptor = file.as_raw_fd();
+        // SAFETY: `descriptor` belongs to `file`, which is open for both calls.
+        if unsafe { libc::fcntl(descriptor, libc::F_FULLFSYNC) } != -1 {
+            return Ok(());
+        }
+        // SAFETY: as above.
+        if unsafe { libc::fsync(descriptor) } == 0 {
+            return Ok(());
+        }
+        Err(std::io::Error::last_os_error())
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        file.sync_all()
+    }
 }
 
 /// Remove a file and its recovery copy.
@@ -227,6 +289,104 @@ mod tests {
             leftovers.is_empty(),
             "a temporary file was not renamed away"
         );
+    }
+
+    #[test]
+    fn the_recovery_copy_is_replaced_rather_than_rewritten_in_place() {
+        // Rewriting it in place truncates it first, so a crash during that
+        // write could leave a half-written primary *and* a half-written copy.
+        // A link to the old copy shows which happened: a replaced file keeps
+        // its old contents, a rewritten one does not.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.json");
+        write_json_atomically(&path, &sample("first", 1)).unwrap();
+        let old_copy = temp.path().join("old-copy");
+        std::fs::hard_link(backup_path(&path), &old_copy).unwrap();
+
+        write_json_atomically(&path, &sample("second", 2)).unwrap();
+        assert_eq!(read_json::<Sample>(&old_copy).unwrap(), sample("first", 1));
+        assert_eq!(
+            read_json::<Sample>(&backup_path(&path)).unwrap(),
+            sample("second", 2)
+        );
+    }
+
+    #[test]
+    fn another_instances_temporary_file_is_left_alone() {
+        // A fixed temporary name meant two instances saving together truncated
+        // each other's file, and one renamed the other's half-written bytes.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.json");
+        let theirs = temp.path().join("state.json.tmp");
+        std::fs::write(&theirs, b"another instance, mid-write").unwrap();
+
+        write_json_atomically(&path, &sample("mine", 1)).unwrap();
+        assert_eq!(
+            std::fs::read(&theirs).unwrap(),
+            b"another instance, mid-write"
+        );
+        assert_eq!(read_json::<Sample>(&path).unwrap(), sample("mine", 1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn written_files_and_the_directories_made_for_them_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("a/b/c/state.json");
+        write_json_atomically(&path, &sample("private", 1)).unwrap();
+
+        for directory in ["a", "a/b", "a/b/c"] {
+            assert_eq!(mode(&temp.path().join(directory)), 0o700, "{directory}");
+        }
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(&backup_path(&path)), 0o600);
+    }
+
+    #[test]
+    fn each_copy_reaches_the_disk_before_its_rename_and_the_rename_after() {
+        use std::cell::RefCell;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.json");
+        write_json_atomically(&path, &sample("old", 1)).unwrap();
+        let current = |path: &Path| read_json::<Sample>(path).unwrap().name;
+
+        // What was on disk at each flush: whether the flushed handle was the
+        // directory, then the primary's and the copy's contents at the time.
+        // Each copy's data is flushed before its rename, and the directory
+        // once both renames are done.
+        let flushes = RefCell::new(Vec::new());
+        let record = |file: &std::fs::File| {
+            flushes.borrow_mut().push((
+                file.metadata()?.is_dir(),
+                current(&path),
+                current(&backup_path(&path)),
+            ));
+            Ok(())
+        };
+        let bytes = serde_json::to_vec(&sample("new", 2)).unwrap();
+        write_bytes(&path, &bytes, &record).unwrap();
+
+        let step = |dir: bool, primary: &str, copy: &str| (dir, primary.into(), copy.into());
+        assert_eq!(
+            flushes.into_inner(),
+            vec![
+                step(false, "old", "old"),
+                step(false, "new", "old"),
+                step(true, "new", "new"),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_real_flush_succeeds_for_a_file_and_its_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.json");
+        std::fs::write(&path, b"{}").unwrap();
+        flush_to_disk(&std::fs::File::open(&path).unwrap()).unwrap();
+        flush_to_disk(&std::fs::File::open(temp.path()).unwrap()).unwrap();
     }
 
     #[test]

@@ -291,6 +291,26 @@ impl ContentRevisionBuilder {
         self
     }
 
+    /// Mix in everything `stat` says about a path that a rewrite changes.
+    ///
+    /// Seconds alone miss an agent that rewrites a file twice within one
+    /// second at the same size, so the nanoseconds, the inode (an atomic
+    /// rename-into-place replaces it) and the change time go in too. A missing
+    /// path is recorded as missing rather than skipped, so a file that appears
+    /// and one that vanishes cannot hash alike.
+    pub fn metadata(&mut self, path: &Path, metadata: Option<&std::fs::Metadata>) -> &mut Self {
+        use std::os::unix::fs::MetadataExt;
+        let Some(metadata) = metadata else {
+            return self.field("missing", &path.to_string_lossy());
+        };
+        self.file(path, metadata.len(), metadata.mtime());
+        self.field("mtime_nsec", &metadata.mtime_nsec().to_string());
+        self.field("ctime", &metadata.ctime().to_string());
+        self.field("ctime_nsec", &metadata.ctime_nsec().to_string());
+        self.field("inode", &metadata.ino().to_string());
+        self
+    }
+
     pub fn finish(&self) -> u64 {
         // Fold in the count so a shorter input cannot share a hash with a
         // longer one that happens to end the same way.

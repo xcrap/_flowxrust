@@ -32,12 +32,14 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use fx_agent::claude::{
-    ClaudeTransport, Launch as ClaudeLaunch, StreamItem, TurnRequest as ClaudeTurnRequest,
+    ClaudeTransport, Launch as ClaudeLaunch, StreamItem, TransportError as ClaudeTransportError,
+    TurnRequest as ClaudeTurnRequest,
 };
 use fx_agent::provider::UserResponse;
 
 use fx_agent::codex::provider::CLIENT_NAME;
 use fx_agent::codex::session::TurnRequest;
+use fx_agent::codex::turn::TurnSteerer;
 use fx_agent::codex::{ApprovalPolicy, CodexProvider, CodexSession, Transport, TurnOutcome};
 use fx_agent::{Conversation, Phase, ProviderEvent};
 use fx_core::services::runtime::{BinarySpec, RuntimeDiscovery, claude_spec};
@@ -61,6 +63,7 @@ const HANDSHAKE_FAILED: &str = "Codex started but did not finish its handshake."
 const THREAD_FAILED: &str = "FlowX could not open a Codex thread.";
 const TURN_FAILED: &str = "FlowX could not run the turn.";
 const WORKER_FAILED: &str = "FlowX could not start a background worker.";
+const ANSWER_FAILED: &str = "FlowX could not deliver your answer to Claude Code.";
 
 /// The prefix `ApprovalPolicy` puts on every refusal it reports.
 const REFUSAL_SENTINEL: &str = "FlowX ";
@@ -94,6 +97,105 @@ pub enum SessionUpdate {
     Failed { reason: String },
     /// The server asked something and FlowX answered it on the user's behalf.
     Refused { tool: String, reason: String },
+    /// Guidance sent into the running turn was accepted, or why it was not.
+    ///
+    /// On success the runner has already added the user's row, at the point in
+    /// the stream where the provider took it.
+    Steered {
+        id: uuid::Uuid,
+        result: Result<(), String>,
+    },
+    /// A thread control reported the thread's goal, or that it has none.
+    GoalChanged {
+        goal: Option<fx_core::models::ConversationGoal>,
+    },
+}
+
+/// A thread-level request that is not a prompt: what `/compact` and `/goal`
+/// ask for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThreadControl {
+    Compact,
+    GoalView,
+    GoalSet(String),
+    GoalStatus(fx_core::models::GoalStatus),
+    GoalClear,
+}
+
+impl ThreadControl {
+    /// Read a slash command from a submitted draft, or `None` for a prompt.
+    ///
+    /// Only the two commands FlowX itself handles are recognised. Anything
+    /// else that starts with a slash is a prompt, because providers have
+    /// slash commands of their own and swallowing those would be worse than
+    /// passing them through.
+    pub fn parse(draft: &str) -> Option<Self> {
+        let trimmed = draft.trim();
+        let rest = trimmed.strip_prefix('/')?;
+        let (command, argument) = match rest.split_once(char::is_whitespace) {
+            Some((command, argument)) => (command, argument.trim()),
+            None => (rest, ""),
+        };
+        match command.to_lowercase().as_str() {
+            "compact" => Some(Self::Compact),
+            "goal" => Some(match argument.to_lowercase().as_str() {
+                "" => Self::GoalView,
+                "pause" => Self::GoalStatus(fx_core::models::GoalStatus::Paused),
+                "resume" => Self::GoalStatus(fx_core::models::GoalStatus::Active),
+                "clear" => Self::GoalClear,
+                _ => Self::GoalSet(argument.to_string()),
+            }),
+            _ => None,
+        }
+    }
+
+    /// Whether the provider can carry this control at all.
+    ///
+    /// Claude Code compacts through its own `/compact` command, sent as the
+    /// turn's prompt. It has no goals.
+    pub fn supported_by(&self, provider: &str) -> bool {
+        match provider {
+            "claude" => matches!(self, Self::Compact),
+            _ => true,
+        }
+    }
+}
+
+/// What a runner is asked to do: a prompt with its images, or a control.
+#[derive(Debug, Clone, Default)]
+pub struct Work {
+    pub prompt: String,
+    pub attachments: Vec<fx_core::Attachment>,
+    pub control: Option<ThreadControl>,
+}
+
+impl Work {
+    pub fn prompt(prompt: impl Into<String>) -> Self {
+        Self {
+            prompt: prompt.into(),
+            ..Self::default()
+        }
+    }
+
+    pub fn with_attachments(mut self, attachments: Vec<fx_core::Attachment>) -> Self {
+        self.attachments = attachments;
+        self
+    }
+
+    pub fn control(control: ThreadControl) -> Self {
+        Self {
+            control: Some(control),
+            ..Self::default()
+        }
+    }
+}
+
+/// Guidance for the running turn, as the UI asked for it.
+#[derive(Debug)]
+struct Steer {
+    id: uuid::Uuid,
+    text: String,
+    attachments: Vec<fx_core::Attachment>,
 }
 
 /// A running turn the UI can stop.
@@ -111,6 +213,7 @@ pub struct TurnRunner {
     /// queued into a channel nobody reads, which is the cheapest no-op there is.
     interrupt: tokio::sync::mpsc::UnboundedSender<()>,
     responses: tokio::sync::mpsc::UnboundedSender<UserResponse>,
+    steers: tokio::sync::mpsc::UnboundedSender<Steer>,
 }
 
 impl TurnRunner {
@@ -135,6 +238,30 @@ impl TurnRunner {
         approvals: ApprovalPolicy,
         on_update: impl Fn(SessionUpdate) + Send + 'static,
     ) -> Self {
+        Self::start_work(
+            _cx,
+            conversation,
+            project_root,
+            agent,
+            Work::prompt(prompt),
+            approvals,
+            on_update,
+        )
+    }
+
+    /// Start a turn with images, or a thread control, in the background.
+    ///
+    /// The same runner as [`Self::start`]: a control shows as a running turn,
+    /// can be stopped the same way, and reports through the same updates.
+    pub fn start_work(
+        _cx: &mut gpui::App,
+        conversation: Arc<Mutex<Conversation>>,
+        project_root: String,
+        agent: Agent,
+        work: Work,
+        approvals: ApprovalPolicy,
+        on_update: impl Fn(SessionUpdate) + Send + 'static,
+    ) -> Self {
         let provider = match agent
             .configuration
             .provider_id
@@ -152,7 +279,7 @@ impl TurnRunner {
             conversation,
             project_root,
             agent,
-            prompt,
+            work,
             approvals,
             provider,
             on_update,
@@ -176,18 +303,38 @@ impl TurnRunner {
         self.responses.send(response).is_ok()
     }
 
+    /// Send guidance into the running turn. `false` once the runner has gone.
+    ///
+    /// The answer arrives later as [`SessionUpdate::Steered`] with this `id`:
+    /// the provider has to accept the guidance before it is part of the turn.
+    pub fn steer(
+        &self,
+        id: uuid::Uuid,
+        text: String,
+        attachments: Vec<fx_core::Attachment>,
+    ) -> bool {
+        self.steers
+            .send(Steer {
+                id,
+                text,
+                attachments,
+            })
+            .is_ok()
+    }
+
     /// The single path into a worker, shared by `start` and its test seam.
     fn launch(
         conversation: Arc<Mutex<Conversation>>,
         project_root: String,
         agent: Agent,
-        prompt: String,
+        work: Work,
         approvals: ApprovalPolicy,
         provider: RuntimeProvider,
         on_update: impl Fn(SessionUpdate) + Send + 'static,
     ) -> Self {
         let (handle, interrupt) = tokio::sync::mpsc::unbounded_channel();
         let (response_handle, responses) = tokio::sync::mpsc::unbounded_channel();
+        let (steer_handle, steers) = tokio::sync::mpsc::unbounded_channel();
         let claude = matches!(provider, RuntimeProvider::Claude { .. });
         let model = agent.configuration.model_id.clone().unwrap_or_else(|| {
             if claude {
@@ -209,7 +356,10 @@ impl TurnRunner {
             conversation: conversation.clone(),
             provider,
             project_root,
-            prompt,
+            prompt: work.prompt,
+            attachments: work.attachments,
+            control: work.control,
+            steers: Mutex::new(Some(steers)),
             approvals,
             access: agent.configuration.resolved_access(AgentAccess::default()),
             model,
@@ -264,6 +414,7 @@ impl TurnRunner {
         Self {
             interrupt: handle,
             responses: response_handle,
+            steers: steer_handle,
         }
     }
 
@@ -285,7 +436,29 @@ impl TurnRunner {
             conversation,
             project_root,
             agent,
-            prompt,
+            Work::prompt(prompt),
+            approvals,
+            RuntimeProvider::Codex(provider),
+            on_update,
+        )
+    }
+
+    /// [`Self::launch_with`] for a turn with images, or for a control.
+    #[cfg(test)]
+    fn launch_work_with(
+        conversation: Arc<Mutex<Conversation>>,
+        project_root: String,
+        agent: Agent,
+        work: Work,
+        approvals: ApprovalPolicy,
+        provider: CodexProvider,
+        on_update: impl Fn(SessionUpdate) + Send + 'static,
+    ) -> Self {
+        Self::launch(
+            conversation,
+            project_root,
+            agent,
+            work,
             approvals,
             RuntimeProvider::Codex(provider),
             on_update,
@@ -309,6 +482,12 @@ struct Job {
     provider: RuntimeProvider,
     project_root: String,
     prompt: String,
+    /// Images sent with the prompt, written to private files for the turn.
+    attachments: Vec<fx_core::Attachment>,
+    /// A thread control to run instead of a prompt.
+    control: Option<ThreadControl>,
+    /// Guidance for the running turn, taken by whichever loop drives it.
+    steers: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<Steer>>>,
     approvals: ApprovalPolicy,
     access: AgentAccess,
     model: String,
@@ -353,12 +532,24 @@ impl Job {
         responses: tokio::sync::mpsc::UnboundedReceiver<UserResponse>,
     ) {
         let _handles_stay_alive = (&self.interrupt, &self.responses);
+        // Taken once, here: whichever loop drives the turn owns the receiver.
+        // A runner built without one gets a closed channel, which never fires.
+        let steers = self
+            .steers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .unwrap_or_else(|| tokio::sync::mpsc::unbounded_channel().1);
+        if let Some(control) = self.control.clone() {
+            return self.run_control(control, interrupts).await;
+        }
         match &self.provider {
             RuntimeProvider::Codex(provider) => {
-                self.run_codex(provider, interrupts, responses).await
+                self.run_codex(provider, interrupts, responses, steers)
+                    .await
             }
             RuntimeProvider::Claude { discovery, spec } => {
-                self.run_claude(discovery, spec, interrupts, responses)
+                self.run_claude(discovery, spec, interrupts, responses, steers)
                     .await
             }
             RuntimeProvider::Unsupported(id) => {
@@ -372,6 +563,7 @@ impl Job {
         provider: &CodexProvider,
         mut interrupts: tokio::sync::mpsc::UnboundedReceiver<()>,
         mut responses: tokio::sync::mpsc::UnboundedReceiver<UserResponse>,
+        mut steers: tokio::sync::mpsc::UnboundedReceiver<Steer>,
     ) {
         // Borrowed, not moved: the sender has to stay alive for the whole run so
         // the receiver cannot report a closed channel, and a move would take
@@ -431,13 +623,32 @@ impl Job {
             },
         );
 
+        // Whether `Accepted` went out from inside the turn, so a Stop that has to
+        // report it afterwards does not report it twice. Atomic only because
+        // the turn's closures and this frame share it; nothing else runs here.
+        let accepted = std::sync::atomic::AtomicBool::new(false);
+
         // Everything borrowing `session` or `self` is scoped to this block.
         // `run_turn` holds a `&mut session` for as long as its future lives, and
-        // interrupting needs a `&session` — so the request, the future, and the
-        // borrows they carry must all be dropped before `session` can be touched
-        // again. That is the whole reason for the block.
+        // interrupting needs a `&mut session` — so the request, the future, and
+        // the borrows they carry must all be dropped before `session` can be
+        // touched again. That is the whole reason for the block.
+        // Codex reads a `localImage` from disk, so the images live in private
+        // files until the turn is over.
+        let files = match attachment_files(&self.attachments) {
+            Ok(files) => files,
+            Err(error) => {
+                session.close().await;
+                return self.fail(TURN_FAILED, error);
+            }
+        };
+        let image_paths = file_paths(&files);
+        let steerer = session.steerer();
+        let mut steering = Steering::default();
         let ending = {
+            let images: &[String] = &image_paths;
             let request = TurnRequest::new(&thread_id, &self.prompt, &self.project_root)
+                .images(&images)
                 .model(&self.model)
                 .effort(self.effort.as_deref().unwrap_or_default())
                 .access(self.access);
@@ -445,27 +656,48 @@ impl Job {
                 &request,
                 &mut responses,
                 |event| self.apply(event),
-                || emit(&self.on_update, SessionUpdate::Accepted),
+                || {
+                    accepted.store(true, std::sync::atomic::Ordering::Relaxed);
+                    emit(&self.on_update, SessionUpdate::Accepted);
+                },
                 |id| self.resolve(id),
             ));
 
-            let ending = tokio::select! {
-                // Biased towards the turn, so an interrupt arriving while the
-                // turn is producing output cannot starve it.
-                biased;
-                ending = &mut turn => Ending::Ran(ending),
-                _ = interrupts.recv() => Ending::Interrupted,
+            let ending = loop {
+                tokio::select! {
+                    // An answered steer first: the reader resolves its response
+                    // before it queues the reply that follows, so taking it
+                    // first is what puts the guidance's row before that reply.
+                    // Then the turn, so an interrupt arriving while the turn is
+                    // producing output cannot starve it.
+                    biased;
+                    (id, result) = steering.next_answer(), if steering.in_flight() => {
+                        self.steer_settled(&mut steering, id, result);
+                    }
+                    ending = &mut turn => break Ending::Ran(ending),
+                    _ = interrupts.recv() => break Ending::Interrupted,
+                    // Steering is a request made while the turn's own future
+                    // reads the stream, so it runs beside it rather than in it.
+                    Some(steer) = steers.recv() => {
+                        self.begin_codex_steer(steer, &steerer, &mut steering);
+                    }
+                }
             };
             drop(turn);
             ending
         };
+        self.abandon_steers(&mut steering, &mut steers).await;
+        drop(files);
 
+        // A turn that failed or was stopped part-way can leave a tool running,
+        // so those endings take down the whole process group. A finished turn
+        // has nothing running and only closes the server.
         match ending {
             Ending::Ran(Ok(TurnOutcome::Failed { reason, .. })) => {
-                session.close().await;
-                // The reason is Codex's own wording — a model refusal, an exit,
-                // a stall — and prefixing it would only bury the part that tells
-                // the user what happened.
+                session.terminate().await;
+                // The reason is Codex's own wording — a model refusal, an exit
+                // — and prefixing it would only bury the part that tells the
+                // user what happened.
                 self.fail("", reason);
             }
             Ending::Ran(Ok(outcome)) => {
@@ -473,7 +705,7 @@ impl Job {
                 self.settle(&outcome);
             }
             Ending::Ran(Err(error)) => {
-                session.close().await;
+                session.terminate().await;
                 self.fail(TURN_FAILED, error.to_string());
             }
             Ending::Interrupted => {
@@ -485,7 +717,14 @@ impl Job {
                 // a server that has gone cannot be told. The turn ends as
                 // cancelled either way.
                 let _ = tokio::time::timeout(Duration::from_secs(2), session.interrupt()).await;
-                session.close().await;
+                // A Stop between writing `turn/start` and its reply: the
+                // interrupt collected that reply, and a prompt Codex has must not
+                // be offered back, or sending it again delivers it twice.
+                if session.prompt_accepted() && !accepted.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    emit(&self.on_update, SessionUpdate::Accepted);
+                }
+                session.terminate().await;
                 // No events here. They reached the conversation through the
                 // sink, and keeping a second copy of every streamed delta for
                 // the length of a turn buys nothing the transcript does not
@@ -504,6 +743,7 @@ impl Job {
         spec: &BinarySpec,
         mut interrupts: tokio::sync::mpsc::UnboundedReceiver<()>,
         mut responses: tokio::sync::mpsc::UnboundedReceiver<UserResponse>,
+        mut steers: tokio::sync::mpsc::UnboundedReceiver<Steer>,
     ) {
         let discovered = tokio::select! {
             result = discovery.launch(spec) => result,
@@ -569,13 +809,25 @@ impl Job {
             }
         };
         let reader = transport.reader().await;
-        if let Err(error) = transport.send_prompt(&self.prompt, &[] as &[String]).await {
+        // Claude reads each image into the envelope as it is written, so the
+        // files are only needed until the prompt is sent.
+        let sent = match attachment_files(&self.attachments) {
+            Ok(files) => transport
+                .send_prompt(&self.prompt, &files)
+                .await
+                .map_err(|error| error.to_string()),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = sent {
             transport.close().await;
-            return self.fail(TURN_FAILED, error.to_string());
+            return self.fail(TURN_FAILED, error);
         }
         let mut thread_id = resume.unwrap_or_default();
         let mut accepted = false;
         let mut waiting = std::collections::HashSet::new();
+        // A closed channel is ready forever, so selecting on it again would
+        // spin a CPU for the rest of the turn. Once it closes it is left out.
+        let mut responses_open = true;
         // Silence is not a failure: thinking and long tools can take minutes,
         // and the parser intentionally omits non-display frames. Only a result,
         // a provider/process error, a closed stream, or Stop ends this turn.
@@ -586,8 +838,8 @@ impl Job {
                     emit(&self.on_update, SessionUpdate::Changed);
                     break TurnOutcome::Cancelled { thread_id, events: Vec::new() };
                 }
-                response = responses.recv() => {
-                    let Some(response) = response else { continue; };
+                response = responses.recv(), if responses_open => {
+                    let Some(response) = response else { responses_open = false; continue; };
                     let id = response.id().to_owned();
                     if !waiting.contains(&id) { continue; }
                     let result = match response {
@@ -595,7 +847,32 @@ impl Job {
                         UserResponse::Questions { answers, .. } => transport.answer_questions(&id, &answers).await,
                         UserResponse::CancelQuestions { .. } => transport.decline_questions(&id).await,
                     };
-                    if result.is_ok() { waiting.remove(&id); self.resolve(id); }
+                    match result {
+                        Ok(()) => { waiting.remove(&id); self.resolve(id); }
+                        // The wrong kind of answer leaves the request open, as
+                        // Codex's does: Claude is still blocked on it, and the
+                        // panel sends only the kind it shows.
+                        Err(ClaudeTransportError::NotAControl { .. }) => {}
+                        // Claude holds no such request, so nobody is waiting.
+                        Err(ClaudeTransportError::UnknownControl { .. }) => { waiting.remove(&id); self.resolve(id); }
+                        // The answer could not be delivered, so Claude will
+                        // never get it. Left open, the request kept both of the
+                        // panel's buttons disabled with nothing left to clear
+                        // them; the turn fails and says why instead.
+                        Err(error) => break TurnOutcome::Failed { thread_id, reason: format!("{ANSWER_FAILED} {error}"), events: Vec::new() },
+                    }
+                }
+                // Guidance is one more user message on the live stream-json
+                // input: Claude reads stdin for the whole turn.
+                Some(steer) = steers.recv() => {
+                    let result = match attachment_files(&steer.attachments) {
+                        Ok(files) => transport
+                            .send_prompt(&steer.text, &files)
+                            .await
+                            .map_err(|error| error.to_string()),
+                        Err(error) => Err(error),
+                    };
+                    self.steer_finished(steer, result);
                 }
                 next = reader.next_event() => {
                     match next {
@@ -607,15 +884,17 @@ impl Job {
                                 lock(&self.conversation).set_session_id(id.clone());
                                 emit(&self.on_update, SessionUpdate::Started { thread_id: id });
                             }
-                            // Init identifies the process/session. Real content
-                            // proves the submitted prompt was accepted.
-                            if !accepted && matches!(event, ProviderEvent::TextDelta(_) | ProviderEvent::Text(_) | ProviderEvent::ToolUse { .. } | ProviderEvent::Approval(_) | ProviderEvent::UserInput(_) | ProviderEvent::Done { .. }) {
+                            // Any frame that answers the prompt proves Claude read
+                            // it: thinking, usage and lifecycle frames as much as
+                            // text. Counting only content let a Stop during long
+                            // thinking hand back a prompt Claude already had.
+                            if !accepted && transport.prompt_consumed().await {
                                 accepted = true; emit(&self.on_update, SessionUpdate::Accepted);
                             }
                             if let ProviderEvent::Approval(ref request) = event {
                                 let auto = if self.approvals == ApprovalPolicy::Ask {
                                     (self.access == AgentAccess::FullAccess).then_some(true)
-                                } else { Some(self.approvals.allows(&request.tool_name, &request.input)) };
+                                } else { Some(self.approvals.allows_claude_tool(&request.tool_name, &request.input)) };
                                 if let Some(approved) = auto {
                                     if let Err(error) = transport.approve(&request.id, approved).await {
                                         break TurnOutcome::Failed { thread_id, reason: error.to_string(), events: Vec::new() };
@@ -639,11 +918,251 @@ impl Job {
                 }
             }
         };
-        transport.close().await;
+        // The frames that proved it may have arrived without an event of their
+        // own — thinking, mostly — so the question is asked once more here.
+        if !accepted && transport.prompt_consumed().await {
+            emit(&self.on_update, SessionUpdate::Accepted);
+        }
+        match ending {
+            TurnOutcome::Completed { .. } => transport.close().await,
+            // Interrupted first, so Claude can end its own turn and tools;
+            // then the process group, for whatever did not.
+            TurnOutcome::Cancelled { .. } => {
+                let _ = transport.interrupt().await;
+                transport.terminate().await;
+            }
+            TurnOutcome::Failed { .. } => transport.terminate().await,
+        }
+        self.abandon_steers(&mut Steering::default(), &mut steers)
+            .await;
         match ending {
             TurnOutcome::Failed { reason, .. } => self.fail("", reason),
             outcome => self.settle(&outcome),
         }
+    }
+
+    // ── Steering ───────────────────────────────────────────────────────────
+
+    /// Start one `turn/steer` beside the running turn.
+    fn begin_codex_steer(&self, steer: Steer, steerer: &TurnSteerer, steering: &mut Steering) {
+        let files = match attachment_files(&steer.attachments) {
+            Ok(files) => files,
+            Err(error) => return self.steer_finished(steer, Err(error)),
+        };
+        let paths = file_paths(&files);
+        steering.files.extend(files);
+        let steerer = steerer.clone();
+        let id = steer.id;
+        let text = steer.text.clone();
+        steering.pending.insert(id, steer);
+        steering.requests.push(Box::pin(async move {
+            let result = steerer
+                .steer(&text, &paths)
+                .await
+                .map_err(|error| error.to_string());
+            (id, result)
+        }));
+    }
+
+    /// One steer request came back.
+    fn steer_settled(&self, steering: &mut Steering, id: uuid::Uuid, result: Result<(), String>) {
+        if let Some(steer) = steering.pending.remove(&id) {
+            self.steer_finished(steer, result);
+        }
+    }
+
+    /// Report guidance the turn ended before accepting.
+    ///
+    /// Every steer gets an answer: the UI holds the draft until it does, and a
+    /// steer that was never answered would hold it forever.
+    async fn abandon_steers(
+        &self,
+        steering: &mut Steering,
+        steers: &mut tokio::sync::mpsc::UnboundedReceiver<Steer>,
+    ) {
+        // A request already sent may still be accepted; give it a moment
+        // rather than reporting a failure Codex would then contradict.
+        let _ = tokio::time::timeout(STEER_SETTLE, async {
+            while steering.in_flight() {
+                let (id, result) = steering.next_answer().await;
+                self.steer_settled(steering, id, result);
+            }
+        })
+        .await;
+        steering.requests.clear();
+        let mut late: Vec<Steer> = steering.pending.drain().map(|(_, steer)| steer).collect();
+        while let Ok(steer) = steers.try_recv() {
+            late.push(steer);
+        }
+        for steer in late {
+            self.steer_finished(
+                steer,
+                Err("The turn ended before the guidance could be accepted.".into()),
+            );
+        }
+    }
+
+    /// Land accepted guidance in the transcript, then report the outcome.
+    ///
+    /// The row is added here rather than by the UI so it sits where the
+    /// provider took it: after the prose streamed so far, before the reply.
+    fn steer_finished(&self, steer: Steer, result: Result<(), String>) {
+        if result.is_ok() {
+            let mut conversation = lock(&self.conversation);
+            conversation.commit_streaming();
+            conversation.append(crate::attachments::user_message(
+                &steer.text,
+                &steer.attachments,
+            ));
+        }
+        emit(
+            &self.on_update,
+            SessionUpdate::Steered {
+                id: steer.id,
+                result,
+            },
+        );
+        emit(&self.on_update, SessionUpdate::Changed);
+    }
+
+    // ── Thread controls ────────────────────────────────────────────────────
+
+    async fn run_control(
+        &self,
+        control: ThreadControl,
+        interrupts: tokio::sync::mpsc::UnboundedReceiver<()>,
+    ) {
+        let resume = lock(&self.conversation).session_id().map(str::to_owned);
+        if control == ThreadControl::Compact && resume.is_none() {
+            lock(&self.conversation)
+                .record_activity("Nothing to compact: this thread has no session yet.", false);
+            return self.settle(&TurnOutcome::Completed {
+                thread_id: String::new(),
+                stop_reason: "skipped".into(),
+                events: Vec::new(),
+            });
+        }
+        match &self.provider {
+            RuntimeProvider::Codex(provider) => {
+                self.run_codex_control(provider, control, resume, interrupts)
+                    .await
+            }
+            // Claude compacts through its own `/compact` prompt, which the UI
+            // sends as a turn, and it has no goals.
+            _ => self.fail(
+                "This provider does not support that command.",
+                "Thread goals are available for Codex threads.",
+            ),
+        }
+    }
+
+    async fn run_codex_control(
+        &self,
+        provider: &CodexProvider,
+        control: ThreadControl,
+        resume: Option<String>,
+        mut interrupts: tokio::sync::mpsc::UnboundedReceiver<()>,
+    ) {
+        let discovered = tokio::select! {
+            result = provider.launch() => result,
+            _ = interrupts.recv() => return self.cancel_before_start(),
+        };
+        let launch = match discovered {
+            Ok(launch) => launch,
+            Err(error) => return self.fail(DISCOVERY_FAILED, error.to_string()),
+        };
+        let started = tokio::select! {
+            result = Transport::start(launch, CLIENT_NAME, CLIENT_VERSION) => result,
+            _ = interrupts.recv() => return self.cancel_before_start(),
+        };
+        let transport = match started {
+            Ok(transport) => transport,
+            Err(error) => return self.fail(HANDSHAKE_FAILED, error.to_string()),
+        };
+        let opened = tokio::select! {
+            result = CodexSession::open_with_instructions(
+                transport,
+                resume.as_deref(),
+                self.access,
+                &self.project_root,
+                self.approvals,
+                self.system_prompt.as_deref(),
+            ) => result,
+            _ = interrupts.recv() => return self.cancel_before_start(),
+        };
+        let mut session = match opened {
+            Ok(session) => session,
+            Err(error) => return self.fail(THREAD_FAILED, error.to_string()),
+        };
+        let thread_id = session.thread_id().to_string();
+        if resume.as_deref() != Some(thread_id.as_str()) {
+            lock(&self.conversation).set_session_id(thread_id.clone());
+            emit(
+                &self.on_update,
+                SessionUpdate::Started {
+                    thread_id: thread_id.clone(),
+                },
+            );
+        }
+        let outcome = {
+            let mut work = Box::pin(self.perform_control(&mut session, &control));
+            tokio::select! {
+                biased;
+                outcome = &mut work => Some(outcome),
+                _ = interrupts.recv() => None,
+            }
+        };
+        session.close().await;
+        match outcome {
+            Some(Ok(())) => self.settle(&TurnOutcome::Completed {
+                thread_id,
+                stop_reason: "control".into(),
+                events: Vec::new(),
+            }),
+            Some(Err(error)) => self.fail("FlowX could not run that command.", error.to_string()),
+            None => self.settle(&TurnOutcome::Cancelled {
+                thread_id,
+                events: Vec::new(),
+            }),
+        }
+    }
+
+    async fn perform_control(
+        &self,
+        session: &mut CodexSession,
+        control: &ThreadControl,
+    ) -> Result<(), fx_agent::ProviderError> {
+        let goal = match control {
+            ThreadControl::Compact => {
+                lock(&self.conversation).set_phase(Phase::Compacting);
+                emit(&self.on_update, SessionUpdate::Changed);
+                return session.compact(|event| self.apply(event)).await;
+            }
+            ThreadControl::GoalView => session.goal().await?,
+            ThreadControl::GoalSet(objective) => Some(
+                session
+                    .set_goal(Some(objective), Some(fx_core::models::GoalStatus::Active))
+                    .await?,
+            ),
+            ThreadControl::GoalStatus(status) => Some(session.set_goal(None, Some(*status)).await?),
+            ThreadControl::GoalClear => {
+                session.clear_goal().await?;
+                None
+            }
+        };
+        let summary = match (control, &goal) {
+            (ThreadControl::GoalClear, _) => "Goal cleared".to_string(),
+            (_, None) => "This thread has no goal.".to_string(),
+            (ThreadControl::GoalSet(_), Some(goal)) => format!("Goal set: {}", goal.objective),
+            (_, Some(goal)) => format!(
+                "Goal {}: {}",
+                goal.status.label().to_lowercase(),
+                goal.objective
+            ),
+        };
+        lock(&self.conversation).record_activity(summary, false);
+        emit(&self.on_update, SessionUpdate::GoalChanged { goal });
+        Ok(())
     }
 
     fn cancel_before_start(&self) {
@@ -753,6 +1272,81 @@ fn lock(conversation: &Mutex<Conversation>) -> MutexGuard<'_, Conversation> {
     conversation
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// How long a steer already sent may take to be answered once its turn ends.
+const STEER_SETTLE: Duration = Duration::from_secs(2);
+
+type SteerRequest =
+    std::pin::Pin<Box<dyn std::future::Future<Output = (uuid::Uuid, Result<(), String>)> + Send>>;
+
+/// Guidance in flight for one Codex turn, and the files its images use.
+///
+/// The requests are polled by the loop driving the turn rather than spawned:
+/// in one task, an answered steer can be taken before the reply that follows
+/// it, which a separately scheduled task cannot promise.
+#[derive(Default)]
+struct Steering {
+    requests: Vec<SteerRequest>,
+    pending: std::collections::HashMap<uuid::Uuid, Steer>,
+    /// Kept until the turn ends: Codex does not say when it has read a path.
+    files: Vec<tempfile::TempPath>,
+}
+
+impl Steering {
+    fn in_flight(&self) -> bool {
+        !self.requests.is_empty()
+    }
+
+    /// The next steer Codex has answered.
+    async fn next_answer(&mut self) -> (uuid::Uuid, Result<(), String>) {
+        std::future::poll_fn(|cx| {
+            for index in 0..self.requests.len() {
+                if let std::task::Poll::Ready(answer) = self.requests[index].as_mut().poll(cx) {
+                    drop(self.requests.swap_remove(index));
+                    return std::task::Poll::Ready(answer);
+                }
+            }
+            std::task::Poll::Pending
+        })
+        .await
+    }
+}
+
+/// Write each image to a private file for the length of a turn.
+///
+/// Both providers take an image by path. The files are `0600` in the user's
+/// temporary directory and are removed when the returned paths are dropped.
+fn attachment_files(
+    attachments: &[fx_core::Attachment],
+) -> Result<Vec<tempfile::TempPath>, String> {
+    use std::io::Write;
+    attachments
+        .iter()
+        .map(|attachment| {
+            let extension = fx_core::services::images::sniff(&attachment.data)
+                .map(|format| format.extension())
+                .unwrap_or("img");
+            let failed = |error: std::io::Error| {
+                format!("FlowX could not prepare {}: {error}", attachment.filename)
+            };
+            let mut file = tempfile::Builder::new()
+                .prefix("flowx-attachment-")
+                .suffix(&format!(".{extension}"))
+                .tempfile()
+                .map_err(failed)?;
+            file.write_all(&attachment.data).map_err(failed)?;
+            file.flush().map_err(failed)?;
+            Ok(file.into_temp_path())
+        })
+        .collect()
+}
+
+fn file_paths(files: &[tempfile::TempPath]) -> Vec<String> {
+    files
+        .iter()
+        .map(|file| file.to_string_lossy().into_owned())
+        .collect()
 }
 
 /// Whether an event is FlowX refusing a tool call, and on what.
@@ -1192,6 +1786,119 @@ mod tests {
         );
     }
 
+    /// Kills a process when dropped, so a failed assertion does not leave a
+    /// fixture's `sleep 60` running.
+    struct KillOnDrop(libc::pid_t);
+
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            if is_running(self.0) {
+                // SAFETY: no memory effects.
+                unsafe { libc::kill(self.0, libc::SIGKILL) };
+            }
+        }
+    }
+
+    fn is_running(pid: libc::pid_t) -> bool {
+        // SAFETY: signal 0 only checks existence.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// Wait for a file the fixture writes, and read it.
+    fn wait_for_file(path: &std::path::Path) -> String {
+        let deadline = Instant::now() + TURN_BUDGET;
+        loop {
+            if let Ok(text) = std::fs::read_to_string(path)
+                && !text.is_empty()
+            {
+                return text;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{} never appeared",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn stopping_a_codex_turn_ends_the_tool_it_was_running() {
+        // Stop used to kill the server alone. It was not in a group of its
+        // own, so the tool it had started kept running after the turn ended.
+        let Some(server) = FakeServer::new() else {
+            return;
+        };
+        let Some(provider) = server.provider() else {
+            return;
+        };
+        let conversation = conversation();
+        let (runner, recorder) = start(
+            &conversation,
+            provider,
+            "spawn-and-hang",
+            ApprovalPolicy::AllowAll,
+        );
+        let pid: libc::pid_t = wait_for_file(&server.log.with_extension("child"))
+            .trim()
+            .parse()
+            .unwrap();
+        let _reap = KillOnDrop(pid);
+        wait_for_phase(&conversation, Phase::Running);
+        runner.interrupt();
+        let updates = recorder.wait_for_end(TURN_BUDGET);
+        assert!(
+            matches!(
+                updates.last(),
+                Some(SessionUpdate::Finished {
+                    outcome: TurnOutcome::Cancelled { .. }
+                })
+            ),
+            "{updates:?}"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while is_running(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!is_running(pid), "the tool outlived the stopped turn");
+    }
+
+    #[test]
+    fn a_stop_before_codex_answers_turn_start_keeps_the_prompt_accepted() {
+        // Codex has the prompt once `turn/start` is written. A Stop before its
+        // reply used to drop the reply: the prompt was offered back for sending
+        // again, and the interrupt named no turn.
+        let Some(server) = FakeServer::new() else {
+            return;
+        };
+        let Some(provider) = server.provider() else {
+            return;
+        };
+        let conversation = conversation();
+        let (runner, recorder) = start(&conversation, provider, "slow-ack", ApprovalPolicy::Ask);
+        let marker = server.log.with_extension("turn-start");
+        let deadline = Instant::now() + TURN_BUDGET;
+        while !marker.exists() {
+            assert!(Instant::now() < deadline, "turn/start never arrived");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        runner.interrupt();
+        let updates = recorder.wait_for_end(TURN_BUDGET);
+        assert!(
+            matches!(
+                updates.last(),
+                Some(SessionUpdate::Finished {
+                    outcome: TurnOutcome::Cancelled { .. }
+                })
+            ),
+            "{updates:?}"
+        );
+        assert!(updates.contains(&SessionUpdate::Accepted), "{updates:?}");
+        let interrupts = wait_for_file(&server.log.with_extension("interrupts"));
+        let interrupt: Value = serde_json::from_str(interrupts.lines().next().unwrap()).unwrap();
+        assert_eq!(interrupt["turnId"], "turn-1");
+    }
+
     #[test]
     fn interrupting_a_finished_turn_changes_nothing() {
         let Some(server) = FakeServer::new() else {
@@ -1394,8 +2101,25 @@ for line in sys.stdin:
     record(message)
     if message.get("type")=="user":
         prompt=message["message"]["content"][0]["text"]
+        if prompt=="think":
+            # Thinking, with no init and nothing shown: proof of reading alone.
+            send({"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"considering"}}})
+            Path(__file__).with_name("thinking").write_text("1")
+            continue
         send({"type":"system","subtype":"init","session_id":"11111111-2222-4333-8444-555555555555"})
         if prompt=="hang": continue
+        if prompt=="read":
+            send({"type":"control_request","request_id":"control-1","request":{"subtype":"can_use_tool","tool_name":"Read","tool_use_id":"tool-1","input":{"file_path":"Cargo.toml"}}})
+            continue
+        if prompt=="closed-input":
+            # Stops reading its input after the first request, so the answer
+            # to the second one cannot be delivered.
+            send({"type":"control_request","request_id":"control-a","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"tool-a","input":{"command":"cargo test"}}})
+            import os
+            os.close(0)
+            time.sleep(0.5)
+            send({"type":"control_request","request_id":"control-b","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"tool-b","input":{"command":"cargo build"}}})
+            while True: time.sleep(1)
         if prompt in ("quiet", "quiet-tool", "quiet-exit"):
             if prompt=="quiet-tool":
                 send({"type":"assistant","message":{"content":[{"type":"tool_use","id":"long-tool","name":"Bash","input":{"command":"long-running build"}}]}})
@@ -1435,6 +2159,17 @@ for line in sys.stdin:
             access: AgentAccess,
             model: &str,
         ) -> (TurnRunner, Recorder) {
+            self.start_with(conversation, prompt, access, model, ApprovalPolicy::Ask)
+        }
+
+        fn start_with(
+            &self,
+            conversation: &Arc<Mutex<Conversation>>,
+            prompt: &str,
+            access: AgentAccess,
+            model: &str,
+            approvals: ApprovalPolicy,
+        ) -> (TurnRunner, Recorder) {
             let mut agent = Agent::new("Claude");
             agent.configuration.provider_id = Some("claude".into());
             agent.configuration.model_id = Some(model.into());
@@ -1452,12 +2187,51 @@ for line in sys.stdin:
                 conversation.clone(),
                 self.dir.path().display().to_string(),
                 agent,
-                prompt.into(),
-                ApprovalPolicy::Ask,
+                Work::prompt(prompt),
+                approvals,
                 provider,
                 move |update| sink.record(update),
             );
             (runner, recorder)
+        }
+
+        /// A job that runs in the caller's own runtime, for a test that has
+        /// to see what the turn does to the thread it runs on. The caller
+        /// hands `run` its own channels; the ones held here only keep the
+        /// job's shape.
+        fn job(
+            &self,
+            conversation: &Arc<Mutex<Conversation>>,
+            prompt: &str,
+            on_update: impl Fn(SessionUpdate) + Send + 'static,
+        ) -> Job {
+            let (interrupt, _) = tokio::sync::mpsc::unbounded_channel();
+            let (responses, _) = tokio::sync::mpsc::unbounded_channel();
+            Job {
+                conversation: conversation.clone(),
+                provider: RuntimeProvider::Claude {
+                    discovery: RuntimeDiscovery::default().without_extra_directories(),
+                    spec: BinarySpec::new(
+                        "claude",
+                        "Claude Code",
+                        vec![FakeServer::python().unwrap()],
+                    )
+                    .with_arguments(vec![self.script.display().to_string()]),
+                },
+                project_root: self.dir.path().display().to_string(),
+                prompt: prompt.into(),
+                attachments: Vec::new(),
+                control: None,
+                steers: Mutex::new(None),
+                approvals: ApprovalPolicy::Ask,
+                access: AgentAccess::Supervised,
+                model: "fixture-model".into(),
+                effort: None,
+                system_prompt: None,
+                on_update: Arc::new(Mutex::new(Box::new(on_update))),
+                interrupt,
+                responses,
+            }
         }
 
         fn received(&self) -> Vec<Value> {
@@ -1701,6 +2475,180 @@ for line in sys.stdin:
         );
         assert_eq!(lock(&conversation).phase(), Phase::Idle);
         assert!(lock(&conversation).pending_approvals().is_empty());
+        // Stop asks Claude itself first, before its process group is signalled.
+        assert!(
+            server.received().iter().any(|message| {
+                message["type"] == "control_request" && message["request"]["subtype"] == "interrupt"
+            }),
+            "Claude was never sent an interrupt"
+        );
+    }
+
+    #[test]
+    fn claude_read_only_policy_allows_reads_by_claudes_tool_names() {
+        // The policy knew only Codex's names, so `Read` was refused like any
+        // unknown tool.
+        for (prompt, behavior) in [("read", "allow"), ("tool", "deny")] {
+            let Some(server) = ClaudeFixture::new() else {
+                return;
+            };
+            let conversation = conversation();
+            let (_runner, recorder) = server.start_with(
+                &conversation,
+                prompt,
+                AgentAccess::Supervised,
+                "fixture-model",
+                ApprovalPolicy::DenyUnlessReadOnly,
+            );
+            let updates = recorder.wait_for_end(TURN_BUDGET);
+            assert!(
+                matches!(updates.last(), Some(SessionUpdate::Finished { outcome }) if outcome.is_completed()),
+                "{prompt}: {updates:?}"
+            );
+            let response = server
+                .received()
+                .into_iter()
+                .find(|item| item["type"] == "control_response")
+                .unwrap();
+            assert_eq!(
+                response["response"]["response"]["behavior"], behavior,
+                "{prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_fails_the_turn_when_an_answer_cannot_be_delivered() {
+        // An answer that failed to write left its request open: the panel's
+        // buttons stayed disabled and nothing would ever clear them.
+        let Some(server) = ClaudeFixture::new() else {
+            return;
+        };
+        let conversation = conversation();
+        let (runner, recorder) =
+            server.start(&conversation, "closed-input", AgentAccess::Supervised);
+        let ProviderEvent::Approval(first) = wait_for_interaction(&recorder) else {
+            panic!("approval expected")
+        };
+        assert!(runner.respond(UserResponse::Approval {
+            id: first.id.clone(),
+            approved: true,
+        }));
+        let deadline = Instant::now() + TURN_BUDGET;
+        let second = loop {
+            let found = recorder
+                .updates()
+                .into_iter()
+                .find_map(|update| match update {
+                    SessionUpdate::Interaction {
+                        event: ProviderEvent::Approval(request),
+                    } if request.id != first.id => Some(request),
+                    _ => None,
+                });
+            if let Some(request) = found {
+                break request;
+            }
+            assert!(Instant::now() < deadline, "{:?}", recorder.updates());
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(runner.respond(UserResponse::Approval {
+            id: second.id.clone(),
+            approved: true,
+        }));
+
+        let updates = recorder.wait_for_end(TURN_BUDGET);
+        assert!(
+            matches!(updates.last(), Some(SessionUpdate::Failed { reason }) if reason.starts_with(ANSWER_FAILED)),
+            "{updates:?}"
+        );
+        assert!(updates.contains(&SessionUpdate::InteractionResolved { id: second.id }));
+        assert!(lock(&conversation).pending_approvals().is_empty());
+    }
+
+    #[test]
+    fn claude_stopped_while_thinking_does_not_hand_the_prompt_back() {
+        // Thinking produces no event, so a Stop during it used to restore a
+        // prompt Claude had already read, and sending it again duplicated it.
+        let Some(server) = ClaudeFixture::new() else {
+            return;
+        };
+        let conversation = conversation();
+        let (runner, recorder) = server.start(&conversation, "think", AgentAccess::Supervised);
+        let marker = server.dir.path().join("thinking");
+        let deadline = Instant::now() + TURN_BUDGET;
+        while !marker.exists() {
+            assert!(Instant::now() < deadline, "the fixture never thought");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The frame is on the pipe; give the reader a moment to take it.
+        std::thread::sleep(Duration::from_millis(200));
+        runner.interrupt();
+        let updates = recorder.wait_for_end(TURN_BUDGET);
+        assert!(
+            matches!(
+                updates.last(),
+                Some(SessionUpdate::Finished {
+                    outcome: TurnOutcome::Cancelled { .. }
+                })
+            ),
+            "{updates:?}"
+        );
+        assert!(updates.contains(&SessionUpdate::Accepted), "{updates:?}");
+    }
+
+    #[test]
+    fn claude_does_not_spin_once_the_response_channel_closes() {
+        // A closed channel is ready forever. Selecting on it again and again
+        // burned a whole CPU for the rest of the turn.
+        let Some(server) = ClaudeFixture::new() else {
+            return;
+        };
+        fn thread_cpu() -> Duration {
+            let mut now = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: writes only into `now`.
+            unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut now) };
+            Duration::new(now.tv_sec as u64, now.tv_nsec as u32)
+        }
+        let conversation = conversation();
+        let (updates, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let job = server.job(&conversation, "hang", move |update| {
+            let _ = updates.send(update);
+        });
+        // Everything runs on this one thread, so its CPU time is the turn's.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let used = runtime.block_on(async {
+            let (interrupt, interrupts) = tokio::sync::mpsc::unbounded_channel();
+            let (closed, responses) = tokio::sync::mpsc::unbounded_channel();
+            drop(closed);
+            let task = tokio::spawn(job.run(interrupts, responses));
+            tokio::time::timeout(TURN_BUDGET, async {
+                while !matches!(
+                    received.recv().await,
+                    Some(SessionUpdate::Started { .. }) | None
+                ) {}
+            })
+            .await
+            .expect("the turn started");
+            let before = thread_cpu();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let used = thread_cpu() - before;
+            interrupt.send(()).unwrap();
+            tokio::time::timeout(TURN_BUDGET, task)
+                .await
+                .expect("the turn stopped")
+                .unwrap();
+            used
+        });
+        assert!(
+            used < Duration::from_millis(150),
+            "an idle turn used {used:?} of CPU in 300 ms"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1734,6 +2682,9 @@ for line in sys.stdin:
                 },
                 project_root: server.dir.path().display().to_string(),
                 prompt: prompt.into(),
+                attachments: Vec::new(),
+                control: None,
+                steers: Mutex::new(None),
                 approvals: ApprovalPolicy::Ask,
                 access: AgentAccess::FullAccess,
                 model: "fixture-model".into(),
@@ -2031,9 +2982,24 @@ for line in sys.stdin:
         for item in (msg.get("params") or {}).get("input") or []:
             if item.get("type") == "text":
                 prompt = item.get("text") or ""
+        if prompt == "slow-ack":
+            # Codex has the prompt; its reply is still on the way when Stop lands.
+            open("THREAD_LOG" + ".turn-start", "w").close()
+            time.sleep(0.5)
         send({"jsonrpc": "2.0", "id": mid, "result": {"turn": {"id": "turn-1"}}})
 
-        if prompt == "fail-now":
+        if prompt == "spawn-and-hang":
+            # A tool that is still running when the user presses Stop.
+            import subprocess
+            child = subprocess.Popen(["sleep", "60"])
+            with open("THREAD_LOG" + ".child", "w") as pid:
+                pid.write(str(child.pid))
+            send({"jsonrpc": "2.0", "method": "turn/started",
+                  "params": {"turn": {"id": "turn-1"}}})
+        elif prompt == "slow-ack":
+            send({"jsonrpc": "2.0", "method": "turn/started",
+                  "params": {"turn": {"id": "turn-1"}}})
+        elif prompt == "fail-now":
             send({"jsonrpc": "2.0", "method": "turn/completed",
                   "params": {"turn": {"id": "turn-1", "status": "failed",
                                       "error": {"message": "the model refused"}}}})
@@ -2042,6 +3008,45 @@ for line in sys.stdin:
             echoed = json.dumps(msg.get("params")) if prompt == "echo-params" else workflow
             send({"jsonrpc": "2.0", "method": "item/agentMessage/delta", "params": {"delta": echoed}})
             send({"jsonrpc": "2.0", "method": "turn/completed", "params": {"turn": {"id": "turn-1", "status": "completed"}}})
+        elif prompt == "echo-images":
+            # Reads each image the way Codex does, from its path, and reports
+            # what it found there.
+            seen = []
+            for item in (msg.get("params") or {}).get("input") or []:
+                if item.get("type") == "localImage":
+                    with open(item.get("path"), "rb") as image:
+                        seen.append([len(image.read()), item.get("path")])
+            send({"jsonrpc": "2.0", "method": "turn/started", "params": {"turn": {"id": "turn-1"}}})
+            send({"jsonrpc": "2.0", "method": "item/agentMessage/delta", "params": {"delta": json.dumps(seen)}})
+            send({"jsonrpc": "2.0", "method": "turn/completed", "params": {"turn": {"id": "turn-1", "status": "completed"}}})
+        elif prompt == "wait-for-steer":
+            # Starts, then waits for guidance and answers it within the turn.
+            send({"jsonrpc": "2.0", "method": "turn/started", "params": {"turn": {"id": "turn-1"}}})
+            while True:
+                waiting = sys.stdin.readline()
+                if not waiting:
+                    sys.exit(0)
+                if not waiting.strip():
+                    continue
+                request = json.loads(waiting)
+                if request.get("method") == "turn/steer":
+                    params = request.get("params") or {}
+                    with open("THREAD_LOG", "a") as log:
+                        log.write(json.dumps({"method": "turn/steer", "params": params}) + "\n")
+                    send({"jsonrpc": "2.0", "id": request.get("id"),
+                          "result": {"turnId": params.get("expectedTurnId")}})
+                    guidance = ""
+                    for item in params.get("input") or []:
+                        if item.get("type") == "text":
+                            guidance = item.get("text") or ""
+                    send({"jsonrpc": "2.0", "method": "item/agentMessage/delta",
+                          "params": {"delta": "Steered: " + guidance}})
+                    send({"jsonrpc": "2.0", "method": "turn/completed",
+                          "params": {"turn": {"id": "turn-1", "status": "completed"}}})
+                    break
+                if request.get("method") == "turn/interrupt":
+                    send({"jsonrpc": "2.0", "id": request.get("id"), "result": {}})
+                    break
         elif prompt == "hang":
             # Starts, says nothing, and never completes.
             send({"jsonrpc": "2.0", "method": "turn/started",
@@ -2088,11 +3093,338 @@ for line in sys.stdin:
                   "params": {"turn": {"id": "turn-1", "status": "completed",
                                       "usage": {"input_tokens": 12, "output_tokens": 3}}}})
     elif method == "turn/interrupt":
+        with open("THREAD_LOG" + ".interrupts", "a") as log:
+            log.write(json.dumps(msg.get("params")) + "\n")
         send({"jsonrpc": "2.0", "id": mid, "result": {}})
+    elif method == "thread/compact/start":
+        params = msg.get("params") or {}
+        with open("THREAD_LOG", "a") as log:
+            log.write(json.dumps({"method": method, "params": params}) + "\n")
+        send({"jsonrpc": "2.0", "id": mid, "result": {}})
+        thread = params.get("threadId")
+        send({"jsonrpc": "2.0", "method": "item/started", "params": {
+            "threadId": thread, "item": {"id": "compact-1", "type": "contextCompaction"}}})
+        send({"jsonrpc": "2.0", "method": "thread/compacted", "params": {"threadId": thread}})
+    elif method in ("thread/goal/set", "thread/goal/get", "thread/goal/clear"):
+        params = msg.get("params") or {}
+        with open("THREAD_LOG", "a") as log:
+            log.write(json.dumps({"method": method, "params": params}) + "\n")
+        if method == "thread/goal/clear":
+            send({"jsonrpc": "2.0", "id": mid, "result": {}})
+        elif method == "thread/goal/get":
+            send({"jsonrpc": "2.0", "id": mid, "result": {"goal": None}})
+        else:
+            send({"jsonrpc": "2.0", "id": mid, "result": {"goal": {
+                "threadId": params.get("threadId"),
+                "objective": params.get("objective", "kept objective"),
+                "status": params.get("status", "active"),
+                "tokensUsed": 1200, "tokenBudget": 5000}}})
     else:
         send({"jsonrpc": "2.0", "id": mid,
               "error": {"code": -32601, "message": "unknown method"}})
 "#;
+
+    // ── Images, steering and thread controls ─────────────────────────────────
+
+    fn start_work(
+        conversation: &Arc<Mutex<Conversation>>,
+        provider: CodexProvider,
+        work: Work,
+    ) -> (TurnRunner, Recorder) {
+        let recorder = Recorder::default();
+        let sink = recorder.clone();
+        let runner = TurnRunner::launch_work_with(
+            conversation.clone(),
+            "/tmp/project".to_string(),
+            Agent::new("Runner"),
+            work,
+            ApprovalPolicy::AllowAll,
+            provider,
+            move |update| sink.record(update),
+        );
+        (runner, recorder)
+    }
+
+    /// Bytes that sniff as a PNG, which is all the attachment path reads.
+    fn png_bytes(len: usize) -> Vec<u8> {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.resize(len, 7);
+        bytes
+    }
+
+    #[test]
+    fn images_reach_codex_as_private_files_that_last_only_for_the_turn() {
+        let Some(server) = FakeServer::new() else {
+            return;
+        };
+        let Some(provider) = server.provider() else {
+            return;
+        };
+        let conversation = conversation();
+        let images = vec![
+            fx_core::Attachment::new(png_bytes(40), "image/png", "a.png"),
+            fx_core::Attachment::new(png_bytes(64), "image/png", "b.png"),
+        ];
+        let (_runner, recorder) = start_work(
+            &conversation,
+            provider,
+            Work::prompt("echo-images").with_attachments(images),
+        );
+        let updates = recorder.wait_for_end(TURN_BUDGET);
+        assert!(
+            matches!(updates.last(), Some(SessionUpdate::Finished { outcome }) if outcome.is_completed()),
+            "{updates:?}"
+        );
+        let seen: Vec<(usize, String)> =
+            serde_json::from_str(&lock(&conversation).last_text().unwrap()).unwrap();
+        assert_eq!(
+            seen.iter().map(|(len, _)| *len).collect::<Vec<_>>(),
+            vec![40, 64],
+            "Codex did not read the images it was sent, in order"
+        );
+        for (_, path) in seen {
+            assert!(path.ends_with(".png"), "{path}");
+            assert!(
+                !std::path::Path::new(&path).exists(),
+                "{path} outlived the turn"
+            );
+        }
+    }
+
+    #[test]
+    fn steering_a_running_codex_turn_lands_the_guidance_where_codex_took_it() {
+        let Some(server) = FakeServer::new() else {
+            return;
+        };
+        let Some(provider) = server.provider() else {
+            return;
+        };
+        let conversation = conversation();
+        let (runner, recorder) = start(
+            &conversation,
+            provider,
+            "wait-for-steer",
+            ApprovalPolicy::AllowAll,
+        );
+        wait_for_phase(&conversation, Phase::Running);
+        let id = Uuid::new_v4();
+        assert!(runner.steer(id, "use zsh".into(), Vec::new()));
+        let updates = recorder.wait_for_end(TURN_BUDGET);
+
+        assert!(
+            updates.contains(&SessionUpdate::Steered { id, result: Ok(()) }),
+            "{updates:?}"
+        );
+        assert_eq!(
+            rows(&conversation),
+            vec!["text: use zsh", "text: Steered: use zsh"],
+            "the guidance must sit before the reply it produced"
+        );
+        let steer = server
+            .thread_calls()
+            .into_iter()
+            .find(|(method, _)| method == "turn/steer")
+            .expect("Codex was steered");
+        assert_eq!(steer.1["threadId"], "thread-new");
+        assert_eq!(steer.1["expectedTurnId"], "turn-1");
+    }
+
+    #[test]
+    fn guidance_a_turn_never_takes_is_answered_rather_than_dropped() {
+        // Whichever way this races — before the turn is acknowledged, while
+        // it finishes, or after — the composer is holding the draft until it
+        // hears back, so it must hear back.
+        let Some(server) = FakeServer::new() else {
+            return;
+        };
+        let Some(provider) = server.provider() else {
+            return;
+        };
+        let conversation = conversation();
+        let (runner, recorder) = start(&conversation, provider, "hello", ApprovalPolicy::AllowAll);
+        let id = Uuid::new_v4();
+        let sent = runner.steer(id, "too late".into(), Vec::new());
+        let updates = recorder.wait_for_end(TURN_BUDGET);
+        if sent {
+            assert!(
+                updates.iter().any(|update| matches!(
+                    update,
+                    SessionUpdate::Steered { id: steered, result: Err(_) } if *steered == id
+                )),
+                "{updates:?}"
+            );
+        }
+        assert!(!rows(&conversation).contains(&"text: too late".to_string()));
+    }
+
+    #[test]
+    fn compacting_resumes_the_thread_and_waits_for_codex_to_finish() {
+        let Some(server) = FakeServer::new() else {
+            return;
+        };
+        let Some(provider) = server.provider() else {
+            return;
+        };
+        let conversation = conversation();
+        lock(&conversation).set_session_id("thread-old");
+        let (_runner, recorder) = start_work(
+            &conversation,
+            provider,
+            Work::control(ThreadControl::Compact),
+        );
+        let updates = recorder.wait_for_end(TURN_BUDGET);
+        assert!(
+            matches!(updates.last(), Some(SessionUpdate::Finished { outcome }) if outcome.is_completed()),
+            "{updates:?}"
+        );
+        let calls = server.thread_calls();
+        assert_eq!(calls[0].0, "thread/resume");
+        assert_eq!(calls[1].0, "thread/compact/start");
+        assert_eq!(calls[1].1["threadId"], "thread-old");
+        let conversation = lock(&conversation);
+        assert!(
+            conversation
+                .activities()
+                .any(|activity| activity.summary == "Context compacted"),
+            "the compaction was not waited for"
+        );
+        assert_eq!(conversation.phase(), Phase::Idle);
+        assert_eq!(conversation.message_count(), 0, "a control adds no rows");
+    }
+
+    #[test]
+    fn compacting_a_thread_with_no_session_starts_nothing() {
+        let Some(server) = FakeServer::new() else {
+            return;
+        };
+        let Some(provider) = server.provider() else {
+            return;
+        };
+        let conversation = conversation();
+        let (_runner, recorder) = start_work(
+            &conversation,
+            provider,
+            Work::control(ThreadControl::Compact),
+        );
+        recorder.wait_for_end(TURN_BUDGET);
+        assert!(server.thread_calls().is_empty(), "Codex was started anyway");
+        assert!(
+            lock(&conversation)
+                .activities()
+                .any(|activity| activity.summary.starts_with("Nothing to compact"))
+        );
+    }
+
+    #[test]
+    fn a_goal_set_from_the_composer_reaches_codex_and_reports_back() {
+        let Some(server) = FakeServer::new() else {
+            return;
+        };
+        let Some(provider) = server.provider() else {
+            return;
+        };
+        let conversation = conversation();
+        lock(&conversation).set_session_id("thread-old");
+        let (_runner, recorder) = start_work(
+            &conversation,
+            provider,
+            Work::control(ThreadControl::GoalSet("Ship the release".into())),
+        );
+        let updates = recorder.wait_for_end(TURN_BUDGET);
+        let goal = updates
+            .iter()
+            .find_map(|update| match update {
+                SessionUpdate::GoalChanged { goal } => goal.clone(),
+                _ => None,
+            })
+            .expect("the goal was reported");
+        assert_eq!(goal.objective, "Ship the release");
+        assert_eq!(goal.status, fx_core::models::GoalStatus::Active);
+        assert_eq!(goal.usage_text().as_deref(), Some("1.2k/5.0k"));
+        let set = server
+            .thread_calls()
+            .into_iter()
+            .find(|(method, _)| method == "thread/goal/set")
+            .unwrap();
+        assert_eq!(
+            set.1,
+            serde_json::json!({
+                "threadId": "thread-old",
+                "objective": "Ship the release",
+                "status": "active",
+            })
+        );
+    }
+
+    #[test]
+    fn claude_takes_guidance_on_its_live_stream_json_input() {
+        let Some(server) = ClaudeFixture::new() else {
+            return;
+        };
+        let conversation = conversation();
+        let (runner, recorder) = server.start(&conversation, "hang", AgentAccess::FullAccess);
+        let deadline = Instant::now() + TURN_BUDGET;
+        while !recorder
+            .updates()
+            .iter()
+            .any(|update| matches!(update, SessionUpdate::Started { .. }))
+        {
+            assert!(Instant::now() < deadline, "{:?}", recorder.updates());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let id = Uuid::new_v4();
+        assert!(runner.steer(id, "use zsh".into(), Vec::new()));
+        let updates = recorder.wait_for_end(TURN_BUDGET);
+        assert!(
+            updates.contains(&SessionUpdate::Steered { id, result: Ok(()) }),
+            "{updates:?}"
+        );
+        assert_eq!(rows(&conversation), vec!["text: use zsh", "text: use zsh"]);
+        let received = server.received();
+        let users: Vec<&Value> = received
+            .iter()
+            .filter(|message| message["type"] == "user")
+            .collect();
+        assert_eq!(users.len(), 2, "{received:?}");
+        assert_eq!(users[1]["message"]["content"][0]["text"], "use zsh");
+    }
+
+    #[test]
+    fn only_compact_and_goal_are_slash_commands() {
+        use fx_core::models::GoalStatus;
+        assert_eq!(
+            ThreadControl::parse(" /compact "),
+            Some(ThreadControl::Compact)
+        );
+        assert_eq!(
+            ThreadControl::parse("/Compact"),
+            Some(ThreadControl::Compact)
+        );
+        assert_eq!(ThreadControl::parse("/goal"), Some(ThreadControl::GoalView));
+        assert_eq!(
+            ThreadControl::parse("/goal pause"),
+            Some(ThreadControl::GoalStatus(GoalStatus::Paused))
+        );
+        assert_eq!(
+            ThreadControl::parse("/goal resume"),
+            Some(ThreadControl::GoalStatus(GoalStatus::Active))
+        );
+        assert_eq!(
+            ThreadControl::parse("/goal CLEAR"),
+            Some(ThreadControl::GoalClear)
+        );
+        assert_eq!(
+            ThreadControl::parse("/goal  Ship the\nrelease "),
+            Some(ThreadControl::GoalSet("Ship the\nrelease".into()))
+        );
+        // A provider's own command, and prose that mentions one, are prompts.
+        assert_eq!(ThreadControl::parse("/review the diff"), None);
+        assert_eq!(ThreadControl::parse("please /compact"), None);
+        assert_eq!(ThreadControl::parse("/compactor"), None);
+        assert!(ThreadControl::Compact.supported_by("claude"));
+        assert!(!ThreadControl::GoalView.supported_by("claude"));
+        assert!(ThreadControl::GoalClear.supported_by("codex"));
+    }
 
     #[test]
     fn the_embedded_fixture_is_valid_python() {

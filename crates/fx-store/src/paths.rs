@@ -81,7 +81,20 @@ impl AppPaths {
 }
 
 /// Create a directory that only the owner can enter.
+///
+/// Every directory this creates is owner-only, not just the last: the ones in
+/// between hold transcripts and attachments too. One that already existed keeps
+/// its mode, except `path` itself — its parents can be the user's own folders.
 pub fn create_private_dir(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)?;
+    }
+    #[cfg(not(unix))]
     std::fs::create_dir_all(path)?;
     set_private_mode(path)
 }
@@ -135,6 +148,28 @@ mod tests {
         let release = AppPaths::discover(false).expect("support directory");
         assert_ne!(debug.root(), release.root());
         assert!(debug.root().to_string_lossy().contains("FlowX-Dev"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn every_directory_created_is_owner_only_and_existing_parents_are_left_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode =
+            |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let temp = tempfile::tempdir().unwrap();
+        let users_folder = temp.path().join("Application Support");
+        std::fs::create_dir(&users_folder).unwrap();
+        std::fs::set_permissions(&users_folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let paths = AppPaths::at(users_folder.join("FlowX"));
+        create_private_dir(&paths.assets_dir(Uuid::nil(), Uuid::from_u128(3))).unwrap();
+
+        assert_eq!(mode(&users_folder), 0o755, "a folder FlowX did not make");
+        let mut directory = paths.assets_dir(Uuid::nil(), Uuid::from_u128(3));
+        while directory != users_folder {
+            assert_eq!(mode(&directory), 0o700, "{}", directory.display());
+            directory.pop();
+        }
     }
 
     #[test]

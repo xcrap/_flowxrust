@@ -62,36 +62,64 @@
 //! It is kept mutable so a later change — reclaiming focus, for one — does not
 //! have to change the signature every caller already depends on.
 //!
+//! # Images, steering and the queue
+//!
+//! The composer draws what the caller holds and reports what the reader did;
+//! it prepares nothing itself. Images arrive three ways — the picker, a drop
+//! on the card, and ⌘V with an image on the clipboard — and each is one
+//! [`ComposerAction`]: reading a file and decoding a thumbnail are the
+//! caller's and the asset loader's work, not a render's.
+//!
+//! While a turn runs, ⌘↩ and ⌃↩ submit as the two follow-ups — steer the
+//! running turn, or queue behind it — in the order the caller's
+//! [`FollowUp`] setting puts them. Both are actions bound in the composer's
+//! key context, so they reach the composer and nothing else.
+//!
 //! # What the Swift did that this does not
 //!
-//! Three omissions are deliberate rather than forgotten, and each one is a
-//! decision that belongs above this file:
-//!
-//! - **Attachment chips and the drop target.** The button calls back and draws
-//!   nothing: preparing an image needs the attachment pipeline, and a thumbnail
-//!   needs a decode step this view has no business running.
-//! - **Editing a queued prompt in place.** The strip removes a prompt and shows
-//!   it; it does not edit it. An inline editor needs its own `TextField` per
-//!   queued row, and its own focus owner, which is state this view does not
-//!   hold.
 //! - **`focusComposer()` on appear.** A function view cannot tell a first render
 //!   from a repaint, and focusing on every pass would pull the caret out of the
 //!   terminal and the browser. The caller focuses the field.
+//! - **Pasting a file copied in Finder.** GPUI's clipboard hands over text
+//!   whenever the pasteboard has any, and a Finder copy carries the file's
+//!   name as text, so it pastes the name. Dragging the file attaches it.
 
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use fx_agent::conversation::state::VISIBLE_QUEUED_PROMPTS;
+use fx_core::models::{ConversationGoal, GoalStatus};
 use fx_design::components::{
-    BadgeTone, ContextUsage, IconButtonProps, ProviderIdentity, SegmentedOption, TurnAction, badge,
-    context_meter, icon_button, segmented_control, turn_action_button,
+    BadgeTone, ButtonStyle, ContextUsage, IconButtonProps, ProviderIdentity, SegmentedOption,
+    TurnAction, badge, button, context_meter, icon_button, segmented_control, turn_action_button,
 };
 use fx_design::icon::Icon;
 use fx_design::styled::{FxStyled, px_len};
 use fx_design::theme::{BorderWidth, Colors, IconSize, Layout, Radii, Spacing, TextRole, global};
 use gpui::prelude::*;
-use gpui::{AnyElement, App, ClickEvent, Entity, SharedString, Window, div, px};
+use gpui::{AnyElement, App, ClickEvent, Entity, ExternalPaths, SharedString, Window, div, px};
 
+use crate::state::FollowUp;
 use crate::text_field::TextField;
+
+gpui::actions!(
+    composer,
+    [
+        /// ⌘↩: send, or the default follow-up while a turn runs.
+        SubmitPrompt,
+        /// ⌃↩: send, or the other follow-up while a turn runs.
+        SubmitAlternate,
+        /// ⌘⇧A: choose images to attach to the active thread's prompt.
+        AttachImages
+    ]
+);
+
+/// The key context the composer's bindings are scoped to.
+///
+/// Scoped rather than global: ⌘↩ in a settings field must not send the
+/// composer's draft. The queued-prompt editor sits inside this context and
+/// claims both actions first, as a save.
+pub const KEY_CONTEXT: &str = "Composer";
 
 /// The callback every control reports through.
 ///
@@ -117,12 +145,27 @@ pub enum ComposerPicker {
 /// removed is dead weight.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComposerAction {
-    /// Send the draft. Fired by the primary control when it is showing Send.
+    /// Send the draft. Fired by the primary control when it is showing Send,
+    /// and by ⌘↩, which while a turn runs means the default follow-up.
     Submit,
+    /// ⌃↩: send, or the other follow-up while a turn runs.
+    SubmitAlternate,
     /// Stop the running turn. Fired by the same control while it shows Stop.
     Stop,
     /// Open the attachment picker.
     Attach,
+    /// Files were dropped on the composer.
+    AttachPaths(Vec<PathBuf>),
+    /// ⌘V found an image, not text, on the clipboard.
+    PasteImage(gpui::Image),
+    /// Take one pending image back out, by its attachment id.
+    RemoveAttachment(uuid::Uuid),
+    /// Open the queued prompt at this position for editing.
+    EditQueued(usize),
+    /// Save the open queued-prompt edit.
+    SaveQueuedEdit,
+    /// Close the queued-prompt editor without saving.
+    CancelQueuedEdit,
     /// A picker changed. The value is the caller's own vocabulary, not the
     /// composer's.
     Select(ComposerPicker, String),
@@ -200,7 +243,51 @@ pub struct ComposerChrome {
     pub model: Picker,
     /// The reasoning effort.
     pub effort: Picker,
+    /// Images waiting to go with the next prompt, in attachment order.
+    pub attachments: Vec<ComposerAttachment>,
+    /// Images are still being read, so Send would leave them behind.
+    pub preparing_attachments: bool,
+    /// What to tell the reader about their last attach, send, or steer.
+    pub notice: Option<SharedString>,
+    /// Guidance is waiting for the provider to take it. Nothing can be sent
+    /// until it answers, because the draft is the guidance.
+    pub steering: bool,
+    /// What ⌘↩ does while a turn runs; ⌃↩ does the other.
+    pub follow_up: FollowUp,
+    /// The thread's goal, drawn above the card.
+    pub goal: Option<ConversationGoal>,
+    /// The queued prompt open for editing: its queue position, and its field.
+    pub editing_queued: Option<(usize, Entity<TextField>)>,
     on_action: Option<ActionHandler>,
+}
+
+/// One image in the composer, as the chip row needs it.
+#[derive(Clone)]
+pub struct ComposerAttachment {
+    pub id: uuid::Uuid,
+    pub filename: SharedString,
+    /// Interned through the inline-image cache, so a repaint neither copies
+    /// nor re-hashes the image.
+    pub(crate) image: crate::attachments::ImageInput,
+}
+
+impl ComposerAttachment {
+    pub(crate) fn new(attachment: &fx_core::Attachment) -> Self {
+        Self {
+            id: attachment.id,
+            filename: SharedString::from(attachment.filename.clone()),
+            image: crate::attachments::ImageInput::inline(&attachment.data),
+        }
+    }
+}
+
+impl std::fmt::Debug for ComposerAttachment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ComposerAttachment")
+            .field("id", &self.id)
+            .field("filename", &self.filename)
+            .finish()
+    }
 }
 
 impl std::fmt::Debug for ComposerChrome {
@@ -214,6 +301,9 @@ impl std::fmt::Debug for ComposerChrome {
             .field("enabled", &self.enabled)
             .field("model", &self.model)
             .field("effort", &self.effort)
+            .field("attachments", &self.attachments)
+            .field("steering", &self.steering)
+            .field("follow_up", &self.follow_up)
             .field("wired", &self.on_action.is_some())
             .finish()
     }
@@ -232,9 +322,37 @@ impl ComposerChrome {
     }
 
     /// Whether Send would do anything: the composer is enabled, no turn is
-    /// running, and there is a prompt to send.
+    /// running, and there is a prompt to send — words, images, or both.
+    ///
+    /// Not while images are still being read: sending then would leave them
+    /// behind, and the reader attached them to go with this prompt.
     pub fn can_send(&self, draft: &str) -> bool {
-        self.enabled && !self.busy && has_text(draft)
+        self.enabled
+            && !self.busy
+            && !self.preparing_attachments
+            && (has_text(draft) || !self.attachments.is_empty())
+    }
+
+    /// Whether ⌘↩ or ⌃↩ would do anything while a turn runs.
+    pub fn can_follow_up(&self, draft: &str) -> bool {
+        self.busy
+            && !self.steering
+            && !self.preparing_attachments
+            && (has_text(draft) || !self.attachments.is_empty())
+    }
+
+    /// The keyboard hint under the card, which says what the keys do now.
+    pub fn shortcut_hint(&self) -> &'static str {
+        if self.steering {
+            return "Sending guidance to the running turn…";
+        }
+        if !self.busy {
+            return "⌘ Return to send · Return for a new line";
+        }
+        match self.follow_up {
+            FollowUp::Steer => "⌘ Return to steer · ⌃ Return to queue",
+            FollowUp::Queue => "⌘ Return to queue · ⌃ Return to steer",
+        }
     }
 
     /// Whether the queue strip has anything to show.
@@ -304,6 +422,13 @@ pub fn view_with_controls(
     let can_send = chrome.can_send(field.read(cx).value());
     // The outer card owns focus styling for the app's borderless input.
     let focused = field.read(cx).focus_handle().is_focused(window);
+    let handler = chrome.handler();
+    let for_submit = handler.clone();
+    let for_alternate = handler.clone();
+    // An image on the clipboard is only an attachment where one can attach.
+    let for_paste = handler
+        .clone()
+        .filter(|_| chrome.attachments_enabled && chrome.enabled && !chrome.steering);
 
     div()
         .w_full()
@@ -312,6 +437,27 @@ pub fn view_with_controls(
         .flex_col()
         .items_center()
         .bg(Colors::content_bg(&theme))
+        .key_context(KEY_CONTEXT)
+        .on_action(move |_: &SubmitPrompt, window, cx| {
+            if let Some(handler) = &for_submit {
+                handler(ComposerAction::Submit, window, cx);
+            }
+        })
+        .on_action(move |_: &SubmitAlternate, window, cx| {
+            if let Some(handler) = &for_alternate {
+                handler(ComposerAction::SubmitAlternate, window, cx);
+            }
+        })
+        // Captured before the field sees the key: an image on the clipboard
+        // is an attachment, and the field would otherwise paste nothing.
+        .capture_key_down(move |event, window, cx| {
+            if let Some(handler) = &for_paste
+                && let Some(image) = pasted_image(&event.keystroke, cx)
+            {
+                cx.stop_propagation();
+                handler(ComposerAction::PasteImage(image), window, cx);
+            }
+        })
         .child(
             div()
                 .w_full()
@@ -323,6 +469,7 @@ pub fn view_with_controls(
                 .px(px_len(Spacing::LG))
                 .pt(px_len(Spacing::SM))
                 .pb(px_len(Spacing::MD))
+                .children(chrome.goal.as_ref().map(goal_row))
                 .child(composer_card(
                     field,
                     chrome,
@@ -335,10 +482,88 @@ pub fn view_with_controls(
                         .pt(px_len(Spacing::SM))
                         .fx_caption()
                         .text_color(Colors::fg_tertiary(&theme))
-                        .child("⌘ Return to send · Return for a new line"),
+                        .child(chrome.shortcut_hint()),
                 ),
         )
         .into_any_element()
+}
+
+/// The image ⌘V would paste, when the clipboard holds one and no text.
+///
+/// GPUI returns text whenever the pasteboard has any, so an image here is
+/// what the reader copied rather than a rendition beside their words.
+fn pasted_image(keystroke: &gpui::Keystroke, cx: &App) -> Option<gpui::Image> {
+    if !keystroke.modifiers.secondary()
+        || keystroke.modifiers.shift
+        || !keystroke.key.eq_ignore_ascii_case("v")
+    {
+        return None;
+    }
+    cx.read_from_clipboard()?
+        .into_entries()
+        .find_map(|entry| match entry {
+            gpui::ClipboardEntry::Image(image) => Some(image),
+            gpui::ClipboardEntry::String(_) => None,
+        })
+}
+
+// ── The goal ───────────────────────────────────────────────────────────────
+
+/// The thread's goal, above the card: what it is and where it stands.
+fn goal_row(goal: &ConversationGoal) -> AnyElement {
+    let theme = global::current();
+    div()
+        .debug_selector(|| "composer.goal".into())
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px_len(Spacing::SM))
+        .mb(px_len(Spacing::SM))
+        .px(px_len(Spacing::SM))
+        .py(px_len(Spacing::XS))
+        .rounded(px_len(Radii::SM))
+        .bg(Colors::bg_surface(&theme))
+        .child(Icon::TARGET.render(IconSize::Regular, Colors::accent(&theme), &theme))
+        .child(
+            div()
+                .flex_shrink_0()
+                .fx_role(TextRole::CaptionMedium)
+                .text_color(Colors::fg_secondary(&theme))
+                .child("Goal"),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .fx_caption()
+                .text_color(Colors::fg(&theme))
+                .child(SharedString::from(goal.objective.clone())),
+        )
+        .children(goal.usage_text().map(|usage| {
+            div()
+                .flex_shrink_0()
+                .fx_role(TextRole::MonoSmall)
+                .text_color(Colors::fg_tertiary(&theme))
+                .child(SharedString::from(usage))
+        }))
+        .child(badge(goal.status.label(), goal_tone(goal.status), false))
+        .into_any_element()
+}
+
+/// The original's tones: working is success, waiting is a warning, stuck is
+/// an error, and done is information.
+fn goal_tone(status: GoalStatus) -> BadgeTone {
+    match status {
+        GoalStatus::Active => BadgeTone::Success,
+        GoalStatus::Paused => BadgeTone::Warning,
+        GoalStatus::Blocked | GoalStatus::UsageLimited | GoalStatus::BudgetLimited => {
+            BadgeTone::Error
+        }
+        GoalStatus::Complete => BadgeTone::Info,
+    }
 }
 
 /// The bordered box the prompt and its controls sit in.
@@ -356,6 +581,8 @@ fn composer_card(
     } else {
         Colors::border_subtle(&theme)
     };
+    let accepts_drops = chrome.attachments_enabled && chrome.enabled && !chrome.steering;
+    let on_drop = chrome.handler().filter(|_| accepts_drops);
     let mut card = div()
         .w_full()
         .flex()
@@ -366,6 +593,19 @@ fn composer_card(
         .border_color(border)
         .debug_selector(|| CARD_SELECTOR.to_string())
         .p(px_len(Spacing::MD));
+    if let Some(on_drop) = on_drop {
+        // The edge says the drop will land here, as the original's did.
+        let accent = Colors::accent(&theme);
+        card = card
+            .drag_over::<ExternalPaths>(move |style, _, _, _| style.border_color(accent))
+            .on_drop(move |paths: &ExternalPaths, window, cx| {
+                on_drop(
+                    ComposerAction::AttachPaths(paths.paths().to_vec()),
+                    window,
+                    cx,
+                );
+            });
+    }
 
     if chrome.has_queued() {
         card = card.child(queued_strip(chrome));
@@ -380,8 +620,67 @@ fn composer_card(
             .pb(px_len(Spacing::SM))
             .child(field.clone().into_any_element()),
     )
+    .children(attachment_row(chrome))
+    .children(chrome.notice.clone().map(|notice| {
+        div()
+            .debug_selector(|| "composer.notice".into())
+            .w_full()
+            .px(px_len(Spacing::XXS))
+            .pb(px_len(Spacing::SM))
+            .fx_caption()
+            .text_color(Colors::fg_secondary(&theme))
+            .child(notice)
+    }))
     .child(control_row(chrome, can_send, configuration))
     .into_any_element()
+}
+
+/// The pending images, and a note while more are being read.
+fn attachment_row(chrome: &ComposerChrome) -> Option<AnyElement> {
+    if chrome.attachments.is_empty() && !chrome.preparing_attachments {
+        return None;
+    }
+    let theme = global::current();
+    let handler = chrome.handler();
+    // Frozen while guidance is in flight: the images are part of it.
+    let removable = !chrome.steering;
+    let mut row = div()
+        .debug_selector(|| "composer.attachments".into())
+        .w_full()
+        .flex()
+        .flex_row()
+        .flex_wrap()
+        .items_center()
+        .gap(px_len(Spacing::SM))
+        .px(px_len(Spacing::XXS))
+        .pb(px_len(Spacing::SM));
+    for (index, attachment) in chrome.attachments.iter().enumerate() {
+        let on_remove: crate::attachments::RemoveHandler = {
+            let handler = handler.clone().filter(|_| removable);
+            let id = attachment.id;
+            Rc::new(move |window, cx| {
+                if let Some(handler) = &handler {
+                    handler(ComposerAction::RemoveAttachment(id), window, cx);
+                }
+            })
+        };
+        row = row.child(crate::attachments::pending_chip(
+            attachment.image.clone(),
+            // Part of the remove control's id, so two pastes named alike
+            // still get a control each.
+            format!("Remove image {} ({})", index + 1, attachment.filename),
+            on_remove,
+        ));
+    }
+    if chrome.preparing_attachments {
+        row = row.child(
+            div()
+                .fx_caption()
+                .text_color(Colors::fg_tertiary(&theme))
+                .child("Preparing images…"),
+        );
+    }
+    Some(row.into_any_element())
 }
 
 /// The row of controls under the prompt, with the primary action at the end.
@@ -421,7 +720,12 @@ fn control_row(
             IconButtonProps::new(Icon::PAPERCLIP, "Attach images")
                 .small()
                 .ghost()
-                .enabled(chrome.enabled && chrome.attachments_enabled && handler.is_some()),
+                .enabled(
+                    chrome.enabled
+                        && chrome.attachments_enabled
+                        && !chrome.steering
+                        && handler.is_some(),
+                ),
             fire(handler.clone(), ComposerAction::Attach),
         ));
     }
@@ -577,6 +881,11 @@ fn queued_strip(chrome: &ComposerChrome) -> AnyElement {
     let mut rows = div().flex().flex_col().gap(px_len(Spacing::XXS));
     for (index, preview) in visible_queued(&chrome.queued).iter().enumerate() {
         rows = rows.child(queued_row(preview, index, &handler));
+        if let Some((editing, field)) = &chrome.editing_queued
+            && *editing == index
+        {
+            rows = rows.child(queued_editor(field, &handler));
+        }
     }
     // Only stated when the caller handed over more than the strip shows; a
     // truncated `queued_previews` leaves nothing to count.
@@ -681,6 +990,13 @@ fn queued_row(preview: &str, index: usize, handler: &Option<ActionHandler>) -> A
     }
 
     row.child(icon_button(
+        IconButtonProps::new(Icon::PENCIL, format!("Edit queued prompt {}", index + 1))
+            .tiny()
+            .ghost()
+            .enabled(handler.is_some()),
+        fire(handler.clone(), ComposerAction::EditQueued(index)),
+    ))
+    .child(icon_button(
         IconButtonProps::new(
             Icon::XMARK,
             // The label is part of the element id, so it has to distinguish rows
@@ -693,6 +1009,72 @@ fn queued_row(preview: &str, index: usize, handler: &Option<ActionHandler>) -> A
         fire(handler.clone(), ComposerAction::RemoveQueued(index)),
     ))
     .into_any_element()
+}
+
+/// The open edit of one queued prompt: its own field, then Cancel and Save.
+///
+/// The field sits inside the composer's key context, so ⌘↩ and ⌃↩ are
+/// claimed here first and mean Save; Escape means Cancel.
+fn queued_editor(field: &Entity<TextField>, handler: &Option<ActionHandler>) -> AnyElement {
+    let theme = global::current();
+    let for_submit = handler.clone();
+    let for_alternate = handler.clone();
+    let for_escape = handler.clone();
+    div()
+        .debug_selector(|| "composer.queue-editor".into())
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(px_len(Spacing::SM))
+        .pl(px_len(Spacing::LG))
+        .on_action(move |_: &SubmitPrompt, window, cx| {
+            if let Some(handler) = &for_submit {
+                handler(ComposerAction::SaveQueuedEdit, window, cx);
+            }
+        })
+        .on_action(move |_: &SubmitAlternate, window, cx| {
+            if let Some(handler) = &for_alternate {
+                handler(ComposerAction::SaveQueuedEdit, window, cx);
+            }
+        })
+        .on_key_down(move |event, window, cx| {
+            if event.keystroke.key == "escape"
+                && let Some(handler) = &for_escape
+            {
+                cx.stop_propagation();
+                handler(ComposerAction::CancelQueuedEdit, window, cx);
+            }
+        })
+        .child(
+            div()
+                .w_full()
+                .px(px_len(Spacing::MD))
+                .py(px_len(Spacing::SM))
+                .rounded(px_len(Radii::MD))
+                .bg(Colors::bg_surface(&theme))
+                .border(px_len(BorderWidth::HAIRLINE))
+                .border_color(Colors::border_subtle(&theme))
+                .child(field.clone().into_any_element()),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .gap(px_len(Spacing::SM))
+                .child(button(
+                    "Cancel",
+                    ButtonStyle::Ghost,
+                    handler.is_some(),
+                    fire(handler.clone(), ComposerAction::CancelQueuedEdit),
+                ))
+                .child(button(
+                    "Save",
+                    ButtonStyle::Primary,
+                    handler.is_some(),
+                    fire(handler.clone(), ComposerAction::SaveQueuedEdit),
+                )),
+        )
+        .into_any_element()
 }
 
 /// How many prompts the strip is standing in for.
@@ -881,6 +1263,78 @@ mod tests {
         let rendered = format!("{chrome:?}");
         assert!(rendered.contains("wired: true"), "{rendered}");
         assert!(!format!("{:?}", ComposerChrome::default()).contains("wired: true"));
+    }
+
+    fn pending(fill: u8) -> ComposerAttachment {
+        let mut data = b"\x89PNG\r\n\x1a\n".to_vec();
+        data.resize(32, fill);
+        ComposerAttachment::new(&fx_core::Attachment::new(
+            data,
+            "image/png",
+            "Pasted Image.png",
+        ))
+    }
+
+    #[test]
+    fn images_alone_are_a_prompt_but_not_while_more_are_being_read() {
+        let mut chrome = ComposerChrome {
+            enabled: true,
+            attachments: vec![pending(1)],
+            ..ComposerChrome::default()
+        };
+        assert!(chrome.can_send(""), "an image with no words is a prompt");
+        assert!(chrome.can_send("  \n"));
+        chrome.preparing_attachments = true;
+        assert!(
+            !chrome.can_send("and words"),
+            "sending now would leave the images being read behind"
+        );
+    }
+
+    #[test]
+    fn follow_ups_need_a_running_turn_and_wait_for_unanswered_guidance() {
+        let mut chrome = ComposerChrome {
+            enabled: true,
+            ..ComposerChrome::default()
+        };
+        assert!(!chrome.can_follow_up("guide"), "nothing is running");
+        chrome.busy = true;
+        assert!(chrome.can_follow_up("guide"));
+        assert!(!chrome.can_follow_up(" "));
+        chrome.steering = true;
+        assert!(
+            !chrome.can_follow_up("guide"),
+            "the draft is still the guidance"
+        );
+    }
+
+    #[test]
+    fn the_hint_says_what_the_keys_do_now() {
+        let mut chrome = ComposerChrome::default();
+        assert_eq!(
+            chrome.shortcut_hint(),
+            "⌘ Return to send · Return for a new line"
+        );
+        chrome.busy = true;
+        assert_eq!(
+            chrome.shortcut_hint(),
+            "⌘ Return to steer · ⌃ Return to queue"
+        );
+        chrome.follow_up = FollowUp::Queue;
+        assert_eq!(
+            chrome.shortcut_hint(),
+            "⌘ Return to queue · ⌃ Return to steer"
+        );
+        chrome.steering = true;
+        assert!(chrome.shortcut_hint().contains("guidance"));
+    }
+
+    #[test]
+    fn a_goal_badge_reads_as_the_original_s() {
+        assert_eq!(goal_tone(GoalStatus::Active), BadgeTone::Success);
+        assert_eq!(goal_tone(GoalStatus::Paused), BadgeTone::Warning);
+        assert_eq!(goal_tone(GoalStatus::BudgetLimited), BadgeTone::Error);
+        assert_eq!(goal_tone(GoalStatus::Complete), BadgeTone::Info);
     }
 
     #[test]
@@ -1193,6 +1647,181 @@ mod tests {
         window
             .update(&mut test, |_window, _entity, _cx| {})
             .expect("the window is still alive");
+    }
+
+    #[test]
+    fn a_composer_with_images_a_note_a_goal_and_an_open_edit_paints() {
+        let mut test = TestAppContext::single();
+        let (field, editor) = test.update(|cx| {
+            (
+                cx.new(TextField::new),
+                cx.new(|cx| TextField::new(cx).multiline(4.0)),
+            )
+        });
+        let goal = ConversationGoal::from_codex(&serde_json::json!({
+            "threadId": "t", "objective": "Ship the release", "status": "paused",
+            "tokensUsed": 1200, "tokenBudget": 5000
+        }))
+        .unwrap();
+        let chrome = ComposerChrome {
+            busy: true,
+            queued: vec!["run the suite".into(), "then the docs".into()],
+            editing_queued: Some((1, editor)),
+            attachments: vec![pending(1), pending(2)],
+            preparing_attachments: true,
+            notice: Some("b.png is not a supported image.".into()),
+            attachments_enabled: true,
+            goal: Some(goal),
+            ..live()
+        };
+        let window = test.add_window(move |_, _| Harness::new(field, chrome, "with images"));
+        test.refresh().expect("the composer painted");
+        let mut visual = VisualTestContext::from_window(*window.deref(), &test);
+        assert!(visual.debug_bounds("composer.goal").is_some());
+        assert!(visual.debug_bounds("composer.attachments").is_some());
+        assert!(visual.debug_bounds("composer.notice").is_some());
+        assert!(visual.debug_bounds("composer.queue-editor").is_some());
+        let chip = visual.debug_bounds("attachment.chip").expect("a chip");
+        assert_eq!(
+            chip.size,
+            size(
+                px(fx_design::components::attachment::ATTACHMENT_CHIP_SIZE),
+                px(fx_design::components::attachment::ATTACHMENT_CHIP_SIZE)
+            )
+        );
+    }
+
+    /// Every action a composer reported, in order.
+    type Recorded = Rc<std::cell::RefCell<Vec<ComposerAction>>>;
+
+    /// A composer wired to record every action, with the app's bindings.
+    fn recording(
+        chrome: ComposerChrome,
+        draft: &str,
+    ) -> (
+        TestAppContext,
+        gpui::WindowHandle<Harness>,
+        Entity<TextField>,
+        Recorded,
+    ) {
+        let mut test = TestAppContext::single();
+        test.update(|cx| {
+            cx.bind_keys([
+                gpui::KeyBinding::new("cmd-enter", SubmitPrompt, Some(KEY_CONTEXT)),
+                gpui::KeyBinding::new("ctrl-enter", SubmitAlternate, Some(KEY_CONTEXT)),
+            ])
+        });
+        let actions = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let recorded = actions.clone();
+        let chrome = chrome.on_action(move |action, _, _| recorded.borrow_mut().push(action));
+        let field = test.update(|cx| cx.new(|cx| TextField::new(cx).multiline(4.0)));
+        let mounted = field.clone();
+        let draft = draft.to_string();
+        let window = test.add_window(move |_, _| Harness::new(mounted, chrome, &draft));
+        test.refresh().expect("the composer painted");
+        (test, window, field, actions)
+    }
+
+    fn focus(
+        test: &mut TestAppContext,
+        window: &gpui::WindowHandle<Harness>,
+        field: &Entity<TextField>,
+    ) {
+        let field = field.clone();
+        window
+            .update(test, |_, window, cx| {
+                field.read(cx).focus_handle().focus(window)
+            })
+            .expect("the window is live");
+        test.refresh().expect("focus painted");
+    }
+
+    #[test]
+    fn command_and_control_return_are_the_two_follow_ups() {
+        let (mut test, window, field, actions) = recording(
+            ComposerChrome {
+                busy: true,
+                ..live()
+            },
+            "guide it",
+        );
+        focus(&mut test, &window, &field);
+        let mut visual = VisualTestContext::from_window(*window.deref(), &test);
+        visual.simulate_keystrokes("cmd-enter");
+        visual.simulate_keystrokes("ctrl-enter");
+        assert_eq!(
+            *actions.borrow(),
+            vec![ComposerAction::Submit, ComposerAction::SubmitAlternate]
+        );
+    }
+
+    #[test]
+    fn command_return_in_a_queued_prompt_s_editor_saves_the_edit() {
+        let mut test = TestAppContext::single();
+        test.update(|cx| {
+            cx.bind_keys([gpui::KeyBinding::new(
+                "cmd-enter",
+                SubmitPrompt,
+                Some(KEY_CONTEXT),
+            )])
+        });
+        let actions = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let recorded = actions.clone();
+        let (field, editor) = test.update(|cx| {
+            (
+                cx.new(TextField::new),
+                cx.new(|cx| TextField::new(cx).multiline(4.0)),
+            )
+        });
+        let chrome = ComposerChrome {
+            busy: true,
+            queued: vec!["queued".into()],
+            editing_queued: Some((0, editor.clone())),
+            ..live()
+        }
+        .on_action(move |action, _, _| recorded.borrow_mut().push(action));
+        let window = test.add_window(move |_, _| Harness::new(field, chrome, ""));
+        test.refresh().expect("painted");
+        let focused = editor.clone();
+        window
+            .update(&mut test, |_, window, cx| {
+                focused.read(cx).focus_handle().focus(window)
+            })
+            .unwrap();
+        test.refresh().unwrap();
+        let mut visual = VisualTestContext::from_window(*window.deref(), &test);
+        visual.simulate_keystrokes("cmd-enter");
+        visual.simulate_keystrokes("escape");
+        assert_eq!(
+            *actions.borrow(),
+            vec![
+                ComposerAction::SaveQueuedEdit,
+                ComposerAction::CancelQueuedEdit
+            ],
+            "the edit, not the composer's draft, is what ⌘↩ sends here"
+        );
+    }
+
+    #[test]
+    fn pasting_an_image_attaches_it_and_pasting_text_does_not() {
+        let image =
+            gpui::Image::from_bytes(gpui::ImageFormat::Png, b"\x89PNG\r\n\x1a\nrest".to_vec());
+        let (mut test, window, field, actions) = recording(
+            ComposerChrome {
+                attachments_enabled: true,
+                ..live()
+            },
+            "",
+        );
+        focus(&mut test, &window, &field);
+        test.update(|cx| cx.write_to_clipboard(gpui::ClipboardItem::new_image(&image)));
+        let mut visual = VisualTestContext::from_window(*window.deref(), &test);
+        visual.simulate_keystrokes("cmd-v");
+        assert_eq!(*actions.borrow(), vec![ComposerAction::PasteImage(image)]);
+
+        test.update(|cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string("words".into())));
+        visual.simulate_keystrokes("cmd-v");
+        assert_eq!(actions.borrow().len(), 1, "text is the field's to paste");
     }
 
     /// Measures the composer at a given window width and hands the two bounds to

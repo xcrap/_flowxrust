@@ -15,6 +15,9 @@ pub struct StatusLine {
     pub path: String,
     pub staged_status: String,
     pub unstaged_status: String,
+    /// The source of a rename or copy, which porcelain prints as its own record
+    /// after the destination.
+    pub original_path: Option<String>,
 }
 
 /// Everything one `git status --porcelain=v1 --branch -z` read tells us.
@@ -25,6 +28,9 @@ pub struct Status {
     pub has_commits: bool,
     pub ahead_count: usize,
     pub behind_count: usize,
+    /// The configured upstream no longer exists on the remote, which is also
+    /// how a clone of an empty repository starts out.
+    pub upstream_gone: bool,
     pub files: Vec<StatusLine>,
     /// Some file has unstaged edits to a tracked path, so `git diff --numstat`
     /// has work to do.
@@ -42,6 +48,7 @@ impl Default for Status {
             has_commits: true,
             ahead_count: 0,
             behind_count: 0,
+            upstream_gone: false,
             files: Vec::new(),
             needs_unstaged_stats: false,
             needs_staged_stats: false,
@@ -94,10 +101,14 @@ impl GitStatusParser {
             let is_rename_or_copy = ["R", "C"].contains(&staged_status.as_str())
                 || ["R", "C"].contains(&unstaged_status.as_str());
 
+            let original_path = is_rename_or_copy
+                .then(|| records.get(index + 1).map(|source| source.to_string()))
+                .flatten();
             snapshot.files.push(StatusLine {
                 path,
                 staged_status,
                 unstaged_status,
+                original_path,
             });
 
             index += if is_rename_or_copy { 2 } else { 1 };
@@ -167,6 +178,7 @@ impl GitStatusParser {
                 let staged = staged_numstat.get(&line.path);
                 GitFileStatus {
                     path: line.path.clone(),
+                    original_path: line.original_path.clone(),
                     staged_status: line.staged_status.clone(),
                     unstaged_status: line.unstaged_status.clone(),
                     staged_additions: staged.map_or(0, |c| c.additions),
@@ -184,6 +196,7 @@ impl GitStatusParser {
             has_commits: status.has_commits,
             ahead_count: status.ahead_count,
             behind_count: status.behind_count,
+            upstream_gone: status.upstream_gone,
             has_remote,
             content_revision,
             files,
@@ -206,21 +219,23 @@ impl GitStatusParser {
     }
 
     fn parse_branch_header(header: &str, snapshot: &mut Status) {
-        let trimmed = header.trim();
+        let mut trimmed = header.trim();
+        snapshot.has_commits = true;
 
-        // An unborn branch has no commits yet, so there is no upstream and no
-        // ahead/behind to report.
+        // An unborn branch has no commits yet, but a clone of an empty
+        // repository still names its upstream after the prefix:
+        // `No commits yet on main...origin/main [gone]`. Strip the prefix and
+        // read the rest exactly like an ordinary header.
         for prefix in ["No commits yet on ", "Initial commit on "] {
-            if let Some(branch) = trimmed.strip_prefix(prefix) {
-                snapshot.branch = branch.to_string();
+            if let Some(rest) = trimmed.strip_prefix(prefix) {
+                trimmed = rest;
                 snapshot.has_commits = false;
-                return;
+                break;
             }
         }
 
-        snapshot.has_commits = true;
-
-        // The header is `branch...upstream [ahead 1, behind 2]`.
+        // The header is `branch...upstream [ahead 1, behind 2]`, or
+        // `branch...upstream [gone]` once the remote branch is missing.
         let mut components = trimmed.splitn(2, " [");
         let branch_component = components.next().unwrap_or_default();
         match branch_component.split_once("...") {
@@ -240,6 +255,8 @@ impl GitStatusParser {
                 snapshot.ahead_count = count.trim().parse().unwrap_or(0);
             } else if let Some(count) = part.strip_prefix("behind ") {
                 snapshot.behind_count = count.trim().parse().unwrap_or(0);
+            } else if part.trim() == "gone" {
+                snapshot.upstream_gone = true;
             }
         }
     }
@@ -342,6 +359,42 @@ mod tests {
             let expected = header.rsplit(" on ").next().unwrap().to_string();
             assert_eq!(s.branch, expected, "{header}");
         }
+    }
+
+    #[test]
+    fn an_empty_clone_reads_its_branch_upstream_and_tracking_state() {
+        // Captured from `git clone` of a repository with no commits.
+        let s =
+            GitStatusParser::parse_status(&z(&["## No commits yet on main...origin/main [gone]"]));
+        assert!(!s.has_commits);
+        assert_eq!(s.branch, "main", "the upstream leaked into the branch name");
+        assert_eq!(s.upstream_branch, "origin/main");
+        assert!(s.upstream_gone);
+        assert_eq!((s.ahead_count, s.behind_count), (0, 0));
+
+        // After the first commit the header still reports the missing upstream.
+        let s = GitStatusParser::parse_status(&z(&["## main...origin/main [gone]"]));
+        assert!(s.has_commits);
+        assert_eq!(s.upstream_branch, "origin/main");
+        assert!(s.upstream_gone);
+        let info = GitStatusParser::make_info(&s, &HashMap::new(), &HashMap::new(), true, 1);
+        assert!(info.upstream_gone);
+        assert!(
+            info.can_push(),
+            "the first commit of an empty clone is pushable"
+        );
+
+        let s = GitStatusParser::parse_status(&z(&["## main...origin/main [ahead 1]"]));
+        assert!(!s.upstream_gone);
+    }
+
+    #[test]
+    fn a_rename_keeps_its_source_path() {
+        let s = GitStatusParser::parse_status(&z(&["## HEAD", "R  new.rs", "old.rs", " M x.rs"]));
+        assert_eq!(s.files[0].original_path.as_deref(), Some("old.rs"));
+        assert_eq!(s.files[1].original_path, None);
+        let info = GitStatusParser::make_info(&s, &HashMap::new(), &HashMap::new(), false, 1);
+        assert_eq!(info.files[0].original_path.as_deref(), Some("old.rs"));
     }
 
     #[test]

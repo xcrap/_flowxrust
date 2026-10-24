@@ -155,6 +155,11 @@ impl Layout {
     pub const SIDEBAR_ROW_HEIGHT: f32 = 30.0;
     pub const PANE_HEADER_HEIGHT: f32 = 44.0;
     pub const COMMAND_PALETTE_WIDTH: f32 = 560.0;
+    /// Tallest the palette's result list grows before it scrolls.
+    pub const COMMAND_PALETTE_MAX_LIST_HEIGHT: f32 = 440.0;
+    /// How far below the window's top edge the palette sits: clear of the title
+    /// bar, with room to read it as floating.
+    pub const COMMAND_PALETTE_TOP_INSET: f32 = Self::TITLE_BAR_HEIGHT + Spacing::XXXL;
     pub const DIALOG_WIDTH: f32 = 440.0;
     /// Row action menus: context menus and the "…" and "+" dropdowns beside them.
     pub const MENU_WIDTH: f32 = 220.0;

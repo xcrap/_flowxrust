@@ -6,6 +6,9 @@
 //!
 //! Run them after touching any foreground, background, or accent token.
 
+use fx_design::components::context_meter::context_meter_palette;
+use fx_design::components::provider_status::provider_status_palette;
+use fx_design::components::{ActivityState, ContextUsage, ProviderIdentity};
 use fx_design::theme::{
     AccentColor, AppearanceMode, BaseTone, Colors, Rgba, TextSizePreset, Theme, composite,
     contrast, h,
@@ -58,29 +61,124 @@ fn white_on_black_is_the_textbook_ratio() {
     assert!((ratio - 21.0).abs() < 0.01, "expected 21:1, got {ratio}:1");
 }
 
+/// The sidebar row states a status tile is painted over, composited onto the
+/// sidebar the way they render.
+fn sidebar_row_surfaces(t: &Theme) -> [(&'static str, Rgba); 3] {
+    let sidebar = Colors::sidebar_bg(t);
+    [
+        ("sidebar", sidebar),
+        ("selected", composite(Colors::bg_selected(t), sidebar)),
+        ("hovered", composite(Colors::bg_hover(t), sidebar)),
+    ]
+}
+
 #[test]
-fn provider_glyphs_clear_non_text_contrast_on_their_sidebar_tiles() {
-    use fx_design::theme::WithAlpha;
+fn every_provider_status_glyph_clears_non_text_contrast_on_its_own_tile() {
+    // Read from the tile's own palette rather than a copy of its alpha: the
+    // copy could only drift. The pulse is swept because its brightest point,
+    // the strongest tint, is the hardest case.
     for (tone, mode) in all_theme_combinations() {
-        let theme = theme_for(tone, mode);
-        for color in [
-            Colors::provider_codex(&theme),
-            Colors::provider_claude(&theme),
-        ] {
-            for surface in [
-                Colors::bg_elevated(&theme),
-                Colors::bg_selected(&theme),
-                Colors::bg_hover(&theme),
-            ] {
-                // The brightest point in the waiting pulse is the hardest case.
-                let surface = composite(surface, Colors::bg_elevated(&theme));
-                let background = composite(color.with_alpha(0.18), surface);
+        let t = theme_for(tone, mode);
+        for provider in [ProviderIdentity::Codex, ProviderIdentity::Claude] {
+            for activity in ActivityState::ALL {
+                for pulse in [0.0, 0.5, 1.0] {
+                    let palette = provider_status_palette(provider, activity, pulse, &t);
+                    for (surface_name, surface) in sidebar_row_surfaces(&t) {
+                        let ratio = contrast(palette.glyph, composite(palette.fill, surface));
+                        assert!(
+                            ratio >= 3.0,
+                            "{tone:?} {mode:?} {provider:?} {activity:?} at pulse {pulse}: glyph on its tint over {surface_name} is {ratio}:1"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn the_error_glyph_clears_non_text_contrast_on_the_provider_tint() {
+    // A failed tile keeps its provider's tint and swaps only the glyph, so
+    // `error` has to hold up on a hue that is not its own.
+    for (tone, mode) in all_theme_combinations() {
+        let t = theme_for(tone, mode);
+        for provider in [ProviderIdentity::Codex, ProviderIdentity::Claude] {
+            let palette = provider_status_palette(provider, ActivityState::Error, 1.0, &t);
+            assert_eq!(palette.glyph, Colors::error(&t));
+            assert_eq!(palette.fill.a, 0.12, "{tone:?} {mode:?} {provider:?}");
+            for (surface_name, surface) in sidebar_row_surfaces(&t) {
+                let ratio = contrast(palette.glyph, composite(palette.fill, surface));
                 assert!(
-                    contrast(color, background) >= 3.0,
-                    "{tone:?} {mode:?}: {}",
-                    contrast(color, background)
+                    ratio >= 3.0,
+                    "{tone:?} {mode:?}: error on the {provider:?} tint over {surface_name} is {ratio}:1"
                 );
             }
+        }
+    }
+}
+
+#[test]
+fn the_waiting_pulse_stays_inside_its_documented_range() {
+    let t = theme_for(BaseTone::Zinc, AppearanceMode::Dark);
+    let fill = |pulse| {
+        provider_status_palette(ProviderIdentity::Codex, ActivityState::Waiting, pulse, &t)
+            .fill
+            .a
+    };
+    assert!((fill(0.0) - 0.08).abs() < 1e-6);
+    assert!((fill(1.0) - 0.18).abs() < 1e-6);
+    assert_eq!(fill(7.0), fill(1.0), "an out-of-range pulse is clamped");
+}
+
+#[test]
+fn the_context_meter_arc_clears_non_text_contrast_on_the_composer_at_every_level() {
+    // Light-mode `warning` was 2.90:1 here; the arc alone carries the level, so
+    // it needs the 3:1 a meaningful graphic does.
+    for (tone, mode) in all_theme_combinations() {
+        let t = theme_for(tone, mode);
+        for provider in [ProviderIdentity::Codex, ProviderIdentity::Claude] {
+            for used in [
+                None,
+                Some(0),
+                Some(50),
+                Some(75),
+                Some(89),
+                Some(90),
+                Some(100),
+            ] {
+                let usage = ContextUsage {
+                    used,
+                    limit: Some(100),
+                };
+                let ring = context_meter_palette(usage, provider, &t).ring;
+                let ratio = contrast(ring, Colors::composer_bg(&t));
+                assert!(
+                    ratio >= 3.0,
+                    "{tone:?} {mode:?} {provider:?} at {used:?}%: the arc is {ratio}:1 on the composer"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn warning_ink_clears_non_text_contrast_on_elevated_surfaces_and_stays_amber() {
+    for (tone, mode) in all_theme_combinations() {
+        let t = theme_for(tone, mode);
+        for (name, surface) in surfaces(&t) {
+            let ratio = contrast(Colors::warning_ink(&t), surface);
+            assert!(
+                ratio >= 3.0,
+                "{tone:?} {mode:?}: warningInk on {name} is {ratio}:1"
+            );
+        }
+        let ink = Colors::warning_ink(&t);
+        assert!(
+            ink.r > ink.g && ink.g > ink.b,
+            "{tone:?} {mode:?}: warningInk is no longer an amber"
+        );
+        if mode == AppearanceMode::Dark {
+            assert_eq!(ink, Colors::warning(&t), "dark mode needs no step down");
         }
     }
 }
@@ -233,6 +331,39 @@ fn banner_text_clears_aa_on_every_muted_fill() {
                         "{tone:?} {mode:?}: {ink_name} on {fill_name} over {surface_name} is {ratio}:1"
                     );
                 }
+            }
+        }
+    }
+}
+
+#[test]
+fn selected_text_stays_legible_and_visible_on_every_transcript_surface() {
+    // Selection is painted under the glyphs, so the words on it must still
+    // clear AA. It is also painted over the reader's own prompt bubble, which is
+    // already an accent wash, so the highlight has to stay distinguishable there.
+    for (tone, mode) in all_theme_combinations() {
+        for accent in AccentColor::ALL {
+            let t = Theme {
+                accent_color: accent,
+                ..theme_for(tone, mode)
+            };
+            let bubble = composite(Colors::accent_muted(&t), Colors::bg(&t));
+            for (surface_name, surface) in [
+                ("bg", Colors::bg(&t)),
+                ("bgElevated", Colors::bg_elevated(&t)),
+                ("bgSurface", Colors::bg_surface(&t)),
+                ("userBubble", bubble),
+            ] {
+                let selected = composite(Colors::text_selection(&t), surface);
+                let ratio = contrast(Colors::fg(&t), selected);
+                assert!(
+                    ratio >= 4.5,
+                    "{tone:?} {mode:?} {accent:?}: fg on a selection over {surface_name} is {ratio}:1"
+                );
+                assert!(
+                    contrast(selected, surface) > 1.1,
+                    "{tone:?} {mode:?} {accent:?}: a selection over {surface_name} is invisible"
+                );
             }
         }
     }

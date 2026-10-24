@@ -569,6 +569,8 @@ fn parse_file(
     let mut messages = Vec::<ConversationMessage>::new();
     let mut positions = HashMap::new();
     let mut cwd_seen = false;
+    // Whether the first record naming a directory has been checked.
+    let mut started = false;
     let mut line = Vec::new();
     let mut line_number = 0;
     loop {
@@ -623,12 +625,24 @@ fn parse_file(
                 "Transcript session ID does not match its filename",
             ));
         }
+        // Where a session started decides whose it is, which is also what
+        // keeps a workspace whose name encodes the same from claiming it.
+        // Later records may name any directory: a shell that ran `cd`, or
+        // Claude desktop running a side session, moves the session's working
+        // directory without moving the thread. Rejecting those hid real
+        // threads behind a sync warning that retrying could never clear.
         if let Some(cwd) = object["cwd"].as_str() {
-            let cwd = canonical_history_directory(Path::new(cwd))?;
-            if cwd == canonical {
+            if !started {
+                let cwd = canonical_history_directory(Path::new(cwd))?;
+                if cwd != canonical && !cwd.starts_with(canonical) {
+                    return Err(protocol("Transcript belongs to a different workspace"));
+                }
+                started = true;
+                cwd_seen = cwd == canonical;
+            } else if !cwd_seen
+                && canonical_history_directory(Path::new(cwd)).is_ok_and(|cwd| cwd == canonical)
+            {
                 cwd_seen = true;
-            } else if !cwd.starts_with(canonical) {
-                return Err(protocol("Transcript belongs to a different workspace"));
             }
         }
         if let Some(timestamp) = parse_timestamp(&object["timestamp"]) {
@@ -1463,6 +1477,37 @@ mod tests {
     }
 
     #[test]
+    fn a_session_is_the_workspace_it_started_in_wherever_it_went_later() {
+        // A real thread: Claude desktop ran a side session from inside it, so
+        // some records name its notes folder. The whole thread was refused.
+        let fixture = Fixture::new();
+        let first = fixture.record("user", "At project root", Uuid::new_v4());
+        let mut side = fixture.record("assistant", "In a side session", Uuid::new_v4());
+        side["cwd"] = json!(
+            fixture
+                .workspace
+                .parent()
+                .unwrap()
+                .join("side-session-notes/gone")
+        );
+        let back = fixture.record("user", "Back at the root", Uuid::new_v4());
+        fixture.write(&[first.clone(), side.clone(), back]);
+        assert_eq!(
+            fixture
+                .store()
+                .read(fixture.root(), SESSION)
+                .unwrap()
+                .messages
+                .len(),
+            3
+        );
+        // A session that started elsewhere is still not this workspace's,
+        // even if it visits it later.
+        fixture.write(&[side, first]);
+        assert!(fixture.store().read(fixture.root(), SESSION).is_err());
+    }
+
+    #[test]
     fn main_session_may_visit_descendants_but_needs_exact_workspace_identity() {
         let fixture = Fixture::new();
         let first = fixture.record("user", "At project root", Uuid::new_v4());
@@ -1483,7 +1528,7 @@ mod tests {
         assert!(fixture.store().read(fixture.root(), SESSION).is_err());
         let mut unrelated = fixture.record("assistant", "Elsewhere", Uuid::new_v4());
         unrelated["cwd"] = json!(fixture.workspace.parent().unwrap());
-        fixture.write(&[first, unrelated]);
+        fixture.write(&[unrelated, first]);
         assert!(fixture.store().read(fixture.root(), SESSION).is_err());
     }
 }

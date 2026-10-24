@@ -74,8 +74,16 @@ pub struct AppState {
     restored_drafts: HashMap<Uuid, String>,
     /// Unacknowledged submissions to restore after startup fails or is cancelled.
     retry_drafts: HashMap<Uuid, String>,
-    saved_conversations: HashMap<Uuid, Vec<u8>>,
-    saved_conversation_versions: HashMap<Uuid, (u64, String)>,
+    /// The save of a panel toggle, held until the panel has finished moving.
+    panel_save: Option<gpui::Task<()>>,
+    /// The revision and draft each transcript was last handed to the writer at,
+    /// or read from disk at. A version, never the bytes: the writer compares
+    /// content by hash, so nothing here grows with the size of a transcript.
+    saved_conversations: HashMap<Uuid, (u64, String)>,
+    /// Encodes and writes transcripts on its own thread.
+    writer: crate::conversation_writer::ConversationWriter,
+    /// Threads whose transcript is being read in the background.
+    loading: HashSet<Uuid>,
     restored_costs: HashMap<Uuid, f64>,
     last_checkpoint: Instant,
     pending_interactions: HashMap<Uuid, VecDeque<fx_agent::ProviderEvent>>,
@@ -85,7 +93,13 @@ pub struct AppState {
     /// item and the sidebar's button open the same sheet, and so it can be
     /// drawn above the whole shell instead of inside one column.
     pub picker: Option<Entity<crate::project_picker::ProjectPicker>>,
+    /// The command palette, while it is open. Held here for the same reasons as
+    /// the picker: ⌘K and the View menu open the same one, above every column.
+    pub palette: Option<Entity<crate::command_palette::CommandPalette>>,
     pub sidebar_visible: bool,
+    /// The thread search and per-project paging, kept here so they survive the
+    /// sidebar being hidden and shown again.
+    pub sidebar: crate::sidebar::SidebarUi,
     /// The one menu that may be open, app-wide.
     pub menu_layer: Entity<MenuLayer>,
     /// Which screen regions offer a context menu.
@@ -94,6 +108,8 @@ pub struct AppState {
     pub last_error: Option<String>,
     pub paths: AppPaths,
     native_sync: crate::native_sync::NativeSync,
+    /// Images, queued images, steering and goals, per thread.
+    pub composer: ComposerStore,
 }
 
 impl AppState {
@@ -180,16 +196,21 @@ impl AppState {
             deleted_agents: HashSet::new(),
             restored_drafts: HashMap::new(),
             retry_drafts: HashMap::new(),
+            panel_save: None,
             saved_conversations: HashMap::new(),
-            saved_conversation_versions: HashMap::new(),
+            writer: Default::default(),
+            loading: HashSet::new(),
             restored_costs: HashMap::new(),
             last_checkpoint: Instant::now(),
             pending_interactions: HashMap::new(),
             picker: None,
+            palette: None,
             sidebar_visible,
+            sidebar: crate::sidebar::SidebarUi::new(cx),
             last_error,
             paths,
             native_sync: Default::default(),
+            composer: ComposerStore::default(),
         }
     }
 
@@ -313,6 +334,22 @@ impl AppState {
     /// Discard results from requests started with previous naming preferences.
     pub(crate) fn cancel_title_jobs(&mut self) {
         self.title_jobs.clear();
+    }
+
+    /// Keep the root's poller running without a provider, as a pending naming
+    /// request would. Returns the generation that finishes it.
+    #[cfg(test)]
+    pub(crate) fn hold_title_job(&mut self, agent_id: Uuid) -> Uuid {
+        let generation = Uuid::new_v4();
+        self.title_jobs.insert(
+            agent_id,
+            crate::auto_title::TitleJob {
+                generation,
+                provider: "codex".into(),
+                model: "test-model".into(),
+            },
+        );
+        generation
     }
 
     fn auto_title_record(&self, agent: Uuid) -> Option<&fx_store::PersistedProject> {
@@ -537,6 +574,7 @@ impl AppState {
     }
 
     pub fn select_project(&mut self, id: Uuid) {
+        let previous = self.snapshot.active_agent_id;
         let Some(record) = self.snapshot.projects.iter().find(|record| {
             record
                 .project
@@ -547,10 +585,56 @@ impl AppState {
         };
         self.snapshot.active_project_id = Some(id);
         self.snapshot.active_agent_id = visible_agent(record, record.last_selected_agent_id);
+        self.mark_seen([previous, self.snapshot.active_agent_id]);
         self.request_native_refresh(id);
     }
 
+    /// Whether a thread finished a turn the reader has not opened since.
+    pub fn has_unseen_completion(&self, agent_id: Uuid) -> bool {
+        self.snapshot
+            .projects
+            .iter()
+            .any(|record| record.unseen_completion_ids.contains(&agent_id))
+    }
+
+    /// Returns whether anything changed, so callers save only when it did.
+    fn set_unseen_completion(&mut self, agent_id: Uuid, unseen: bool) -> bool {
+        let Some(record) = self
+            .snapshot
+            .projects
+            .iter_mut()
+            .find(|record| record.agents.iter().any(|agent| agent.id == agent_id))
+        else {
+            return false;
+        };
+        if record.unseen_completion_ids.contains(&agent_id) == unseen {
+            return false;
+        }
+        if unseen {
+            record.unseen_completion_ids.push(agent_id);
+        } else {
+            record.unseen_completion_ids.retain(|id| *id != agent_id);
+        }
+        true
+    }
+
+    /// Clear the unseen mark from threads that are, or just were, on screen.
+    ///
+    /// The thread being left counts as well as the one being opened. Archiving
+    /// or deleting the selected thread moves the selection without going
+    /// through here, and that thread has been on screen ever since.
+    fn mark_seen(&mut self, agents: impl IntoIterator<Item = Option<Uuid>>) {
+        let mut changed = false;
+        for agent in agents.into_iter().flatten() {
+            changed |= self.set_unseen_completion(agent, false);
+        }
+        if changed {
+            self.save();
+        }
+    }
+
     pub fn select_agent(&mut self, id: Uuid) {
+        let previous = self.snapshot.active_agent_id;
         let Some(record) = self
             .snapshot
             .projects
@@ -566,6 +650,83 @@ impl AppState {
         self.snapshot.active_agent_id = Some(id);
         record.last_selected_agent_id = Some(id);
         self.native_sync.history_due.remove(&id);
+        self.mark_seen([previous, Some(id)]);
+    }
+
+    /// Show a thread from anywhere — ⌘1…⌘9 or the palette — the way clicking
+    /// it in the sidebar does: its project selected and expanded, and its
+    /// transcript read on first selection. Returns whether the thread exists.
+    pub fn open_thread(&mut self, agent_id: Uuid) -> bool {
+        let Some(project_id) = self.project_for_agent(agent_id) else {
+            return false;
+        };
+        if !self.is_expanded(project_id) {
+            self.toggle_project_expansion(project_id);
+        }
+        if self.snapshot.active_project_id != Some(project_id) {
+            self.select_project(project_id);
+        }
+        self.select_agent(agent_id);
+        self.conversation(project_id, agent_id);
+        true
+    }
+
+    /// Clear a thread's conversation and start over with a new provider session.
+    ///
+    /// Ported from the Swift app's `resetConversation`. A thread the provider
+    /// already knows cannot be emptied from here — its history would come back
+    /// with the next sync — so it is kept as it is, and a fresh thread with the
+    /// same effective configuration takes its place in the selection. So does a
+    /// thread whose saved transcript could not be read: emptying it would make
+    /// its files writable again, and they are kept for recovery. Any other
+    /// thread is emptied in place: transcript, session, usage, and draft.
+    /// Refused while the thread is running, like every other change to a
+    /// thread. Returns the thread selected afterwards.
+    pub fn reset_conversation(&mut self, agent_id: Uuid, cx: &mut App) -> Option<Uuid> {
+        if self.is_thread_busy(agent_id) {
+            self.last_error = Some("Stop this thread's running turn before resetting it.".into());
+            return None;
+        }
+        let project_id = self.project_for_agent(agent_id)?;
+        let source = self.thread(agent_id)?.clone();
+        self.pending_interactions.remove(&agent_id);
+        self.retry_drafts.remove(&agent_id);
+        let provider_knows_it = self
+            .snapshot
+            .projects
+            .iter()
+            .flat_map(|record| &record.native_bindings)
+            .any(|binding| binding.agent_id == agent_id);
+        if provider_knows_it || self.protected_conversations.contains(&agent_id) {
+            let configuration =
+                crate::configuration::with_native_defaults(source, self.native_defaults(agent_id))
+                    .configuration;
+            self.select_agent(agent_id);
+            let fresh = self.create_thread()?;
+            if let Some(agent) = self
+                .snapshot
+                .projects
+                .iter_mut()
+                .flat_map(|record| record.agents.iter_mut())
+                .find(|agent| agent.id == fresh)
+            {
+                agent.configuration = configuration;
+            }
+            self.save();
+            return Some(fresh);
+        }
+        let conversation = self.conversation(project_id, agent_id);
+        *conversation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Conversation::new(agent_id);
+        self.restored_costs.remove(&agent_id);
+        // Forget what was last written, so the emptied transcript is saved —
+        // which, having nothing worth keeping, deletes the file.
+        self.saved_conversations.remove(&agent_id);
+        self.clear_draft(agent_id, cx);
+        self.save_conversations();
+        self.save();
+        Some(agent_id)
     }
 
     pub fn thread(&self, agent_id: Uuid) -> Option<&Agent> {
@@ -748,6 +909,7 @@ impl AppState {
                 .retain(|entry| entry.agent_id != agent_id);
             record.missing_native_agent_ids.retain(|id| *id != agent_id);
             record.archived_agent_ids.retain(|id| *id != agent_id);
+            record.unseen_completion_ids.retain(|id| *id != agent_id);
             if let Some(project) = &mut record.project {
                 project.agent_order.retain(|id| *id != agent_id);
             }
@@ -780,7 +942,6 @@ impl AppState {
         self.restored_drafts.remove(&agent_id);
         self.retry_drafts.remove(&agent_id);
         self.saved_conversations.remove(&agent_id);
-        self.saved_conversation_versions.remove(&agent_id);
         self.restored_costs.remove(&agent_id);
         self.pending_interactions.remove(&agent_id);
         self.native_sync.invalidate(project_id);
@@ -788,6 +949,9 @@ impl AppState {
         self.native_sync.history_warnings.remove(&agent_id);
         self.native_sync.completed_turns.remove(&agent_id);
         self.native_sync.loaded_revisions.remove(&agent_id);
+        // A queued save landing after this would recreate the deleted files.
+        self.writer.forget(agent_id);
+        crate::transcript::forget_thread(agent_id);
         if let Err(error) = self.store.delete_thread_files(project_id, agent_id) {
             self.last_error = Some(format!(
                 "The thread was removed, but its saved files could not all be deleted: {error}"
@@ -799,6 +963,20 @@ impl AppState {
     pub fn toggle_sidebar(&mut self) {
         self.sidebar_visible = !self.sidebar_visible;
         self.snapshot.sidebar_visible = self.sidebar_visible;
+    }
+
+    /// Save the layout once a panel toggle has finished moving.
+    ///
+    /// A save flushes the workspace file and its backup to disk, which takes
+    /// long enough on the UI thread to cost the slide its first frames. A
+    /// second toggle before then replaces the pending save.
+    pub fn save_after_panel_moves(&mut self, cx: &mut Context<Self>) {
+        self.panel_save = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(fx_design::theme::FxAnimation::PANEL + Duration::from_millis(50))
+                .await;
+            let _ = this.update(cx, |state, _| state.save());
+        }));
     }
 
     pub fn sidebar_width(&self) -> f32 {
@@ -838,41 +1016,107 @@ impl AppState {
     }
 
     /// The transcript for a thread, reading it from disk on first use.
+    ///
+    /// Blocks on that read, so it is for actions that cannot proceed without
+    /// the history. A view uses [`Self::request_conversation`] instead.
     pub fn conversation(&mut self, project_id: Uuid, agent_id: Uuid) -> Arc<GuardedConversation> {
         if let Some(existing) = self.conversations.get(&agent_id) {
             return existing.clone();
         }
-        let mut conversation = Conversation::new(agent_id);
-        match self.store.load_conversation(project_id, agent_id) {
-            Ok(Some(persisted)) if persisted.agent_id == agent_id => {
-                self.restored_costs
-                    .insert(agent_id, persisted.total_cost_usd);
-                self.restored_drafts.insert(
-                    agent_id,
-                    if persisted.draft_text.is_empty() {
-                        persisted
-                            .unsent_prompt
-                            .as_ref()
-                            .map(|prompt| prompt.text.clone())
-                            .unwrap_or_default()
-                    } else {
-                        persisted.draft_text.clone()
-                    },
-                );
-                restore_conversation(&mut conversation, persisted);
-            }
-            Ok(None) => {}
-            result => {
-                let reason = match result {
-                    Err(error) => error.to_string(),
-                    _ => "the transcript belongs to a different thread".to_string(),
-                };
-                self.protected_conversations.insert(agent_id);
-                self.last_error = Some(format!(
-                    "Could not restore this conversation: {reason}. Its saved files have been preserved."
-                ));
-                conversation.set_error("The saved conversation could not be read. Its files have been preserved; start a new thread to continue.");
-            }
+        let loaded = read_conversation(&self.store, project_id, agent_id);
+        self.adopt_conversation(project_id, agent_id, loaded)
+    }
+
+    /// The transcript for a thread, or `None` while it is read in the background.
+    ///
+    /// The first call for an unloaded thread starts the read; when it lands,
+    /// the state notifies, so whatever asked repaints with the history.
+    pub fn request_conversation(
+        &mut self,
+        project_id: Uuid,
+        agent_id: Uuid,
+        cx: &mut Context<Self>,
+    ) -> Option<Arc<GuardedConversation>> {
+        if let Some(found) = self.loaded_or_unsaved(project_id, agent_id) {
+            return Some(found);
+        }
+        if self.loading.insert(agent_id) {
+            let store = self.store.clone();
+            let read =
+                cx.background_spawn(async move { read_conversation(&store, project_id, agent_id) });
+            cx.spawn(async move |this, cx| {
+                let loaded = read.await;
+                let _ = this.update(cx, |state, cx| {
+                    state.loading.remove(&agent_id);
+                    // A blocking load may have won the race, and a thread can be
+                    // deleted or moved while its file is read. Neither may be
+                    // replaced by a late result.
+                    if state.conversations.contains_key(&agent_id)
+                        || state.deleted_agents.contains(&agent_id)
+                        || state.project_for_agent(agent_id) != Some(project_id)
+                    {
+                        return;
+                    }
+                    state.adopt_conversation(project_id, agent_id, loaded);
+                    state.restore_loaded_draft(agent_id, cx);
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+        None
+    }
+
+    /// A thread's transcript when it can be had without reading a file: it is
+    /// loaded already, or nothing was ever saved for it. For callers that only
+    /// need what the transcript says so far, and must not start a read.
+    pub(crate) fn loaded_or_unsaved(
+        &mut self,
+        project_id: Uuid,
+        agent_id: Uuid,
+    ) -> Option<Arc<GuardedConversation>> {
+        if let Some(existing) = self.conversations.get(&agent_id) {
+            return Some(existing.clone());
+        }
+        if self.loading.contains(&agent_id) || self.store.has_conversation(project_id, agent_id) {
+            return None;
+        }
+        Some(self.adopt_conversation(project_id, agent_id, LoadedConversation::empty(agent_id)))
+    }
+
+    /// Whether a thread's transcript is still being read.
+    pub fn is_loading_conversation(&self, agent_id: Uuid) -> bool {
+        self.loading.contains(&agent_id)
+    }
+
+    /// Install a read transcript as the live one.
+    fn adopt_conversation(
+        &mut self,
+        project_id: Uuid,
+        agent_id: Uuid,
+        loaded: LoadedConversation,
+    ) -> Arc<GuardedConversation> {
+        let LoadedConversation {
+            mut conversation,
+            restored,
+            failure,
+            goal,
+            attachments,
+        } = loaded;
+        if let Some(goal) = goal {
+            self.composer.goals.insert(agent_id, goal);
+        }
+        if !attachments.is_empty() {
+            self.composer
+                .attachments
+                .entry(agent_id)
+                .or_insert(attachments);
+        }
+        if let Some(reason) = failure {
+            self.protected_conversations.insert(agent_id);
+            self.last_error = Some(format!(
+                "Could not restore this conversation: {reason}. Its saved files have been preserved."
+            ));
         }
         if conversation.session_id().is_none()
             && let Some(binding) = self
@@ -890,29 +1134,63 @@ impl AppState {
         {
             conversation.set_session_id(binding.session_id.clone());
         }
+        if let Some((cost, draft)) = restored {
+            self.restored_costs.insert(agent_id, cost);
+            // The file holds exactly this, so opening a thread is not a reason
+            // to write it back.
+            self.saved_conversations
+                .insert(agent_id, (conversation.revision(), draft.clone()));
+            self.restored_drafts.insert(agent_id, draft);
+        }
         let conversation = Arc::new(Mutex::new(conversation));
         self.conversations.insert(agent_id, conversation.clone());
         conversation
     }
 
-    /// The active thread's conversation, loaded on first use.
+    /// Put a draft read in the background into a composer made while it was
+    /// read, unless the user has typed there since: that typing is newer.
+    fn restore_loaded_draft(&mut self, agent_id: Uuid, cx: &mut App) {
+        let Some(field) = self.drafts.get(&agent_id).cloned() else {
+            return;
+        };
+        let typed = field.read(cx).value().to_string();
+        if !typed.is_empty() {
+            self.restored_drafts.insert(agent_id, typed);
+        } else if let Some(draft) = self
+            .restored_drafts
+            .get(&agent_id)
+            .filter(|draft| !draft.is_empty())
+            .cloned()
+        {
+            field.update(cx, |field, cx| field.set_value(draft, cx));
+        }
+    }
+
+    /// The active thread's conversation, or `None` while it is still loading.
     ///
-    /// `None` when no thread is selected. Separate from [`Self::conversation`]
-    /// because a view asks this every frame and must not trigger a disk read
-    /// inside a render.
-    pub fn active_conversation(&mut self) -> Option<Arc<GuardedConversation>> {
+    /// `None` also when no thread is selected. Separate from
+    /// [`Self::conversation`] because a view asks this every frame and must not
+    /// read a transcript inside a render: the first ask starts a background
+    /// read, and the transcript repaints when it lands.
+    pub fn active_conversation(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<Arc<GuardedConversation>> {
         let project_id = self.snapshot.active_project_id?;
         let agent_id = self.snapshot.active_agent_id?;
-        Some(self.conversation(project_id, agent_id))
+        self.request_conversation(project_id, agent_id, cx)
     }
 
     /// The draft field for a thread, creating it on first use.
-    pub fn draft(&mut self, agent_id: Uuid, cx: &mut App) -> Entity<TextField> {
+    ///
+    /// A saved draft arrives with its transcript. When that is still being
+    /// read, the field starts empty and is filled once the read lands.
+    pub fn draft(&mut self, agent_id: Uuid, cx: &mut Context<Self>) -> Entity<TextField> {
         if let Some(existing) = self.drafts.get(&agent_id) {
             return existing.clone();
         }
         if let Some(project_id) = self.project_for_agent(agent_id) {
-            self.conversation(project_id, agent_id);
+            self.request_conversation(project_id, agent_id, cx);
         }
         let initial = self
             .restored_drafts
@@ -937,7 +1215,25 @@ impl AppState {
     /// The path arrives from `project_picker::validate_project_path`, so it has
     /// been canonicalized. Re-checking here would still let the user add a
     /// symlink and have it retargeted underneath them later.
-    pub fn add_project(&mut self, root_path: &str) {
+    ///
+    /// A folder that is already open is focused rather than added again. Two
+    /// rows for one root would race each other for the same provider threads,
+    /// and the loader keeps only the first of them on the next launch, taking
+    /// the second row's threads with it.
+    pub fn add_project(&mut self, root_path: &str) -> Uuid {
+        if let Some(existing) = self.project_with_root(root_path) {
+            if let Some(record) = self
+                .snapshot
+                .projects
+                .iter_mut()
+                .find(|record| record.project.as_ref().is_some_and(|p| p.id == existing))
+            {
+                record.is_expanded = true;
+            }
+            self.select_project(existing);
+            self.save();
+            return existing;
+        }
         let project = Project::new(root_path);
         self.snapshot.projects.push(fx_store::PersistedProject {
             project: Some(project.clone()),
@@ -950,18 +1246,49 @@ impl AppState {
         self.snapshot.active_agent_id = None;
         self.request_native_refresh(project.id);
         self.save();
+        project.id
+    }
+
+    /// The open project whose folder is `root_path`.
+    ///
+    /// Compares resolved paths, so a symlink, a trailing slash, or `~` names the
+    /// same project as the folder it points at. Projects saved before paths were
+    /// canonicalised are resolved here too, not only the one being added.
+    pub fn project_with_root(&self, root_path: &str) -> Option<Uuid> {
+        let wanted = Project::new(root_path).canonical_root_path();
+        self.snapshot
+            .projects
+            .iter()
+            .filter_map(|record| record.project.as_ref())
+            .find(|project| project.canonical_root_path() == wanted)
+            .map(|project| project.id)
+    }
+
+    /// Every open project's resolved folder, for the picker to recognise.
+    pub fn open_project_roots(&self) -> Vec<std::path::PathBuf> {
+        self.snapshot
+            .projects
+            .iter()
+            .filter_map(|record| record.project.as_ref())
+            .map(Project::canonical_root_path)
+            .collect()
     }
 
     /// Remove only the sidebar entry. Saved transcripts and project files remain.
+    ///
+    /// Callers capture drafts first (`save_all`), because the transcripts are
+    /// written once more here and then released from memory.
     pub fn remove_project(&mut self, project_id: Uuid) {
-        if self
+        let agents: Vec<Uuid> = self
             .snapshot
             .projects
             .iter()
             .filter(|record| record.project.as_ref().is_some_and(|p| p.id == project_id))
-            .flat_map(|record| &record.agents)
-            .any(|agent| self.runners.contains_key(&agent.id))
-        {
+            .flat_map(|record| record.agents.iter().map(|agent| agent.id))
+            .collect();
+        // The same test the project menu uses to disable the row, so a turn
+        // that is still starting or waiting on an answer keeps its project.
+        if agents.iter().any(|id| self.is_thread_busy(*id)) {
             self.last_error = Some("Stop this project's running turns before removing it.".into());
             return;
         }
@@ -970,6 +1297,9 @@ impl AppState {
         self.snapshot
             .projects
             .retain(|record| !record.project.as_ref().is_some_and(|p| p.id == project_id));
+        for agent_id in agents {
+            self.release_thread(agent_id);
+        }
         if self.snapshot.active_project_id == Some(project_id) {
             self.snapshot.active_project_id = None;
             self.snapshot.active_agent_id = None;
@@ -982,6 +1312,29 @@ impl AppState {
                 self.select_project(id);
             }
         }
+    }
+
+    /// Drop everything held in memory for a thread that has left the snapshot
+    /// with its project. The in-memory half of `delete_thread`'s cleanup; the
+    /// files on disk are kept, and nothing is recorded as deleted, because the
+    /// thread was not.
+    ///
+    /// Only reached for idle threads: `remove_project` refuses while any of its
+    /// threads is busy, so no running turn loses its conversation or runner.
+    fn release_thread(&mut self, agent_id: Uuid) {
+        self.title_jobs.remove(&agent_id);
+        self.conversations.remove(&agent_id);
+        self.drafts.remove(&agent_id);
+        self.protected_conversations.remove(&agent_id);
+        self.restored_drafts.remove(&agent_id);
+        self.retry_drafts.remove(&agent_id);
+        self.saved_conversations.remove(&agent_id);
+        self.restored_costs.remove(&agent_id);
+        self.pending_interactions.remove(&agent_id);
+        self.native_sync.history_due.remove(&agent_id);
+        self.native_sync.history_warnings.remove(&agent_id);
+        self.native_sync.completed_turns.remove(&agent_id);
+        self.native_sync.loaded_revisions.remove(&agent_id);
     }
 
     fn project_for_agent(&self, agent_id: Uuid) -> Option<Uuid> {
@@ -997,7 +1350,24 @@ impl AppState {
 
     /// Move the prompt into the transcript and recovery record before starting
     /// a worker. The composer is immediately available for the next draft.
+    ///
+    /// The record's save is queued here, ahead of anything the turn writes; it
+    /// lands on the writer's thread rather than holding up the send.
     pub fn prepare_prompt(&mut self, agent_id: Uuid, text: &str, cx: &mut App) -> bool {
+        self.prepare_prompt_with(agent_id, text, &[], cx)
+    }
+
+    /// [`Self::prepare_prompt`], with the images that go with it.
+    ///
+    /// The images ride in the user's row, so a retry and a restart recover
+    /// them from the transcript along with the unsent prompt's text.
+    pub fn prepare_prompt_with(
+        &mut self,
+        agent_id: Uuid,
+        text: &str,
+        attachments: &[fx_core::Attachment],
+        cx: &mut App,
+    ) -> bool {
         if self.runners.contains_key(&agent_id) || self.protected_conversations.contains(&agent_id)
         {
             return false;
@@ -1025,22 +1395,24 @@ impl AppState {
                 .unsent()
                 .is_some_and(|prompt| prompt.text == text)
                 && conversation.messages().last().is_some_and(|message| {
-                    message.role == fx_core::MessageRole::User && message.text_content() == text
+                    message.role == fx_core::MessageRole::User
+                        && message.text_content() == text
+                        && same_images(&crate::attachments::attachments_in(message), attachments)
                 });
             if !retrying_same_row {
-                conversation.append(fx_core::ConversationMessage::text(
-                    fx_core::MessageRole::User,
-                    text,
-                ));
+                conversation.append(crate::attachments::user_message(text, attachments));
             }
             let session_id = conversation.session_id().map(str::to_string);
             conversation.hold_unsent(fx_agent::conversation::UnsentPrompt {
                 text: text.to_string(),
-                attachment_count: 0,
+                attachment_count: attachments.len(),
                 session_id,
             });
         }
         self.retry_drafts.remove(&agent_id);
+        self.composer.retry_attachments.remove(&agent_id);
+        let sent: Vec<Uuid> = attachments.iter().map(|attachment| attachment.id).collect();
+        self.release_sent_attachments(agent_id, &sent);
         // The keyboard callback is deferred. Only clear the submitted text,
         // preserving any replacement draft written before that callback runs.
         if let Some(field) = self.drafts.get(&agent_id).cloned() {
@@ -1091,42 +1463,82 @@ impl AppState {
         self.runners.insert(agent_id, runner);
     }
 
-    /// Apply anything the running turn has reported.
+    /// Apply anything the running turn has reported, and how queued saves went.
     ///
-    /// Called from the render path, which is the only place that may touch the
-    /// entity. A turn finishing must repaint without anything asking it to, so
-    /// this runs every pass.
-    pub fn drain_updates(&mut self) {
+    /// Returns whether anything was applied, which is what tells the root's
+    /// poller to repaint: a turn finishing must repaint without anything asking
+    /// it to, and a tick with nothing to report must not.
+    pub fn drain_updates(&mut self) -> bool {
+        let mut applied = self.apply_save_outcomes();
         let updates: Vec<crate::session::SessionUpdate> = self.updates.try_iter().collect();
         for update in updates {
+            applied = true;
             self.apply_update(self.snapshot.active_agent_id, update);
         }
         let updates: Vec<_> = self.targeted_updates.try_iter().collect();
         for (agent_id, update) in updates {
+            applied = true;
             self.apply_update(Some(agent_id), update);
         }
+        applied
     }
 
-    pub fn drain_updates_with_context(&mut self, cx: &mut App) {
+    pub fn drain_updates_with_context(&mut self, cx: &mut App) -> bool {
         // Lifecycle events may save immediately. Capture newer typing first so
         // recovery cannot persist an older draft over a follow-up.
         self.capture_drafts(cx);
-        self.drain_updates();
+        let applied = self.drain_updates();
         for (agent_id, prompt) in std::mem::take(&mut self.retry_drafts) {
+            let mut restored = false;
             if let Some(field) = self.drafts.get(&agent_id).cloned() {
                 // Never overwrite a follow-up drafted while startup was pending.
-                if field.read(cx).value().is_empty() {
+                // Whitespace is not a follow-up: `prepare_prompt` trims, so a
+                // field holding only "\n" would otherwise swallow the retry.
+                if field.read(cx).value().trim().is_empty() {
                     field.update(cx, |field, cx| field.set_value(prompt, cx));
+                    restored = true;
                 }
             } else if self
                 .restored_drafts
                 .get(&agent_id)
-                .is_none_or(|draft| draft.is_empty())
+                .is_none_or(|draft| draft.trim().is_empty())
             {
                 self.restored_drafts.insert(agent_id, prompt);
+                restored = true;
+            }
+            // The images come back with the words, and only into a composer
+            // that has none of its own by now.
+            let images = self.composer.retry_attachments.remove(&agent_id);
+            if restored
+                && let Some(images) = images
+                && self.attachments(agent_id).is_empty()
+            {
+                self.composer.attachments.insert(agent_id, images);
             }
         }
+        self.clear_accepted_steers(cx);
         self.capture_drafts(cx);
+        applied
+    }
+
+    /// The revisions of threads with a running turn. A runner writes into its
+    /// conversation from its own thread, so this is how the root tells a quiet
+    /// poll from one with something new to draw.
+    pub fn running_revisions(&self) -> Vec<(Uuid, u64)> {
+        let mut revisions: Vec<_> = self
+            .runners
+            .keys()
+            .filter_map(|id| {
+                let conversation = self.conversations.get(id)?;
+                let revision = conversation
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .revision();
+                Some((*id, revision))
+            })
+            .collect();
+        revisions.sort_unstable();
+        revisions
     }
 
     fn apply_update(&mut self, agent_id: Option<Uuid>, update: crate::session::SessionUpdate) {
@@ -1190,16 +1602,41 @@ impl AppState {
                     queue.retain(|event| interaction_id(event) != Some(&id));
                 }
             }
+            SessionUpdate::Steered { id, result } => {
+                should_save = result.is_ok();
+                if let Some(agent_id) = agent_id {
+                    self.steer_answered(agent_id, id, result);
+                }
+            }
+            SessionUpdate::GoalChanged { goal } => {
+                if let Some(agent_id) = agent_id {
+                    self.goal_changed(agent_id, goal);
+                }
+            }
             SessionUpdate::Finished { outcome } => {
                 if let Some(agent_id) = agent_id {
                     self.mark_native_local_turn(agent_id);
                     self.runners.remove(&agent_id);
                     self.pending_interactions.remove(&agent_id);
+                    self.composer.steers.remove(&agent_id);
+                    self.composer.goal_prompts.remove(&agent_id);
                     self.restore_unaccepted_prompt(agent_id);
-                    self.record_execution_state(
-                        agent_id,
-                        crate::thread_presentation::settled_state(&outcome),
-                    );
+                    self.queue_may_advance(agent_id);
+                    let settled = crate::thread_presentation::settled_state(&outcome);
+                    // Marked before the outcome is recorded, so the one save
+                    // that records the outcome carries the mark as well.
+                    let marked = crate::thread_presentation::completion_needs_attention(
+                        &outcome,
+                        self.snapshot.active_agent_id == Some(agent_id),
+                    ) && self.set_unseen_completion(agent_id, true);
+                    if marked
+                        && self
+                            .thread(agent_id)
+                            .is_some_and(|agent| agent.execution_state == settled)
+                    {
+                        self.save();
+                    }
+                    self.record_execution_state(agent_id, settled);
                 }
                 // A turn that worked clears the previous turn's failure. Leaving
                 // it up would report an error that no longer describes anything.
@@ -1214,7 +1651,10 @@ impl AppState {
                     self.mark_native_local_turn(agent_id);
                     self.runners.remove(&agent_id);
                     self.pending_interactions.remove(&agent_id);
+                    self.composer.steers.remove(&agent_id);
+                    self.composer.goal_prompts.remove(&agent_id);
                     self.restore_unaccepted_prompt(agent_id);
+                    self.queue_may_advance(agent_id);
                     self.record_execution_state(agent_id, fx_core::AgentExecutionState::Failure);
                 }
                 self.last_error = Some(reason);
@@ -1268,6 +1708,11 @@ impl AppState {
                 .unwrap_or_else(|error| error.into_inner());
             if let Some(prompt) = conversation.unsent() {
                 self.retry_drafts.insert(agent_id, prompt.text.clone());
+                if prompt.attachment_count > 0 {
+                    self.composer
+                        .retry_attachments
+                        .insert(agent_id, unsent_attachments(&conversation));
+                }
             }
         }
     }
@@ -1285,6 +1730,146 @@ impl AppState {
     /// The conversation for a thread, if it has been loaded.
     pub fn conversation_by_agent(&self, agent_id: Uuid) -> Option<Arc<GuardedConversation>> {
         self.conversations.get(&agent_id).cloned()
+    }
+
+    // ── Recovering a failed turn ───────────────────────────────────────────
+    //
+    // Each of these resets what its action resets and returns the prompt to
+    // send, if any. Starting the turn is left to the shell, which owns the path
+    // that starts one; a second path here would be a second place for a launch
+    // to go wrong.
+
+    /// A loaded thread with nothing running, ready to be recovered.
+    fn idle_conversation(&self, agent_id: Uuid) -> Option<Arc<GuardedConversation>> {
+        if self.is_thread_busy(agent_id) || self.protected_conversations.contains(&agent_id) {
+            return None;
+        }
+        self.conversations.get(&agent_id).cloned()
+    }
+
+    /// Take the turn's failure off the conversation, and off the shell's banner
+    /// when that banner is reporting the same failure. An unrelated one, such
+    /// as a failed save, stays up.
+    fn release_turn_error(&mut self, conversation: &mut Conversation) {
+        let error = conversation.error().map(str::to_owned);
+        conversation.dismiss_error();
+        if error.is_some() && self.last_error == error {
+            self.last_error = None;
+        }
+    }
+
+    /// The images of the prompt a retry or restart resends, read from its own
+    /// transcript row.
+    pub fn unsent_images(&self, agent_id: Uuid) -> Vec<fx_core::Attachment> {
+        self.conversations
+            .get(&agent_id)
+            .map(|conversation| {
+                unsent_attachments(
+                    &conversation
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()),
+                )
+            })
+            .unwrap_or_default()
+    }
+
+    /// The prompt a retry resends: the one the provider never accepted, else
+    /// the last one the reader sent.
+    pub fn retry_prompt(&mut self, agent_id: Uuid) -> Option<String> {
+        let conversation = self.idle_conversation(agent_id)?;
+        let mut conversation = conversation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let prompt = conversation
+            .unsent()
+            .map(|prompt| prompt.text.clone())
+            .or_else(|| conversation.last_user_prompt())
+            .filter(|prompt| !prompt.trim().is_empty())?;
+        self.release_turn_error(&mut conversation);
+        Some(prompt)
+    }
+
+    /// Ask the session the failed turn ran in to carry on.
+    pub fn resume_session(&mut self, agent_id: Uuid) -> Option<String> {
+        let conversation = self.idle_conversation(agent_id)?;
+        let mut conversation = conversation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if conversation.session_id().is_none_or(str::is_empty) {
+            return None;
+        }
+        self.release_turn_error(&mut conversation);
+        Some("continue".to_string())
+    }
+
+    /// Open a fresh provider session on the same thread.
+    ///
+    /// The thread keeps its transcript and its place in the sidebar; only the
+    /// provider's side starts over. The old session's binding goes, so the new
+    /// session binds when it starts, and its identity is suppressed so a dead
+    /// session cannot come back from discovery as a duplicate thread.
+    pub fn restart_session(&mut self, agent_id: Uuid) -> Option<String> {
+        let conversation = self.idle_conversation(agent_id)?;
+        let prompt = {
+            let mut conversation = conversation
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            conversation.clear_session_id();
+            self.release_turn_error(&mut conversation);
+            conversation.record_activity("Session restarted", false);
+            conversation
+                .unsent()
+                .map(|prompt| prompt.text.clone())
+                .or_else(|| conversation.last_user_prompt())
+                .filter(|prompt| !prompt.trim().is_empty())
+        };
+        for record in &mut self.snapshot.projects {
+            let retired: Vec<fx_store::format::PersistedNativeIdentity> = record
+                .native_bindings
+                .iter()
+                .filter(|binding| binding.agent_id == agent_id)
+                .map(|binding| fx_store::format::PersistedNativeIdentity {
+                    provider_id: binding.provider_id.clone(),
+                    session_id: binding.session_id.clone(),
+                })
+                .collect();
+            record
+                .native_bindings
+                .retain(|binding| binding.agent_id != agent_id);
+            for identity in retired {
+                if !record.suppressed_native_threads.contains(&identity) {
+                    record.suppressed_native_threads.push(identity);
+                }
+            }
+        }
+        self.native_sync.history_due.remove(&agent_id);
+        self.native_sync.loaded_revisions.remove(&agent_id);
+        self.save();
+        self.save_conversations();
+        prompt
+    }
+
+    /// Put a failed turn's banner away.
+    pub fn dismiss_turn_error(&mut self, agent_id: Uuid) {
+        let Some(conversation) = self.conversations.get(&agent_id).cloned() else {
+            return;
+        };
+        self.release_turn_error(
+            &mut conversation
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+        );
+        self.save_conversations();
+    }
+
+    /// The thread and project root a recovery turn runs with.
+    pub fn recovery_target(&self, agent_id: Uuid) -> Option<(Agent, String)> {
+        let agent = self.thread(agent_id)?.clone();
+        let root = self
+            .project(self.project_for_agent(agent_id)?)?
+            .root_path
+            .clone();
+        Some((agent, root))
     }
 
     /// Clear a thread's draft after its prompt is sent.
@@ -1361,7 +1946,11 @@ impl AppState {
         }
     }
 
-    /// Persist only loaded conversations. Unopened and unreadable siblings remain untouched.
+    /// Queue saves for loaded conversations that changed. Unopened and
+    /// unreadable siblings remain untouched.
+    ///
+    /// Returns at once. The UI thread only compares a revision and a draft; the
+    /// copy, the encode, and the write all happen on the writer's thread.
     pub fn save_conversations(&mut self) {
         let loaded: Vec<_> = self
             .conversations
@@ -1380,99 +1969,98 @@ impl AppState {
                 .get(&agent_id)
                 .cloned()
                 .unwrap_or_default();
-            let (mut persisted, version) = {
-                let conversation = conversation
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                let version = (conversation.revision(), draft.clone());
-                if self.saved_conversation_versions.get(&agent_id) == Some(&version) {
-                    continue;
-                }
-                (persisted_from(&conversation), version)
-            };
-            persisted.total_cost_usd = self
-                .restored_costs
-                .get(&agent_id)
-                .copied()
-                .unwrap_or_default();
-            persisted.draft_text = draft;
-            if persisted.draft_text.is_empty()
-                && let Some(prompt) = self.retry_drafts.get(&agent_id)
-            {
-                persisted.draft_text.clone_from(prompt);
-            }
-            let Ok(mut bytes) = serde_json::to_vec(&persisted) else {
-                continue;
-            };
-            if bytes.len() as u64 > fx_store::format::MAX_CONVERSATION_BYTES {
-                // A full native transcript can exceed the cache limit. Its
-                // draft is local-only and must still survive quitting.
-                match self.store.load_conversation(project_id, agent_id) {
-                    Ok(previous) => {
-                        match encode_partial_cache(
-                            persisted,
-                            previous,
-                            fx_store::format::MAX_CONVERSATION_BYTES,
-                        ) {
-                            Ok((record, encoded)) => {
-                                persisted = record;
-                                bytes = encoded;
-                            }
-                            Err(error) => {
-                                self.last_error = Some(error);
-                                continue;
-                            }
-                        }
-                        self.last_error = Some("This conversation exceeds the local history cache limit. The complete history remains with the provider and in memory; its draft and session have been saved with the available cached history.".into());
-                    }
-                    Err(error) => {
-                        self.last_error = Some(format!(
-                            "Could not preserve this large conversation's draft without replacing an unreadable cache: {error}"
-                        ));
-                        continue;
-                    }
-                }
-            }
-            if self.saved_conversations.get(&agent_id) == Some(&bytes) {
-                self.saved_conversation_versions.insert(agent_id, version);
+            let revision = conversation
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .revision();
+            let version = (revision, draft);
+            if self.saved_conversations.get(&agent_id) == Some(&version) {
                 continue;
             }
-            let result = if persisted.is_worth_persisting() {
-                self.store
-                    .save_conversation(project_id, agent_id, &persisted)
-                    .map_err(|error| error.to_string())
-            } else {
-                self.store
-                    .delete_conversation(project_id, agent_id)
-                    .map_err(|error| error.to_string())
-            };
-            match result {
-                Ok(()) => {
-                    self.saved_conversations.insert(agent_id, bytes);
-                    self.saved_conversation_versions.insert(agent_id, version);
-                }
-                Err(error) => {
-                    tracing::error!(%agent_id, %error, "could not save the conversation");
-                    self.last_error = Some(format!("Could not save the conversation: {error}"));
-                }
-            }
+            self.writer.submit(crate::conversation_writer::Job {
+                store: self.store.clone(),
+                project_id,
+                agent_id,
+                conversation,
+                draft: version.1.clone(),
+                retry_draft: self.retry_drafts.get(&agent_id).cloned(),
+                goal: self.composer.goals.get(&agent_id).cloned(),
+                cost: self
+                    .restored_costs
+                    .get(&agent_id)
+                    .copied()
+                    .unwrap_or_default(),
+            });
+            self.saved_conversations.insert(agent_id, version);
         }
     }
 
+    /// Report how queued saves went. Returns whether that changed anything the
+    /// window shows.
+    fn apply_save_outcomes(&mut self) -> bool {
+        use crate::conversation_writer::Saved;
+        let mut reported = false;
+        for outcome in self.writer.take_outcomes() {
+            if self.deleted_agents.contains(&outcome.agent_id) {
+                continue;
+            }
+            match outcome.result {
+                Ok(Saved::Partial) => {
+                    self.last_error = Some("This conversation exceeds the local history cache limit. The complete history remains with the provider and in memory; its draft and session have been saved with the available cached history.".into());
+                    reported = true;
+                }
+                Ok(Saved::Written | Saved::Unchanged | Saved::Removed) => {}
+                Err(error) => {
+                    tracing::error!(agent_id = %outcome.agent_id, %error, "could not save the conversation");
+                    // Ask again at the next save rather than believing the
+                    // failed version landed.
+                    self.saved_conversations.remove(&outcome.agent_id);
+                    self.last_error = Some(error);
+                    reported = true;
+                }
+            }
+        }
+        reported
+    }
+
+    /// Wait for queued transcript saves to land, then report them.
+    pub fn flush_saves(&mut self) {
+        self.writer.flush();
+        self.apply_save_outcomes();
+    }
+
     /// Throttled recovery checkpoints while a turn streams or a draft changes.
-    pub fn checkpoint(&mut self, cx: &App) {
+    ///
+    /// Returns whether a reported save changed what the window shows.
+    pub fn checkpoint(&mut self, cx: &App) -> bool {
+        let reported = self.apply_save_outcomes();
         if self.last_checkpoint.elapsed() < Duration::from_secs(1) {
-            return;
+            return reported;
         }
         self.last_checkpoint = Instant::now();
         self.capture_drafts(cx);
         self.save_conversations();
+        reported
     }
 
-    /// Save the whole loaded workspace, including drafts and partial streamed text, on quit.
+    /// What a pause in typing saves: everything [`Self::save_all`] does,
+    /// without waiting for transcripts to land.
+    ///
+    /// Returns whether a reported save changed what the window shows.
+    pub fn autosave(&mut self, cx: &App) -> bool {
+        let reported = self.apply_save_outcomes();
+        self.capture_drafts(cx);
+        self.save_conversations();
+        self.save();
+        reported
+    }
+
+    /// Save the whole loaded workspace, including drafts and partial streamed
+    /// text, and wait for it to land. Quitting relies on the wait.
     pub fn save_all(&mut self, cx: &App) {
         self.capture_drafts(cx);
         self.save_conversations();
+        self.flush_saves();
         self.save();
     }
 
@@ -1508,6 +2096,51 @@ impl AppState {
         }
     }
 
+    /// Everything a native-sync pass can change that the window shows.
+    fn native_view(&self) -> NativeView {
+        NativeView {
+            snapshot: self.snapshot.clone(),
+            warnings: self.native_sync.warnings.clone(),
+            history_warnings: self.native_sync.history_warnings.clone(),
+            revisions: self
+                .conversations
+                .iter()
+                .map(|(id, conversation)| {
+                    let revision = conversation
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .revision();
+                    (*id, revision)
+                })
+                .collect(),
+        }
+    }
+
+    /// The loading states a running pass shows: "Loading provider threads…"
+    /// for a project with no threads yet, and "Loading conversation history…"
+    /// for a selected thread with nothing to show.
+    fn native_loading(&self) -> Vec<bool> {
+        let mut loading: Vec<bool> = self
+            .snapshot
+            .projects
+            .iter()
+            .filter(|record| record.agents.is_empty())
+            .filter_map(|record| record.project.as_ref())
+            .map(|project| self.native_sync.pending_for(project.id))
+            .collect();
+        loading.push(self.snapshot.active_agent_id.is_some_and(|agent| {
+            self.native_sync.history_loading(agent)
+                && self.conversations.get(&agent).is_none_or(|conversation| {
+                    conversation
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .message_count()
+                        == 0
+                })
+        }));
+        loading
+    }
+
     pub fn request_native_refresh(&mut self, project_id: Uuid) {
         for provider in crate::native_sync::PROVIDERS {
             self.native_sync
@@ -1527,11 +2160,21 @@ impl AppState {
         if !self.native_sync_enabled() {
             return false;
         }
+        // A pass that found nothing new is not a change, and neither is
+        // starting one. Reporting both redrew the whole window twice a pass —
+        // every second or two — and flickered the sync row, while nothing on
+        // screen had moved. This also runs on every render, so the full view
+        // is compared only when a pass has finished.
+        let loading_before = self.native_loading();
         let mut changed = false;
-        for completion in self.native_sync.drain() {
-            self.capture_drafts(cx);
-            self.apply_native_completion(completion);
-            changed = true;
+        let completions = self.native_sync.drain();
+        if !completions.is_empty() {
+            let before = self.native_view();
+            for completion in completions {
+                self.capture_drafts(cx);
+                self.apply_native_completion(completion);
+            }
+            changed = self.native_view() != before;
         }
         let selected = self
             .snapshot
@@ -1594,7 +2237,9 @@ impl AppState {
                     .flat_map(|record| &record.native_bindings)
                     .find(|binding| binding.agent_id == agent && binding.provider_id == provider)?
                     .clone();
-                let conversation = self.conversation(project, agent);
+                // This runs from a render. A saved transcript is read by the
+                // view that shows it; history waits for that read to land.
+                let conversation = self.loaded_or_unsaved(project, agent)?;
                 let revision = conversation
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
@@ -1684,7 +2329,7 @@ impl AppState {
                         .insert(agent, now + crate::native_sync::HISTORY_INTERVAL);
                 }
                 match self.native_sync.submit(ticket, self.paths.clone()) {
-                    Ok(()) => changed = true,
+                    Ok(()) => {}
                     Err(error) => {
                         self.native_sync
                             .warnings
@@ -1694,7 +2339,7 @@ impl AppState {
                 }
             }
         }
-        changed
+        changed || self.native_loading() != loading_before
     }
 
     fn apply_native_completion(&mut self, completion: crate::native_sync::Completion) -> bool {
@@ -2152,18 +2797,555 @@ impl AppState {
     }
 }
 
+/// Most prompts one thread may queue, and most image bytes they may hold
+/// together. The original's limits.
+pub const MAX_QUEUED_PROMPTS: usize = 20;
+pub const MAX_QUEUED_ATTACHMENT_BYTES: usize = 64 * 1024 * 1024;
+
+/// What each thread's composer holds besides its text, and what is in flight
+/// on its behalf.
+///
+/// One owner for all of it rather than a map per concern on [`AppState`]:
+/// a thread's images, its queue's images, its unanswered steer and its goal
+/// all live and die with the thread, and are read together by one view.
+#[derive(Default)]
+pub struct ComposerStore {
+    attachments: HashMap<Uuid, Vec<fx_core::Attachment>>,
+    preparing: HashMap<Uuid, usize>,
+    notices: HashMap<Uuid, String>,
+    /// Images of an unaccepted prompt, put back with its text.
+    retry_attachments: HashMap<Uuid, Vec<fx_core::Attachment>>,
+    /// Images travelling with a queued prompt, by the queued prompt's id.
+    queued_attachments: HashMap<Uuid, Vec<fx_core::Attachment>>,
+    steers: HashMap<Uuid, PendingSteer>,
+    accepted_steers: Vec<(Uuid, PendingSteer)>,
+    goals: HashMap<Uuid, fx_core::models::ConversationGoal>,
+    /// An objective `/goal` set, to send as a prompt once the goal is in place.
+    goal_prompts: HashMap<Uuid, String>,
+    /// Threads whose turn ended with prompts waiting behind it.
+    dispatch: Vec<Uuid>,
+    /// The queued prompt being edited in place, if any.
+    pub editor: Option<QueueEditor>,
+}
+
+/// Guidance sent into a running turn and not yet answered.
+#[derive(Debug, Clone)]
+pub struct PendingSteer {
+    pub id: Uuid,
+    pub text: String,
+    pub attachment_ids: Vec<Uuid>,
+}
+
+/// A queued prompt open for editing, and the field editing it.
+#[derive(Clone)]
+pub struct QueueEditor {
+    pub agent_id: Uuid,
+    pub queued_id: Uuid,
+    pub field: Entity<TextField>,
+}
+
+/// What a submitted draft becomes while a turn is running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FollowUp {
+    /// Guide the running turn now. The original's default.
+    #[default]
+    Steer,
+    /// Run after the running turn.
+    Queue,
+}
+
+impl FollowUp {
+    pub fn from_preference(value: &str) -> Self {
+        if value.eq_ignore_ascii_case("queue") {
+            Self::Queue
+        } else {
+            Self::Steer
+        }
+    }
+
+    pub fn preference(self) -> &'static str {
+        match self {
+            Self::Steer => "steer",
+            Self::Queue => "queue",
+        }
+    }
+
+    pub fn opposite(self) -> Self {
+        match self {
+            Self::Steer => Self::Queue,
+            Self::Queue => Self::Steer,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Steer => "Steer",
+            Self::Queue => "Queue",
+        }
+    }
+}
+
+impl AppState {
+    // ── Composer attachments ───────────────────────────────────────────────
+
+    /// The images waiting in a thread's composer.
+    pub fn attachments(&self, agent_id: Uuid) -> &[fx_core::Attachment] {
+        self.composer
+            .attachments
+            .get(&agent_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    /// Whether images are still being read for this thread.
+    pub fn is_preparing_attachments(&self, agent_id: Uuid) -> bool {
+        self.composer
+            .preparing
+            .get(&agent_id)
+            .is_some_and(|count| *count > 0)
+    }
+
+    /// What the composer should say about its last attach, send, or steer.
+    pub fn composer_notice(&self, agent_id: Uuid) -> Option<&str> {
+        self.composer.notices.get(&agent_id).map(String::as_str)
+    }
+
+    pub fn set_composer_notice(&mut self, agent_id: Uuid, notice: Option<String>) {
+        match notice {
+            Some(notice) => self.composer.notices.insert(agent_id, notice),
+            None => self.composer.notices.remove(&agent_id),
+        };
+    }
+
+    /// Note that a batch of images is being read for this thread.
+    pub fn begin_preparing_attachments(&mut self, agent_id: Uuid) {
+        *self.composer.preparing.entry(agent_id).or_default() += 1;
+    }
+
+    /// Admit a prepared batch under the composer's limits.
+    pub fn finish_preparing_attachments(
+        &mut self,
+        agent_id: Uuid,
+        prepared: crate::attachments::Prepared,
+    ) {
+        if let Some(count) = self.composer.preparing.get_mut(&agent_id) {
+            *count = count.saturating_sub(1);
+        }
+        if self.deleted_agents.contains(&agent_id) {
+            return;
+        }
+        let pending = self.composer.attachments.entry(agent_id).or_default();
+        let notice = crate::attachments::admit(pending, prepared);
+        self.set_composer_notice(agent_id, notice);
+    }
+
+    /// Attach an image taken from the clipboard.
+    pub fn attach_pasted(&mut self, agent_id: Uuid, image: &gpui::Image) {
+        let prepared = match crate::attachments::prepare_pasted(image) {
+            Ok(attachment) => crate::attachments::Prepared {
+                attachments: vec![attachment],
+                errors: Vec::new(),
+            },
+            Err(error) => crate::attachments::Prepared {
+                attachments: Vec::new(),
+                errors: vec![error],
+            },
+        };
+        self.begin_preparing_attachments(agent_id);
+        self.finish_preparing_attachments(agent_id, prepared);
+    }
+
+    pub fn remove_attachment(&mut self, agent_id: Uuid, attachment_id: Uuid) {
+        if let Some(pending) = self.composer.attachments.get_mut(&agent_id) {
+            pending.retain(|attachment| attachment.id != attachment_id);
+        }
+    }
+
+    /// Drop the composer's images that went out with a prompt, keeping any
+    /// attached since.
+    fn release_sent_attachments(&mut self, agent_id: Uuid, sent: &[Uuid]) {
+        if let Some(pending) = self.composer.attachments.get_mut(&agent_id) {
+            pending.retain(|attachment| !sent.contains(&attachment.id));
+        }
+    }
+
+    // ── Queue ──────────────────────────────────────────────────────────────
+
+    /// Queue a prompt behind the running turn, with its images.
+    ///
+    /// The composer is cleared only once the queue has taken the prompt, so a
+    /// refusal leaves the reader's words and images where they were.
+    pub fn enqueue_prompt(
+        &mut self,
+        agent_id: Uuid,
+        text: &str,
+        attachments: Vec<fx_core::Attachment>,
+        cx: &mut App,
+    ) -> Result<(), String> {
+        let conversation = self
+            .conversation_by_agent(agent_id)
+            .ok_or("This thread is not loaded.")?;
+        let queued: Vec<Uuid> = {
+            let conversation = conversation
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            conversation.queued().map(|prompt| prompt.id).collect()
+        };
+        if queued.len() >= MAX_QUEUED_PROMPTS {
+            return Err(format!(
+                "The queue is full (maximum {MAX_QUEUED_PROMPTS} prompts)."
+            ));
+        }
+        let queued_bytes: usize = queued
+            .iter()
+            .filter_map(|id| self.composer.queued_attachments.get(id))
+            .flatten()
+            .map(|attachment| attachment.data.len())
+            .sum();
+        let bytes: usize = attachments
+            .iter()
+            .map(|attachment| attachment.data.len())
+            .sum();
+        if queued_bytes + bytes > MAX_QUEUED_ATTACHMENT_BYTES {
+            return Err("Queued attachments would exceed the 64 MB per-conversation limit.".into());
+        }
+        let id = Uuid::new_v4();
+        let sent: Vec<Uuid> = attachments.iter().map(|attachment| attachment.id).collect();
+        {
+            let mut conversation = conversation
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            conversation.enqueue(fx_agent::conversation::QueuedPrompt {
+                id,
+                text: text.to_string(),
+                attachment_count: attachments.len(),
+            });
+        }
+        if !attachments.is_empty() {
+            self.composer.queued_attachments.insert(id, attachments);
+        }
+        self.release_sent_attachments(agent_id, &sent);
+        if let Some(field) = self.drafts.get(&agent_id).cloned()
+            && field.read(cx).value().trim() == text.trim()
+        {
+            self.clear_draft(agent_id, cx);
+        }
+        self.set_composer_notice(agent_id, None);
+        Ok(())
+    }
+
+    /// Remove a queued prompt and the images it carried.
+    pub fn remove_queued(&mut self, agent_id: Uuid, index: usize) {
+        let Some(conversation) = self.conversation_by_agent(agent_id) else {
+            return;
+        };
+        let removed = conversation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove_queued_at(index);
+        if let Some(removed) = removed {
+            self.composer.queued_attachments.remove(&removed.id);
+            if self
+                .composer
+                .editor
+                .as_ref()
+                .is_some_and(|editor| editor.queued_id == removed.id)
+            {
+                self.composer.editor = None;
+            }
+        }
+    }
+
+    /// Open a queued prompt for editing in place.
+    pub fn begin_editing_queued(&mut self, agent_id: Uuid, index: usize, cx: &mut App) {
+        let Some(conversation) = self.conversation_by_agent(agent_id) else {
+            return;
+        };
+        let Some(queued) = conversation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .queued_at(index)
+            .cloned()
+        else {
+            return;
+        };
+        let field = cx.new(|cx| {
+            let mut field = TextField::new(cx)
+                .placeholder("Edit queued prompt")
+                .multiline(6.0)
+                .max_len(32_000);
+            field.set_value(queued.text.clone(), cx);
+            field
+        });
+        self.composer.editor = Some(QueueEditor {
+            agent_id,
+            queued_id: queued.id,
+            field,
+        });
+    }
+
+    pub fn queue_editor(&self) -> Option<&QueueEditor> {
+        self.composer.editor.as_ref()
+    }
+
+    pub fn cancel_editing_queued(&mut self) {
+        self.composer.editor = None;
+    }
+
+    /// Save the open edit. An edit that leaves only whitespace is refused and
+    /// the editor stays open: emptying a prompt is what Remove is for.
+    pub fn save_queued_edit(&mut self, cx: &App) -> bool {
+        let Some(editor) = self.composer.editor.clone() else {
+            return false;
+        };
+        let text = editor.field.read(cx).value().to_string();
+        let Some(conversation) = self.conversation_by_agent(editor.agent_id) else {
+            self.composer.editor = None;
+            return false;
+        };
+        let saved = conversation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .update_queued(editor.queued_id, &text);
+        if saved {
+            self.composer.editor = None;
+        }
+        saved
+    }
+
+    /// Threads ready to send the next queued prompt, taken once.
+    pub fn take_ready_queues(&mut self) -> Vec<Uuid> {
+        std::mem::take(&mut self.composer.dispatch)
+    }
+
+    /// The next queued prompt for a thread, with its images.
+    pub fn dequeue_prompt(&mut self, agent_id: Uuid) -> Option<(String, Vec<fx_core::Attachment>)> {
+        if self.runners.contains_key(&agent_id) {
+            return None;
+        }
+        let conversation = self.conversation_by_agent(agent_id)?;
+        let queued = conversation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .dequeue()?;
+        if self
+            .composer
+            .editor
+            .as_ref()
+            .is_some_and(|editor| editor.queued_id == queued.id)
+        {
+            self.composer.editor = None;
+        }
+        let attachments = self
+            .composer
+            .queued_attachments
+            .remove(&queued.id)
+            .unwrap_or_default();
+        Some((queued.text, attachments))
+    }
+
+    /// Note that a thread's turn has ended, so its queue may move.
+    ///
+    /// Not after a prompt the provider never accepted: the next one would
+    /// meet the same refusal, which is the original's rule.
+    fn queue_may_advance(&mut self, agent_id: Uuid) {
+        let Some(conversation) = self.conversations.get(&agent_id) else {
+            return;
+        };
+        let conversation = conversation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if conversation.unsent().is_none()
+            && conversation.queued_count() > 0
+            && !self.composer.dispatch.contains(&agent_id)
+        {
+            self.composer.dispatch.push(agent_id);
+        }
+    }
+
+    // ── Steering ───────────────────────────────────────────────────────────
+
+    /// Send guidance into the running turn. The draft stays in the composer
+    /// until the provider accepts it.
+    pub fn begin_steer(
+        &mut self,
+        agent_id: Uuid,
+        text: &str,
+        attachments: Vec<fx_core::Attachment>,
+    ) -> Result<(), String> {
+        if self.composer.steers.contains_key(&agent_id) {
+            return Err("Wait for the previous guidance to be accepted.".into());
+        }
+        let Some(runner) = self.runners.get(&agent_id) else {
+            return Err(
+                "There is no active turn to steer. Send this as a new prompt or queue it instead."
+                    .into(),
+            );
+        };
+        let steer = PendingSteer {
+            id: Uuid::new_v4(),
+            text: text.to_string(),
+            attachment_ids: attachments.iter().map(|attachment| attachment.id).collect(),
+        };
+        if !runner.steer(steer.id, text.to_string(), attachments) {
+            return Err(
+                "The turn ended before the guidance could be sent. Send it as a new prompt.".into(),
+            );
+        }
+        self.composer.steers.insert(agent_id, steer);
+        self.set_composer_notice(agent_id, None);
+        Ok(())
+    }
+
+    /// Whether guidance for this thread is waiting on the provider.
+    pub fn is_steering(&self, agent_id: Uuid) -> bool {
+        self.composer.steers.contains_key(&agent_id)
+    }
+
+    fn steer_answered(&mut self, agent_id: Uuid, id: Uuid, result: Result<(), String>) {
+        if self
+            .composer
+            .steers
+            .get(&agent_id)
+            .is_none_or(|steer| steer.id != id)
+        {
+            return;
+        }
+        let Some(steer) = self.composer.steers.remove(&agent_id) else {
+            return;
+        };
+        match result {
+            Ok(()) => self.composer.accepted_steers.push((agent_id, steer)),
+            Err(reason) => self.set_composer_notice(
+                agent_id,
+                Some(format!(
+                    "Could not steer the active turn: {reason} Your message was not sent; retry or queue it."
+                )),
+            ),
+        }
+    }
+
+    /// Clear accepted guidance from the composer, unless it has been edited.
+    fn clear_accepted_steers(&mut self, cx: &mut App) {
+        for (agent_id, steer) in std::mem::take(&mut self.composer.accepted_steers) {
+            if let Some(field) = self.drafts.get(&agent_id).cloned()
+                && field.read(cx).value().trim() == steer.text.trim()
+            {
+                self.clear_draft(agent_id, cx);
+            }
+            self.release_sent_attachments(agent_id, &steer.attachment_ids);
+        }
+    }
+
+    // ── Thread controls and goals ──────────────────────────────────────────
+
+    /// The thread's goal, as the provider last reported it.
+    pub fn goal(&self, agent_id: Uuid) -> Option<&fx_core::models::ConversationGoal> {
+        self.composer.goals.get(&agent_id)
+    }
+
+    /// Whether a thread may start a control now, and its conversation if so.
+    pub fn prepare_control(&mut self, agent_id: Uuid) -> Option<Arc<GuardedConversation>> {
+        if self.runners.contains_key(&agent_id) || self.protected_conversations.contains(&agent_id)
+        {
+            return None;
+        }
+        let project_id = self.project_for_agent(agent_id)?;
+        let conversation = self.conversation(project_id, agent_id);
+        if conversation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_busy()
+        {
+            return None;
+        }
+        Some(conversation)
+    }
+
+    /// Send this objective as a prompt once `/goal` has set it.
+    pub fn send_after_goal(&mut self, agent_id: Uuid, objective: String) {
+        self.composer.goal_prompts.insert(agent_id, objective);
+    }
+
+    fn goal_changed(&mut self, agent_id: Uuid, goal: Option<fx_core::models::ConversationGoal>) {
+        match goal {
+            Some(goal) => {
+                if let Some(objective) = self.composer.goal_prompts.remove(&agent_id)
+                    && let Some(conversation) = self.conversations.get(&agent_id)
+                {
+                    conversation
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .enqueue(fx_agent::conversation::QueuedPrompt {
+                            id: Uuid::new_v4(),
+                            text: objective,
+                            attachment_count: 0,
+                        });
+                }
+                self.composer.goals.insert(agent_id, goal);
+            }
+            None => {
+                self.composer.goals.remove(&agent_id);
+            }
+        }
+        // The goal is not part of the conversation's revision, so the
+        // unchanged-version shortcut would skip writing it.
+        self.saved_conversations.remove(&agent_id);
+    }
+
+    /// The folder a thread's project lives in.
+    pub fn project_root_for(&self, agent_id: Uuid) -> Option<String> {
+        let project_id = self.project_for_agent(agent_id)?;
+        self.project(project_id)
+            .map(|project| project.root_path.clone())
+    }
+
+    /// Put a prompt that could not start back where the reader can see it.
+    pub fn return_to_composer(
+        &mut self,
+        agent_id: Uuid,
+        text: String,
+        attachments: Vec<fx_core::Attachment>,
+        cx: &mut Context<Self>,
+    ) {
+        let field = self.draft(agent_id, cx);
+        if field.read(cx).value().trim().is_empty() && self.attachments(agent_id).is_empty() {
+            field.update(cx, |field, cx| field.set_value(text, cx));
+            self.composer.attachments.insert(agent_id, attachments);
+        } else {
+            self.set_composer_notice(
+                agent_id,
+                Some(format!("A queued prompt could not be sent: {text}")),
+            );
+        }
+    }
+
+    // ── Follow-up mode ─────────────────────────────────────────────────────
+
+    /// What ⌘↩ does while a turn runs. ⌃↩ does the other.
+    pub fn follow_up_mode(&self) -> FollowUp {
+        FollowUp::from_preference(&self.preferences.follow_up_mode)
+    }
+}
+
 /// Keep local-only drafts and resume metadata even when native history cannot
 /// fit the bounded recovery cache. The caller reports this partial cache.
-fn encode_partial_cache(
+///
+/// Measured in the encoding that is written, because that is what a later read
+/// is bounded by.
+pub(crate) fn encode_partial_cache(
     mut record: PersistedConversation,
     previous: Option<PersistedConversation>,
     limit: u64,
-) -> Result<(PersistedConversation, Vec<u8>), String> {
+) -> Result<(PersistedConversation, fx_store::EncodedConversation), String> {
+    let encode = |record: &PersistedConversation| {
+        fx_store::EncodedConversation::new(record).map_err(|error| error.to_string())
+    };
     record.messages = previous.map(|old| old.messages).unwrap_or_default();
-    let mut bytes = serde_json::to_vec(&record).map_err(|error| error.to_string())?;
+    let mut bytes = encode(&record)?;
     if bytes.len() as u64 > limit {
         record.messages.clear();
-        bytes = serde_json::to_vec(&record).map_err(|error| error.to_string())?;
+        bytes = encode(&record)?;
     }
     if bytes.len() as u64 > limit {
         return Err(
@@ -2266,6 +3448,30 @@ fn native_contains_local_tail(
         })
 }
 
+/// The images of a conversation's unsent prompt, read back from its user row.
+fn unsent_attachments(conversation: &Conversation) -> Vec<fx_core::Attachment> {
+    let Some(unsent) = conversation.unsent() else {
+        return Vec::new();
+    };
+    conversation
+        .messages()
+        .last()
+        .filter(|message| {
+            message.role == fx_core::MessageRole::User && message.text_content() == unsent.text
+        })
+        .map(crate::attachments::attachments_in)
+        .unwrap_or_default()
+}
+
+/// Whether two image lists carry the same bytes in the same order.
+fn same_images(left: &[fx_core::Attachment], right: &[fx_core::Attachment]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| left.data == right.data)
+}
+
 /// Copy of a conversation for persistence.
 pub fn persisted_from(conversation: &Conversation) -> PersistedConversation {
     let mut persisted = PersistedConversation::from_messages(
@@ -2297,6 +3503,85 @@ pub fn persisted_from(conversation: &Conversation) -> PersistedConversation {
         )
     });
     persisted
+}
+
+/// What a native-sync pass can change on screen, compared before and after it
+/// is applied.
+#[derive(PartialEq)]
+struct NativeView {
+    snapshot: PersistedApp,
+    warnings: HashMap<(Uuid, String), Vec<String>>,
+    history_warnings: HashMap<Uuid, String>,
+    revisions: HashMap<Uuid, u64>,
+}
+
+/// What reading a thread's saved transcript produced.
+///
+/// Built entirely from the store, so a read and parse of tens of megabytes can
+/// happen off the UI thread; installing it is all the UI thread does.
+pub(crate) struct LoadedConversation {
+    conversation: Conversation,
+    /// The saved cost and draft, when there was a readable file.
+    restored: Option<(f64, String)>,
+    /// Why the saved files could not be used, when they could not.
+    failure: Option<String>,
+    /// The thread's saved goal.
+    goal: Option<fx_core::models::ConversationGoal>,
+    /// The unsent prompt's images, when the draft is that prompt.
+    attachments: Vec<fx_core::Attachment>,
+}
+
+impl LoadedConversation {
+    fn empty(agent_id: Uuid) -> Self {
+        Self {
+            conversation: Conversation::new(agent_id),
+            restored: None,
+            failure: None,
+            goal: None,
+            attachments: Vec::new(),
+        }
+    }
+}
+
+fn read_conversation(store: &Store, project_id: Uuid, agent_id: Uuid) -> LoadedConversation {
+    let mut loaded = LoadedConversation::empty(agent_id);
+    match store.load_conversation(project_id, agent_id) {
+        Ok(Some(persisted)) if persisted.agent_id == agent_id => {
+            // Whitespace is not a draft. A composer holding only a newline
+            // must not stand in for the prompt that failed.
+            let draft = if persisted.draft_text.trim().is_empty() {
+                persisted
+                    .unsent_prompt
+                    .as_ref()
+                    .map(|prompt| prompt.text.clone())
+                    .unwrap_or_default()
+            } else {
+                persisted.draft_text.clone()
+            };
+            // The images come back when the draft is the unsent prompt —
+            // restored from it, or already put back after its failure.
+            let recover_images = persisted.unsent_prompt.as_ref().is_some_and(|prompt| {
+                prompt.attachment_count > 0
+                    && (persisted.draft_text.trim().is_empty()
+                        || persisted.draft_text.trim() == prompt.text.trim())
+            });
+            loaded.goal = persisted.goal.clone();
+            loaded.restored = Some((persisted.total_cost_usd, draft));
+            restore_conversation(&mut loaded.conversation, persisted);
+            if recover_images {
+                loaded.attachments = unsent_attachments(&loaded.conversation);
+            }
+        }
+        Ok(None) => {}
+        result => {
+            loaded.failure = Some(match result {
+                Err(error) => error.to_string(),
+                _ => "the transcript belongs to a different thread".to_string(),
+            });
+            loaded.conversation.set_error("The saved conversation could not be read. Its files have been preserved; start a new thread to continue.");
+        }
+    }
+    loaded
 }
 
 pub(crate) fn restore_conversation(
@@ -2398,6 +3683,8 @@ pub fn open_project_picker(state: Entity<AppState>, window: &mut gpui::Window, c
             window.blur();
         }),
     );
+    let open_roots = state.read(cx).open_project_roots();
+    picker.update(cx, |picker, _| picker.set_open_roots(open_roots));
     state.update(cx, |state, cx| {
         state.picker = Some(picker);
         cx.notify();
@@ -3081,7 +4368,7 @@ mod persistence_tests {
                     first,
                     "explicit selection can read archived history"
                 );
-                let conversation = state.active_conversation().unwrap();
+                let conversation = state.conversation(project, first);
                 assert_eq!(
                     conversation.lock().unwrap().session_id(),
                     Some("native-session")
@@ -3400,6 +4687,8 @@ mod persistence_tests {
                     field.read(cx).value().is_empty(),
                     "clear before any provider event"
                 );
+                // The save is queued on the writer; wait for it before reading.
+                state.flush_saves();
                 let saved = state
                     .store
                     .load_conversation(project, agent)
@@ -3492,6 +4781,433 @@ mod persistence_tests {
     }
 
     #[test]
+    fn a_whitespace_only_composer_does_not_stop_a_failed_prompt_coming_back() {
+        // `prepare_prompt` trims, so a field holding only a newline is empty
+        // as far as sending goes. It must be empty for recovery too.
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, project, agent, _) = test.update(|cx| workspace(cx, &paths));
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                let field = state.draft(agent, cx);
+                field.update(cx, |field, cx| field.set_value("send this", cx));
+                assert!(state.prepare_prompt(agent, "send this", cx));
+                field.update(cx, |field, cx| field.set_value("\n", cx));
+                state.update_sender_for(agent)(SessionUpdate::Failed {
+                    reason: "CLI unavailable".into(),
+                });
+                state.drain_updates_with_context(cx);
+                assert_eq!(field.read(cx).value(), "send this");
+                state.flush_saves();
+                let saved = state
+                    .store
+                    .load_conversation(project, agent)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    saved.draft_text, "send this",
+                    "the failure's own save must not record the newline over the retry"
+                );
+            })
+        });
+    }
+
+    #[test]
+    fn a_whitespace_only_saved_draft_falls_back_to_the_unsent_prompt_on_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, project, agent, _) = test.update(|cx| workspace(cx, &paths));
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                let field = state.draft(agent, cx);
+                field.update(cx, |field, cx| field.set_value("send this", cx));
+                assert!(state.prepare_prompt(agent, "send this", cx));
+                field.update(cx, |field, cx| field.set_value(" \n", cx));
+                state.save_all(cx);
+            })
+        });
+        let reopened = test.update(|cx| cx.new(|cx| AppState::restore(paths.clone(), cx)));
+        test.update(|cx| {
+            reopened.update(cx, |state, cx| {
+                state.conversation(project, agent);
+                assert_eq!(state.draft(agent, cx).read(cx).value(), "send this");
+            })
+        });
+
+        // A thread whose field was never created recovers through the same
+        // rule, from the restored copy rather than from a live field.
+        let reopened = test.update(|cx| cx.new(|cx| AppState::restore(paths, cx)));
+        test.update(|cx| {
+            reopened.update(cx, |state, cx| {
+                state.conversation(project, agent);
+                state.restored_drafts.insert(agent, "\n".into());
+                assert!(state.prepare_prompt(agent, "send this", cx));
+                state.update_sender_for(agent)(SessionUpdate::Failed {
+                    reason: "CLI unavailable".into(),
+                });
+                state.drain_updates_with_context(cx);
+                assert_eq!(state.draft(agent, cx).read(cx).value(), "send this");
+            })
+        });
+    }
+
+    fn image(fill: u8) -> fx_core::Attachment {
+        let mut data = b"\x89PNG\r\n\x1a\n".to_vec();
+        data.resize(48, fill);
+        fx_core::Attachment::new(data, "image/png", format!("image-{fill}.png"))
+    }
+
+    fn attach(state: &mut AppState, agent: Uuid, images: Vec<fx_core::Attachment>) {
+        state.begin_preparing_attachments(agent);
+        state.finish_preparing_attachments(
+            agent,
+            crate::attachments::Prepared {
+                attachments: images,
+                errors: Vec::new(),
+            },
+        );
+    }
+
+    #[test]
+    fn images_go_with_an_unsent_prompt_through_a_retry_and_a_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, project, agent, _) = test.update(|cx| workspace(cx, &paths));
+        let sent = image(1);
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                let field = state.draft(agent, cx);
+                field.update(cx, |field, cx| field.set_value("look at this", cx));
+                attach(state, agent, vec![sent.clone()]);
+                let images = state.attachments(agent).to_vec();
+                assert!(state.prepare_prompt_with(agent, "look at this", &images, cx));
+                assert!(state.attachments(agent).is_empty(), "sent images stay out");
+                state.update_sender_for(agent)(SessionUpdate::Failed {
+                    reason: "CLI unavailable".into(),
+                });
+                state.drain_updates_with_context(cx);
+                assert_eq!(field.read(cx).value(), "look at this");
+                assert_eq!(state.attachments(agent).len(), 1, "the image came back");
+                assert_eq!(state.attachments(agent)[0].data, sent.data);
+
+                // Retrying the same prompt with the same image reuses its row.
+                let images = state.attachments(agent).to_vec();
+                assert!(state.prepare_prompt_with(agent, "look at this", &images, cx));
+                let conversation = state.conversation(project, agent);
+                assert_eq!(conversation.lock().unwrap().message_count(), 1);
+                assert_eq!(
+                    conversation
+                        .lock()
+                        .unwrap()
+                        .unsent()
+                        .unwrap()
+                        .attachment_count,
+                    1
+                );
+                state.save_all(cx);
+            })
+        });
+        let reopened = test.update(|cx| cx.new(|cx| AppState::restore(paths, cx)));
+        test.update(|cx| {
+            reopened.update(cx, |state, cx| {
+                state.conversation(project, agent);
+                assert_eq!(state.draft(agent, cx).read(cx).value(), "look at this");
+                assert_eq!(state.attachments(agent).len(), 1, "lost across a restart");
+                assert_eq!(state.attachments(agent)[0].data, sent.data);
+            })
+        });
+    }
+
+    #[test]
+    fn a_composer_holding_its_own_images_keeps_them_over_a_failed_prompts() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, _, agent, _) = test.update(|cx| workspace(cx, &paths));
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                assert!(state.prepare_prompt_with(agent, "first", &[image(1)], cx));
+                attach(state, agent, vec![image(2)]);
+                state.update_sender_for(agent)(SessionUpdate::Failed {
+                    reason: "startup failed".into(),
+                });
+                state.drain_updates_with_context(cx);
+                assert_eq!(state.attachments(agent).len(), 1);
+                assert_eq!(state.attachments(agent)[0].data, image(2).data);
+            })
+        });
+    }
+
+    #[test]
+    fn the_composer_refuses_images_past_its_limits_and_says_why() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, _, agent, _) = test.update(|cx| workspace(cx, &paths));
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                let many = (0..crate::attachments::MAX_PENDING_ATTACHMENTS as u8 + 2)
+                    .map(image)
+                    .collect();
+                attach(state, agent, many);
+                assert_eq!(
+                    state.attachments(agent).len(),
+                    crate::attachments::MAX_PENDING_ATTACHMENTS
+                );
+                assert!(!state.is_preparing_attachments(agent));
+                assert!(state.composer_notice(agent).unwrap().contains("at once"));
+                let id = state.attachments(agent)[0].id;
+                state.remove_attachment(agent, id);
+                assert_eq!(
+                    state.attachments(agent).len(),
+                    crate::attachments::MAX_PENDING_ATTACHMENTS - 1
+                );
+            })
+        });
+    }
+
+    #[test]
+    fn a_queued_prompt_keeps_its_images_and_moves_when_the_turn_ends() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, _, agent, _) = test.update(|cx| workspace(cx, &paths));
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                assert!(state.prepare_prompt(agent, "first", cx));
+                state.update_sender_for(agent)(SessionUpdate::Accepted);
+                state.drain_updates_with_context(cx);
+
+                let field = state.draft(agent, cx);
+                field.update(cx, |field, cx| field.set_value("then this", cx));
+                attach(state, agent, vec![image(3)]);
+                let images = state.attachments(agent).to_vec();
+                state
+                    .enqueue_prompt(agent, "then this", images, cx)
+                    .unwrap();
+                assert!(
+                    field.read(cx).value().is_empty(),
+                    "the queue took the draft"
+                );
+                assert!(state.attachments(agent).is_empty());
+                assert!(
+                    state.take_ready_queues().is_empty(),
+                    "nothing moves mid-turn"
+                );
+
+                state.update_sender_for(agent)(SessionUpdate::Finished {
+                    outcome: fx_agent::codex::TurnOutcome::Completed {
+                        thread_id: "thread".into(),
+                        stop_reason: "completed".into(),
+                        events: vec![],
+                    },
+                });
+                state.drain_updates_with_context(cx);
+                assert_eq!(state.take_ready_queues(), vec![agent]);
+                let (text, images) = state.dequeue_prompt(agent).unwrap();
+                assert_eq!(text, "then this");
+                assert_eq!(images.len(), 1);
+                assert_eq!(images[0].data, image(3).data);
+                assert!(state.dequeue_prompt(agent).is_none());
+            })
+        });
+    }
+
+    #[test]
+    fn a_queue_does_not_move_behind_a_prompt_the_provider_never_took() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, _, agent, _) = test.update(|cx| workspace(cx, &paths));
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                assert!(state.prepare_prompt(agent, "refused", cx));
+                state
+                    .enqueue_prompt(agent, "waiting", Vec::new(), cx)
+                    .unwrap();
+                state.update_sender_for(agent)(SessionUpdate::Failed {
+                    reason: "writer conflict".into(),
+                });
+                state.drain_updates_with_context(cx);
+                assert!(state.take_ready_queues().is_empty());
+            })
+        });
+    }
+
+    #[test]
+    fn a_queued_prompt_is_edited_in_place_and_an_empty_edit_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, project, agent, _) = test.update(|cx| workspace(cx, &paths));
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                state.conversation(project, agent);
+                for text in ["one", "two"] {
+                    state.enqueue_prompt(agent, text, Vec::new(), cx).unwrap();
+                }
+                state.begin_editing_queued(agent, 1, cx);
+                let editor = state.queue_editor().unwrap().field.clone();
+                assert_eq!(editor.read(cx).value(), "two");
+                editor.update(cx, |field, cx| field.set_value("  two, rewritten  ", cx));
+                assert!(state.save_queued_edit(cx));
+                assert!(state.queue_editor().is_none());
+                let conversation = state.conversation(project, agent);
+                let queued: Vec<String> = conversation
+                    .lock()
+                    .unwrap()
+                    .queued()
+                    .map(|prompt| prompt.text.clone())
+                    .collect();
+                assert_eq!(queued, vec!["one", "two, rewritten"]);
+
+                state.begin_editing_queued(agent, 0, cx);
+                let editor = state.queue_editor().unwrap().field.clone();
+                editor.update(cx, |field, cx| field.set_value(" \n ", cx));
+                assert!(!state.save_queued_edit(cx));
+                assert!(state.queue_editor().is_some(), "the editor stays open");
+                state.remove_queued(agent, 0);
+                assert!(
+                    state.queue_editor().is_none(),
+                    "removing it closes its editor"
+                );
+            })
+        });
+    }
+
+    #[test]
+    fn accepted_guidance_clears_the_composer_and_refused_guidance_keeps_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, project, agent, _) = test.update(|cx| workspace(cx, &paths));
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                state.conversation(project, agent);
+                assert!(
+                    state.begin_steer(agent, "guide", Vec::new()).is_err(),
+                    "there is no turn to steer"
+                );
+                let field = state.draft(agent, cx);
+                field.update(cx, |field, cx| field.set_value("guide", cx));
+                attach(state, agent, vec![image(4)]);
+                let id = Uuid::new_v4();
+                state.composer.steers.insert(
+                    agent,
+                    PendingSteer {
+                        id,
+                        text: "guide".into(),
+                        attachment_ids: vec![state.attachments(agent)[0].id],
+                    },
+                );
+                assert!(state.is_steering(agent));
+                // A stale answer for some other steer changes nothing.
+                state.update_sender_for(agent)(SessionUpdate::Steered {
+                    id: Uuid::new_v4(),
+                    result: Ok(()),
+                });
+                state.drain_updates_with_context(cx);
+                assert!(state.is_steering(agent));
+
+                state.update_sender_for(agent)(SessionUpdate::Steered { id, result: Ok(()) });
+                state.drain_updates_with_context(cx);
+                assert!(!state.is_steering(agent));
+                assert!(field.read(cx).value().is_empty());
+                assert!(state.attachments(agent).is_empty());
+
+                field.update(cx, |field, cx| field.set_value("again", cx));
+                let id = Uuid::new_v4();
+                state.composer.steers.insert(
+                    agent,
+                    PendingSteer {
+                        id,
+                        text: "again".into(),
+                        attachment_ids: Vec::new(),
+                    },
+                );
+                state.update_sender_for(agent)(SessionUpdate::Steered {
+                    id,
+                    result: Err("the turn ended".into()),
+                });
+                state.drain_updates_with_context(cx);
+                assert_eq!(field.read(cx).value(), "again");
+                assert!(
+                    state
+                        .composer_notice(agent)
+                        .unwrap()
+                        .contains("Your message was not sent")
+                );
+            })
+        });
+    }
+
+    #[test]
+    fn a_goal_is_kept_with_its_thread_and_a_new_objective_is_sent_after_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, project, agent, _) = test.update(|cx| workspace(cx, &paths));
+        let goal = fx_core::models::ConversationGoal::from_codex(&serde_json::json!({
+            "threadId": "thread", "objective": "Ship it", "status": "active"
+        }))
+        .unwrap();
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                state.conversation(project, agent);
+                state.send_after_goal(agent, "Ship it".into());
+                state.update_sender_for(agent)(SessionUpdate::GoalChanged {
+                    goal: Some(goal.clone()),
+                });
+                state.update_sender_for(agent)(SessionUpdate::Finished {
+                    outcome: fx_agent::codex::TurnOutcome::Completed {
+                        thread_id: "thread".into(),
+                        stop_reason: "control".into(),
+                        events: vec![],
+                    },
+                });
+                state.drain_updates_with_context(cx);
+                assert_eq!(state.goal(agent), Some(&goal));
+                assert_eq!(state.take_ready_queues(), vec![agent]);
+                assert_eq!(state.dequeue_prompt(agent).unwrap().0, "Ship it");
+                state.save_all(cx);
+            })
+        });
+        let reopened = test.update(|cx| cx.new(|cx| AppState::restore(paths.clone(), cx)));
+        test.update(|cx| {
+            reopened.update(cx, |state, cx| {
+                state.conversation(project, agent);
+                assert_eq!(state.goal(agent), Some(&goal));
+                state.update_sender_for(agent)(SessionUpdate::GoalChanged { goal: None });
+                state.drain_updates_with_context(cx);
+                assert_eq!(state.goal(agent), None);
+                state.save_all(cx);
+            })
+        });
+        let reopened = test.update(|cx| cx.new(|cx| AppState::restore(paths, cx)));
+        test.update(|cx| {
+            reopened.update(cx, |state, _| {
+                state.conversation(project, agent);
+                assert_eq!(state.goal(agent), None, "a cleared goal came back");
+            })
+        });
+    }
+
+    #[test]
+    fn the_follow_up_setting_reads_its_stored_spelling() {
+        assert_eq!(FollowUp::from_preference("queue"), FollowUp::Queue);
+        assert_eq!(FollowUp::from_preference("steer"), FollowUp::Steer);
+        assert_eq!(FollowUp::from_preference(""), FollowUp::Steer);
+        assert_eq!(FollowUp::Steer.opposite(), FollowUp::Queue);
+        assert_eq!(
+            FollowUp::from_preference(FollowUp::Queue.preference()),
+            FollowUp::Queue
+        );
+    }
+
+    #[test]
     fn accepting_a_prompt_does_not_erase_edits_made_during_startup() {
         let temp = tempfile::tempdir().unwrap();
         let paths = AppPaths::at(temp.path().join("state"));
@@ -3531,15 +5247,17 @@ mod persistence_tests {
                 first_field.update(cx, |field, cx| field.set_value("send this", cx));
                 assert!(state.prepare_prompt(first, "send this", cx));
                 first_field.update(cx, |field, cx| field.set_value("my follow-up", cx));
+                // Left empty on purpose: a filled composer would also pass if the
+                // prompt were restored into every empty one, which is the bug.
                 let second_field = state.draft(second, cx);
-                second_field.update(cx, |field, cx| field.set_value("another chat's draft", cx));
                 state.select_agent(second);
                 state.update_sender_for(first)(SessionUpdate::Failed {
                     reason: "startup failed".into(),
                 });
                 state.drain_updates_with_context(cx);
                 assert_eq!(first_field.read(cx).value(), "my follow-up");
-                assert_eq!(second_field.read(cx).value(), "another chat's draft");
+                assert_eq!(second_field.read(cx).value(), "");
+                state.flush_saves();
                 let saved = state
                     .store
                     .load_conversation(project, first)
@@ -3547,6 +5265,13 @@ mod persistence_tests {
                     .unwrap();
                 assert_eq!(saved.draft_text, "my follow-up");
                 assert_eq!(saved.unsent_prompt.unwrap().text, "send this");
+                let other = state.store.load_conversation(project, second).unwrap();
+                assert!(
+                    other.is_none_or(
+                        |other| other.draft_text.is_empty() && other.unsent_prompt.is_none()
+                    ),
+                    "the other chat was given this chat's prompt"
+                );
 
                 // With no replacement draft, stopping before acknowledgement makes
                 // the original prompt available to retry, even in a background chat.
@@ -3560,7 +5285,7 @@ mod persistence_tests {
                 });
                 state.drain_updates_with_context(cx);
                 assert_eq!(first_field.read(cx).value(), "send this");
-                assert_eq!(second_field.read(cx).value(), "another chat's draft");
+                assert_eq!(second_field.read(cx).value(), "");
             })
         });
     }
@@ -3640,6 +5365,159 @@ mod persistence_tests {
                         .unwrap()
                         .unsent()
                         .is_none()
+                );
+            })
+        });
+    }
+
+    #[test]
+    fn retrying_a_prompt_with_images_resends_them_and_keeps_its_one_row() {
+        // The banner's Retry resends the unsent prompt. Its text alone is a
+        // different prompt: the images would be lost and a second row added.
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, project, agent, _) = test.update(|cx| workspace(cx, &paths));
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                let images = vec![image(1), image(2)];
+                assert!(state.prepare_prompt_with(agent, "what is this", &images, cx));
+                let conversation = state.conversation(project, agent);
+                conversation.lock().unwrap().set_error("launch failed");
+                assert_eq!(state.retry_prompt(agent).as_deref(), Some("what is this"));
+                let resent = state.unsent_images(agent);
+                assert!(same_images(&resent, &images), "the images were not resent");
+                assert!(state.prepare_prompt_with(agent, "what is this", &resent, cx));
+                let users = conversation
+                    .lock()
+                    .unwrap()
+                    .messages()
+                    .filter(|message| message.role == fx_core::MessageRole::User)
+                    .count();
+                assert_eq!(users, 1, "the retry added a second prompt row");
+            })
+        });
+    }
+
+    #[test]
+    fn a_failed_turn_retries_resumes_restarts_and_dismisses() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, project, agent, _) = test.update(|cx| workspace(cx, &paths));
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                let conversation = state.conversation(project, agent);
+                let fail = |state: &mut AppState, reason: &str| {
+                    conversation.lock().unwrap().set_error(reason);
+                    state.last_error = Some(reason.into());
+                };
+
+                // A prompt the provider never accepted is the one resent.
+                assert!(state.prepare_prompt(agent, "first question", cx));
+                fail(state, "launch failed");
+                assert_eq!(state.retry_prompt(agent).as_deref(), Some("first question"));
+                assert!(conversation.lock().unwrap().error().is_none());
+                assert!(state.last_error.is_none(), "the shell kept the banner");
+
+                // Resuming needs a session to resume.
+                fail(state, "provider disconnected");
+                assert_eq!(state.resume_session(agent), None);
+                conversation.lock().unwrap().set_session_id("thread-1");
+                assert_eq!(state.resume_session(agent).as_deref(), Some("continue"));
+
+                // Restarting forgets the session and its binding, and resends.
+                conversation.lock().unwrap().clear_unsent();
+                state.bind_local_session(agent);
+                fail(state, "Codex thread not found");
+                assert_eq!(
+                    state.restart_session(agent).as_deref(),
+                    Some("first question")
+                );
+                assert!(conversation.lock().unwrap().session_id().is_none());
+                let record = &state.snapshot.projects[0];
+                assert!(
+                    !record
+                        .native_bindings
+                        .iter()
+                        .any(|binding| binding.agent_id == agent),
+                    "the dead session stayed bound"
+                );
+                assert!(
+                    record
+                        .suppressed_native_threads
+                        .iter()
+                        .any(|identity| identity.session_id == "thread-1"),
+                    "the dead session could come back as a duplicate thread"
+                );
+                // The next session the provider opens binds to the same thread.
+                state.update_sender_for(agent)(SessionUpdate::Started {
+                    thread_id: "thread-2".into(),
+                });
+                state.drain_updates_with_context(cx);
+                assert!(
+                    state.snapshot.projects[0]
+                        .native_bindings
+                        .iter()
+                        .any(
+                            |binding| binding.agent_id == agent && binding.session_id == "thread-2"
+                        )
+                );
+
+                // Dismissing leaves an unrelated shell failure up.
+                fail(state, "boom");
+                state.last_error = Some("The workspace could not be saved.".into());
+                state.dismiss_turn_error(agent);
+                assert!(conversation.lock().unwrap().error().is_none());
+                assert_eq!(
+                    state.last_error.as_deref(),
+                    Some("The workspace could not be saved.")
+                );
+            })
+        });
+    }
+
+    #[test]
+    fn a_running_thread_is_never_recovered_underneath_its_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, project, agent, _) = test.update(|cx| workspace(cx, &paths));
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                assert!(state.prepare_prompt(agent, "busy", cx));
+                let conversation = state.conversation(project, agent);
+                conversation.lock().unwrap().set_session_id("thread-1");
+                conversation
+                    .lock()
+                    .unwrap()
+                    .apply(fx_agent::ProviderEvent::Lifecycle(
+                        fx_agent::provider::Lifecycle::TurnStarted,
+                    ));
+                assert_eq!(state.retry_prompt(agent), None);
+                assert_eq!(state.resume_session(agent), None);
+                assert_eq!(state.restart_session(agent), None);
+                assert_eq!(conversation.lock().unwrap().session_id(), Some("thread-1"));
+            })
+        });
+    }
+
+    #[test]
+    fn deleting_a_thread_forgets_its_transcript_memory() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, project, _, second) = test.update(|cx| workspace(cx, &paths));
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                let conversation = state.conversation(project, second);
+                let id = conversation.lock().unwrap().id;
+                crate::transcript::snapshot(&conversation.lock().unwrap());
+                assert!(crate::transcript::remembers(id));
+                assert!(state.delete_thread(second));
+                assert!(
+                    !crate::transcript::remembers(id),
+                    "a deleted thread's view memory outlived it"
                 );
             })
         });
@@ -3757,6 +5635,174 @@ mod persistence_tests {
             std::fs::read_to_string(fx_store::write::backup_path(&path)).unwrap(),
             "broken backup"
         );
+    }
+
+    #[test]
+    fn a_save_is_queued_off_the_ui_thread_and_a_newer_one_replaces_it() {
+        // Each checkpoint used to clone, encode and write the transcript on the
+        // UI thread, once a second while a turn streamed, and kept every saved
+        // transcript's encoded bytes alive to compare the next one against.
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, project, agent, _) = test.update(|cx| workspace(cx, &paths));
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                let file = paths.conversation_file(project, agent);
+                let conversation = state.conversation(project, agent);
+                conversation
+                    .lock()
+                    .unwrap()
+                    .append(ConversationMessage::text(MessageRole::User, "first"));
+                state.writer.hold(true);
+                state.save_conversations();
+                assert_eq!(state.writer.waiting(), 1);
+                assert_eq!(state.writer.stats().encodes.load(Relaxed), 0);
+                assert!(!file.exists(), "the save ran on the UI thread");
+
+                // A newer snapshot replaces the waiting one; the older can never
+                // land after it.
+                conversation
+                    .lock()
+                    .unwrap()
+                    .append(ConversationMessage::text(MessageRole::Assistant, "second"));
+                state
+                    .draft(agent, cx)
+                    .update(cx, |field, cx| field.set_value("newest draft", cx));
+                state.capture_drafts(cx);
+                state.save_conversations();
+                assert_eq!(state.writer.waiting(), 1);
+                state.writer.hold(false);
+                state.flush_saves();
+                assert_eq!(state.writer.stats().writes.load(Relaxed), 1);
+                let saved = state
+                    .store
+                    .load_conversation(project, agent)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(saved.messages.len(), 2);
+                assert_eq!(saved.draft_text, "newest draft");
+
+                // Unchanged: nothing is queued. A revision that changes nothing
+                // persisted costs one encode on the writer, and no write.
+                state.save_conversations();
+                assert_eq!(state.writer.waiting(), 0);
+                conversation
+                    .lock()
+                    .unwrap()
+                    .set_phase(fx_agent::conversation::Phase::Running);
+                state.save_conversations();
+                state.flush_saves();
+                assert_eq!(state.writer.stats().encodes.load(Relaxed), 2);
+                assert_eq!(state.writer.stats().writes.load(Relaxed), 1);
+                assert!(fx_store::write::has_backup(&file));
+            })
+        });
+    }
+
+    #[test]
+    fn opening_a_saved_thread_does_not_write_it_back() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, project, agent, _) = test.update(|cx| workspace(cx, &paths));
+        let mut saved = PersistedConversation::from_messages(
+            agent,
+            vec![ConversationMessage::text(MessageRole::User, "on disk")],
+        );
+        saved.draft_text = "saved draft".into();
+        Store::new(paths.clone())
+            .save_conversation(project, agent, &saved)
+            .unwrap();
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                state.conversation(project, agent);
+                assert_eq!(state.draft(agent, cx).read(cx).value(), "saved draft");
+                state.save_all(cx);
+                assert_eq!(state.writer.stats().encodes.load(Relaxed), 0);
+            })
+        });
+    }
+
+    #[test]
+    fn an_oversized_thread_reads_its_previous_cache_once_and_keeps_its_draft() {
+        // Every save of a thread over the cache limit used to re-read and
+        // re-parse its previous file, on the UI thread, once a second.
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, project, agent, _) = test.update(|cx| workspace(cx, &paths));
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                let conversation = state.conversation(project, agent);
+                conversation
+                    .lock()
+                    .unwrap()
+                    .append(ConversationMessage::text(MessageRole::User, "Old cache"));
+                state.save_all(cx);
+                state.writer.set_limit(2048);
+                let field = state.draft(agent, cx);
+                for round in 0..3 {
+                    conversation
+                        .lock()
+                        .unwrap()
+                        .append(ConversationMessage::text(
+                            MessageRole::Assistant,
+                            "large".repeat(1000),
+                        ));
+                    let draft = format!("Keep my typing {round}");
+                    field.update(cx, |field, cx| field.set_value(draft.clone(), cx));
+                    state.last_error = None;
+                    state.save_all(cx);
+                    assert!(
+                        state
+                            .last_error
+                            .as_deref()
+                            .is_some_and(|error| error.contains("cache limit"))
+                    );
+                    let saved = state
+                        .store
+                        .load_conversation(project, agent)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(saved.messages.len(), 1);
+                    assert_eq!(saved.messages[0].text_content(), "Old cache");
+                    assert_eq!(saved.draft_text, draft);
+                }
+                assert_eq!(state.writer.stats().previous_reads.load(Relaxed), 1);
+            })
+        });
+    }
+
+    #[test]
+    fn deleting_a_thread_drops_its_waiting_save() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, project, first, _) = test.update(|cx| workspace(cx, &paths));
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                state
+                    .conversation(project, first)
+                    .lock()
+                    .unwrap()
+                    .append(ConversationMessage::text(MessageRole::User, "delete me"));
+                state.writer.hold(true);
+                state.save_conversations();
+                assert_eq!(state.writer.waiting(), 1);
+                assert!(state.delete_thread(first));
+                assert_eq!(state.writer.waiting(), 0);
+                state.writer.hold(false);
+                state.flush_saves();
+                assert!(!paths.conversation_file(project, first).exists());
+            })
+        });
     }
 
     #[test]
@@ -4468,6 +6514,7 @@ mod native_sync_tests {
             let agent = state.snapshot.active_agent_id.unwrap();
             let (codex_jobs, codex_results) = state.native_sync.test_worker("codex");
             let (claude_jobs, _claude_results) = state.native_sync.test_worker("claude");
+            // The thread has no history yet, so its loading state appears.
             assert!(state.poll_native_sync(cx));
             let initial = codex_jobs.try_recv().unwrap();
             assert!(matches!(initial.kind, RequestKind::History { agent: id, known_revision: None, .. } if id == agent), "saved native selection loads before startup index jobs");
@@ -4493,6 +6540,85 @@ mod native_sync_tests {
             assert_eq!(state.conversation(project, agent).lock().unwrap().revision(), revision);
         }));
     }
+    #[test]
+    fn a_sync_pass_that_finds_nothing_new_does_not_redraw_the_window() {
+        // Every completed pass used to report a change, so the whole window
+        // redrew every second or two and the sync row blinked.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_string_lossy().to_string();
+        let test = gpui::TestAppContext::single();
+        let (state, project) =
+            test.update(|cx| setup(cx, AppPaths::at(temp.path().join("store")), &root));
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                let known = entry(&root, "codex", "known", "Known thread");
+                index(state, project, "codex", vec![known.clone()], Vec::new());
+                // History already on screen, so a running pass shows nothing.
+                let agent = state.snapshot.active_agent_id.unwrap();
+                state
+                    .conversation(project, agent)
+                    .lock()
+                    .unwrap()
+                    .append(ConversationMessage::text(MessageRole::Assistant, "Earlier"));
+                let (codex_jobs, codex_results) = state.native_sync.test_worker("codex");
+                let (_claude_jobs, _claude_results) = state.native_sync.test_worker("claude");
+                assert!(
+                    !state.poll_native_sync(cx),
+                    "starting a pass redrew the window"
+                );
+                let history = codex_jobs.try_recv().unwrap();
+                codex_results
+                    .send(Completion {
+                        ticket: history,
+                        result: Ok(Payload::Unchanged),
+                    })
+                    .unwrap();
+                assert!(
+                    !state.poll_native_sync(cx),
+                    "unchanged history redrew the window"
+                );
+
+                let same = codex_jobs.try_recv().unwrap();
+                assert!(matches!(same.kind, RequestKind::Index { .. }));
+                let reply = |entries| {
+                    Ok(Payload::Index {
+                        index: NativeThreadIndex {
+                            threads: entries,
+                            warnings: Vec::new(),
+                        },
+                        sessions: Vec::new(),
+                        protected: Vec::new(),
+                    })
+                };
+                codex_results
+                    .send(Completion {
+                        ticket: same,
+                        result: reply(vec![known.clone()]),
+                    })
+                    .unwrap();
+                assert!(
+                    !state.poll_native_sync(cx),
+                    "an identical index redrew the window"
+                );
+
+                state.native_sync.index_due.insert(
+                    (project, "codex".into()),
+                    Instant::now() - Duration::from_secs(1),
+                );
+                state.poll_native_sync(cx);
+                let next = codex_jobs.try_recv().unwrap();
+                let added = entry(&root, "codex", "added", "A new thread");
+                codex_results
+                    .send(Completion {
+                        ticket: next,
+                        result: reply(vec![known, added]),
+                    })
+                    .unwrap();
+                assert!(state.poll_native_sync(cx), "a new thread went undrawn");
+            })
+        });
+    }
+
     #[test]
     fn an_earlier_identical_turn_cannot_clear_the_pending_local_history_guard() {
         let temp = tempfile::tempdir().unwrap();
@@ -4578,5 +6704,358 @@ mod native_sync_tests {
             ),
             "one native prose occurrence cannot satisfy two local segments"
         );
+    }
+}
+
+#[cfg(test)]
+mod project_lifecycle_tests {
+    use super::*;
+    use fx_store::PersistedProject;
+
+    fn project_at(root: &std::path::Path, agents: &[Agent]) -> PersistedProject {
+        let mut project = Project::new(root.to_string_lossy());
+        project.agent_order = agents.iter().map(|agent| agent.id).collect();
+        PersistedProject {
+            project: Some(project),
+            agents: agents.to_vec(),
+            is_expanded: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn adding_an_open_folder_again_focuses_it_instead_of_duplicating_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let link = temp.path().join("first-link");
+        std::os::unix::fs::symlink(&first, &link).unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        // Saved before roots were resolved: the stored spelling is the link.
+        Store::new(paths.clone())
+            .save_app(&PersistedApp {
+                projects: vec![project_at(&link, &[])],
+                ..Default::default()
+            })
+            .unwrap();
+        let test = gpui::TestAppContext::single();
+        test.update(|cx| {
+            let state = cx.new(|cx| AppState::restore(paths.clone(), cx));
+            state.update(cx, |state, _| {
+                let existing = state.snapshot.projects[0].project.as_ref().unwrap().id;
+                let resolved = first.canonicalize().unwrap();
+                let other = state.add_project(&second.canonicalize().unwrap().to_string_lossy());
+                assert_ne!(other, existing);
+                state.toggle_project_expansion(existing);
+                assert!(state.open_project_roots().contains(&resolved));
+
+                for spelling in [
+                    resolved.to_string_lossy().into_owned(),
+                    format!("{}/", resolved.display()),
+                    link.to_string_lossy().into_owned(),
+                ] {
+                    assert_eq!(state.add_project(&spelling), existing, "{spelling}");
+                    assert_eq!(state.snapshot.projects.len(), 2, "{spelling}");
+                    assert_eq!(state.snapshot.active_project_id, Some(existing));
+                    assert!(state.is_expanded(existing));
+                    state.select_project(other);
+                }
+            });
+        });
+        assert_eq!(Store::new(paths).load_app().unwrap().projects.len(), 2);
+    }
+
+    #[test]
+    fn removing_a_project_releases_its_threads_and_keeps_their_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let removed_root = temp.path().join("removed");
+        let kept_root = temp.path().join("kept");
+        std::fs::create_dir_all(&removed_root).unwrap();
+        std::fs::create_dir_all(&kept_root).unwrap();
+        let (first, second, kept) = (
+            Agent::new("First"),
+            Agent::new("Second"),
+            Agent::new("Kept"),
+        );
+        let removed = project_at(&removed_root, &[first.clone(), second.clone()]);
+        let removed_id = removed.project.as_ref().unwrap().id;
+        let survivor = project_at(&kept_root, std::slice::from_ref(&kept));
+        let kept_id = survivor.project.as_ref().unwrap().id;
+        let paths = AppPaths::at(temp.path().join("state"));
+        Store::new(paths.clone())
+            .save_app(&PersistedApp {
+                active_project_id: Some(removed_id),
+                active_agent_id: Some(first.id),
+                projects: vec![removed, survivor],
+                ..Default::default()
+            })
+            .unwrap();
+        let test = gpui::TestAppContext::single();
+        test.update(|cx| {
+            let state = cx.new(|cx| AppState::restore(paths.clone(), cx));
+            state.update(cx, |state, cx| {
+                for (project, agent) in [
+                    (removed_id, first.id),
+                    (removed_id, second.id),
+                    (kept_id, kept.id),
+                ] {
+                    state.conversation(project, agent);
+                    let draft = state.draft(agent, cx);
+                    draft.update(cx, |field, cx| field.set_value("Unsent work", cx));
+                }
+                state
+                    .conversation(removed_id, first.id)
+                    .lock()
+                    .unwrap()
+                    .append(fx_core::ConversationMessage::text(
+                        fx_core::MessageRole::User,
+                        "Saved prompt",
+                    ));
+                // A naming request still in flight, and leftovers of a turn.
+                state.title_jobs.insert(
+                    first.id,
+                    crate::auto_title::TitleJob {
+                        generation: Uuid::new_v4(),
+                        provider: "codex".into(),
+                        model: "model".into(),
+                    },
+                );
+                state
+                    .pending_interactions
+                    .insert(second.id, VecDeque::new());
+                state.retry_drafts.insert(second.id, "Retry".into());
+                state.restored_costs.insert(second.id, 1.0);
+                state.protected_conversations.insert(second.id);
+                state
+                    .native_sync
+                    .history_warnings
+                    .insert(first.id, "warning".into());
+                state
+                    .native_sync
+                    .completed_turns
+                    .insert(first.id, Instant::now());
+                state.save_all(cx);
+                assert!(state.saved_conversations.contains_key(&first.id));
+
+                // A turn still waiting on the reader keeps its project.
+                state
+                    .conversation(kept_id, kept.id)
+                    .lock()
+                    .unwrap()
+                    .set_phase(fx_agent::conversation::Phase::WaitingForInput);
+                state.remove_project(kept_id);
+                assert!(state.project(kept_id).is_some());
+                assert!(state.last_error.is_some());
+                state
+                    .conversation(kept_id, kept.id)
+                    .lock()
+                    .unwrap()
+                    .set_phase(fx_agent::conversation::Phase::Idle);
+
+                state.remove_project(removed_id);
+                assert!(state.project(removed_id).is_none());
+                assert_eq!(state.snapshot.active_project_id, Some(kept_id));
+                for agent in [first.id, second.id] {
+                    assert!(!state.conversations.contains_key(&agent));
+                    assert!(!state.drafts.contains_key(&agent));
+                    assert!(!state.saved_conversations.contains_key(&agent));
+                    assert!(!state.title_jobs.contains_key(&agent));
+                    assert!(!state.pending_interactions.contains_key(&agent));
+                    assert!(!state.restored_drafts.contains_key(&agent));
+                    assert!(!state.retry_drafts.contains_key(&agent));
+                    assert!(!state.restored_costs.contains_key(&agent));
+                    assert!(!state.protected_conversations.contains(&agent));
+                    assert!(!state.native_sync.history_warnings.contains_key(&agent));
+                    assert!(!state.native_sync.completed_turns.contains_key(&agent));
+                }
+                // The surviving project's thread is untouched.
+                assert!(state.conversations.contains_key(&kept.id));
+                assert!(state.drafts.contains_key(&kept.id));
+                assert!(state.saved_conversations.contains_key(&kept.id));
+            });
+        });
+        // Removal is from the sidebar only: the transcript and its draft stay.
+        let saved = Store::new(paths)
+            .load_conversation(removed_id, first.id)
+            .unwrap()
+            .expect("the removed project's transcript is kept");
+        assert_eq!(saved.draft_text, "Unsent work");
+        assert_eq!(saved.messages.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod reset_tests {
+    use super::*;
+    use fx_core::{ConversationMessage, MessageContent, MessageRole};
+
+    /// One project with two threads, the first selected, built through the
+    /// real restore path.
+    fn workspace(cx: &mut App, paths: &AppPaths) -> (Entity<AppState>, Uuid, Uuid, Uuid) {
+        let mut project = Project::new(paths.root().parent().unwrap().to_string_lossy());
+        let mut first = Agent::new("First");
+        first.configuration.provider_id = Some("codex".into());
+        first.configuration.model_id = Some("gpt-test".into());
+        first.configuration.effort = Some("high".into());
+        let second = Agent::new("Second");
+        project.agent_order = vec![first.id, second.id];
+        let project_id = project.id;
+        let snapshot = PersistedApp {
+            active_project_id: Some(project.id),
+            active_agent_id: Some(first.id),
+            projects: vec![fx_store::PersistedProject {
+                project: Some(project),
+                agents: vec![first.clone(), second.clone()],
+                is_expanded: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        Store::new(paths.clone()).save_app(&snapshot).unwrap();
+        (
+            cx.new(|cx| AppState::restore(paths.clone(), cx)),
+            project_id,
+            first.id,
+            second.id,
+        )
+    }
+
+    fn say(state: &mut AppState, project: Uuid, agent: Uuid, text: &str) {
+        let conversation = state.conversation(project, agent);
+        let mut conversation = conversation.lock().unwrap();
+        conversation.append(ConversationMessage::new(
+            MessageRole::User,
+            vec![MessageContent::Text { text: text.into() }],
+        ));
+    }
+
+    #[test]
+    fn resetting_a_flowx_only_thread_empties_it_in_place_and_deletes_its_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(dir.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, project, first, _) = test.update(|cx| workspace(cx, &paths));
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                say(state, project, first, "hello");
+                state
+                    .conversation(project, first)
+                    .lock()
+                    .unwrap()
+                    .set_session_id("local-session");
+                let draft = state.draft(first, cx);
+                draft.update(cx, |field, cx| field.set_value("unsent", cx));
+                state.save_all(cx);
+            })
+        });
+        let store = Store::new(paths.clone());
+        assert!(store.load_conversation(project, first).unwrap().is_some());
+
+        let selected =
+            test.update(|cx| state.update(cx, |state, cx| state.reset_conversation(first, cx)));
+        assert_eq!(selected, Some(first), "the same thread, emptied");
+        test.read(|cx| {
+            let state = state.read(cx);
+            let conversation = state.conversation_by_agent(first).unwrap();
+            let conversation = conversation.lock().unwrap();
+            assert_eq!(conversation.message_count(), 0);
+            assert_eq!(conversation.session_id(), None, "a new session next turn");
+            assert_eq!(state.drafts[&first].read(cx).value(), "");
+            assert_eq!(state.active_agents().len(), 2, "no thread was added");
+        });
+        assert!(
+            store.load_conversation(project, first).unwrap().is_none(),
+            "an empty transcript is deleted, not written as a stub"
+        );
+    }
+
+    #[test]
+    fn resetting_a_provider_thread_starts_a_fresh_one_with_its_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(dir.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, project, first, _) = test.update(|cx| workspace(cx, &paths));
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                say(state, project, first, "kept by the provider");
+                state
+                    .conversation(project, first)
+                    .lock()
+                    .unwrap()
+                    .set_session_id("provider-session");
+                state.bind_local_session(first);
+            })
+        });
+
+        let fresh = test
+            .update(|cx| state.update(cx, |state, cx| state.reset_conversation(first, cx)))
+            .unwrap();
+        assert_ne!(fresh, first);
+        test.read(|cx| {
+            let state = state.read(cx);
+            assert_eq!(state.snapshot.active_agent_id, Some(fresh));
+            let copied = &state.thread(fresh).unwrap().configuration;
+            assert_eq!(copied.provider_id.as_deref(), Some("codex"));
+            assert_eq!(copied.model_id.as_deref(), Some("gpt-test"));
+            assert_eq!(copied.effort.as_deref(), Some("high"));
+            // The provider's thread is left exactly as it was.
+            let original = state.conversation_by_agent(first).unwrap();
+            assert_eq!(original.lock().unwrap().message_count(), 1);
+            assert_eq!(state.active_agents().len(), 3);
+        });
+        let saved = Store::new(paths).load_app().unwrap();
+        assert_eq!(
+            saved.active_agent_id,
+            Some(fresh),
+            "and it survives a restart"
+        );
+    }
+
+    #[test]
+    fn resetting_an_unreadable_thread_keeps_its_files_and_starts_a_fresh_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(dir.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, project, first, _) = test.update(|cx| workspace(cx, &paths));
+        let file = paths.conversation_file(project, first);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"{ not a transcript").unwrap();
+        let fresh = test.update(|cx| {
+            state.update(cx, |state, cx| {
+                state.conversation(project, first);
+                state.reset_conversation(first, cx)
+            })
+        });
+        assert_ne!(fresh, Some(first));
+        assert!(fresh.is_some());
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            b"{ not a transcript",
+            "kept for recovery, not emptied"
+        );
+    }
+
+    #[test]
+    fn a_running_thread_refuses_to_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(dir.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, project, first, _) = test.update(|cx| workspace(cx, &paths));
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                say(state, project, first, "busy");
+                state
+                    .conversation(project, first)
+                    .lock()
+                    .unwrap()
+                    .set_phase(fx_agent::conversation::Phase::Running);
+                assert_eq!(state.reset_conversation(first, cx), None);
+                assert!(state.last_error.is_some());
+                let conversation = state.conversation_by_agent(first).unwrap();
+                assert_eq!(conversation.lock().unwrap().message_count(), 1);
+            })
+        });
     }
 }

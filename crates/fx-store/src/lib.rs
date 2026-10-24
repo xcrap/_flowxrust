@@ -8,6 +8,7 @@
 pub mod format;
 pub mod paths;
 mod store;
+pub mod window;
 pub mod write;
 
 pub use format::{
@@ -16,5 +17,6 @@ pub use format::{
     ProviderDefaults, RightPanelTab, SplitContent,
 };
 pub use paths::{AppPaths, PathsError};
-pub use store::{LoadError, SaveError, Store};
+pub use store::{EncodedConversation, LoadError, SaveError, Store};
+pub use window::PersistedWindowFrame;
 pub use write::{ReadError, WriteError, read_json, write_json_atomically};

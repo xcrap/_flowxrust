@@ -25,6 +25,20 @@
 //! are deliberately *not* claimed: they fall through to `NSInputContext`, so dead
 //! keys and IME composition keep working the way the platform intends. Return is
 //! claimed even in a multi-line field, for the same reason.
+//!
+//! The modifiers follow AppKit rather than inventing their own: Option reaches a
+//! word and Cmd reaches the edge of the line, for movement and deletion alike.
+//!
+//! # Undo
+//!
+//! User edits are recorded in groups the way an `NSTextView` groups them: a run
+//! of typing is one step, a run of deleting is another, and moving the caret
+//! ends the run. Cut and paste are always a step of their own. A composition is
+//! never split: everything the IME does between its first marked text and its
+//! commit joins the group it began in, so undo cannot land on half a character.
+//! Assigning a value with [`TextField::set_value`] is not an edit and starts the
+//! history afresh — undoing past a sent prompt into the previous draft would
+//! resurrect text that has already gone.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -44,6 +58,24 @@ use gpui::{
     Pixels, Point, Render, ShapedLine, SharedString, Task, TextAlign, TextRun, Timer,
     UTF16Selection, Window, WrappedLine, div, fill, point, px, size,
 };
+
+gpui::actions!(
+    text_field,
+    [
+        /// Undo the focused field's last group of edits.
+        Undo,
+        /// Redo what the last undo took back.
+        Redo,
+        /// Cut the selection to the clipboard.
+        Cut,
+        /// Copy the selection to the clipboard.
+        Copy,
+        /// Paste the clipboard over the selection.
+        Paste,
+        /// Select the whole value.
+        SelectAll
+    ]
+);
 
 // ── Metrics ────────────────────────────────────────────────────────────────
 //
@@ -146,6 +178,7 @@ pub struct TextField {
     blink: Option<Task<()>>,
     blinking: bool,
     geometry: Rc<RefCell<FieldGeometry>>,
+    history: UndoHistory,
 }
 
 impl TextField {
@@ -169,6 +202,7 @@ impl TextField {
             blink: None,
             blinking: false,
             geometry: Rc::default(),
+            history: UndoHistory::default(),
         }
     }
 
@@ -228,10 +262,13 @@ impl TextField {
     /// Goes through the same path as typing, so `max_len` and the single-line
     /// newline rule hold here too — restoring a draft cannot smuggle in a
     /// newline or exceed the cap.
+    ///
+    /// Not an edit, so it is not undoable: the history starts again from here.
     pub fn set_value(&mut self, value: impl Into<String>, cx: &mut Context<Self>) {
         let caret = self.value.len();
         self.edit(0..caret, &value.into());
         self.selection = Selection::collapsed(self.selection.head);
+        self.history = UndoHistory::default();
         cx.notify();
     }
 
@@ -313,6 +350,92 @@ impl TextField {
         self.dragging = false;
     }
 
+    /// An edit the user made, recorded for undo.
+    ///
+    /// Everything a person does to the value comes through here; [`Self::edit`]
+    /// stays the primitive so that assigning a value is not mistaken for one.
+    /// An edit that changes nothing records nothing, so Backspace at the start
+    /// of the field does not leave an empty step to undo.
+    fn user_edit(&mut self, kind: EditKind, range: Range<usize>, insert: &str) {
+        if !self.enabled {
+            return;
+        }
+        // Read before `edit` clears it: a composition already under way belongs
+        // to the group its first marked text opened.
+        let composing = self.marked.is_some();
+        let before = self.snapshot();
+        self.edit(range, insert);
+        if self.value == before.value {
+            return;
+        }
+        if !composing {
+            self.history.will_edit(kind, before);
+        }
+        self.history.did_edit(kind, self.selection);
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            value: self.value.clone(),
+            selection: self.selection,
+        }
+    }
+
+    /// Put back a recorded state. It passed every rule when it was recorded,
+    /// so it is assigned directly rather than edited in.
+    fn restore(&mut self, snapshot: Snapshot) {
+        self.value = snapshot.value;
+        self.selection = Selection {
+            anchor: snap_back(&self.value, snapshot.selection.anchor),
+            head: snap_back(&self.value, snapshot.selection.head),
+        };
+        self.marked = None;
+        self.caret_on = true;
+        self.dragging = false;
+    }
+
+    /// Take back the last group of edits. Returns whether there was one.
+    ///
+    /// Refused while the IME is composing: the composition is not finished,
+    /// so neither is the group it belongs to, and pulling the text out from
+    /// under the input method would leave it editing a range that has gone.
+    pub fn undo(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.enabled || self.marked.is_some() {
+            return false;
+        }
+        let current = self.snapshot();
+        let Some(previous) = self.history.undo(current) else {
+            return false;
+        };
+        self.restore(previous);
+        cx.notify();
+        true
+    }
+
+    /// Reapply what the last undo took back. Returns whether there was any.
+    pub fn redo(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.enabled || self.marked.is_some() {
+            return false;
+        }
+        let current = self.snapshot();
+        let Some(next) = self.history.redo(current) else {
+            return false;
+        };
+        self.restore(next);
+        cx.notify();
+        true
+    }
+
+    /// Whether there is anything to undo, for a caller that greys out a control.
+    pub fn can_undo(&self) -> bool {
+        self.history.can_undo()
+    }
+
+    /// Whether there is anything to redo.
+    pub fn can_redo(&self) -> bool {
+        self.history.can_redo()
+    }
+
     /// Where text from the platform lands: the range it names, else the
     /// composition it replaces, else the selection. A dead key or an IME sends
     /// its final text with no range, meaning "over what is being composed".
@@ -327,7 +450,7 @@ impl TextField {
     /// Insert final text from the platform, ending any composition.
     fn commit_text(&mut self, range_utf16: Option<Range<usize>>, text: &str) {
         let range = self.input_range(range_utf16);
-        self.edit(range, text);
+        self.user_edit(EditKind::Typing, range, text);
     }
 
     /// Replace the composition with the IME's in-progress text and keep it
@@ -343,7 +466,7 @@ impl TextField {
             return;
         }
         let range = self.input_range(range_utf16);
-        self.edit(range.clone(), text);
+        self.user_edit(EditKind::Typing, range.clone(), text);
         // `edit` may have stripped or truncated the text; the caret is where
         // what actually went in ends.
         let marked = range.start..self.selection.head;
@@ -377,20 +500,22 @@ impl TextField {
     /// Separate from the GPUI callback so the whole table can be exercised
     /// without a window. Everything here works on the value alone — including
     /// vertical movement, which steps by the value's logical lines rather than
-    /// its visual rows — so none of it needs a shaped layout.
+    /// its visual rows — so none of it needs a shaped layout. For the same
+    /// reason a line edge is a logical line's edge: Cmd-Right in a wrapped
+    /// paragraph goes to the end of the paragraph, not of the visual row.
     fn handle_edit_key(
         &mut self,
         key: &str,
         extend: bool,
-        by_word: bool,
+        reach: Reach,
         cx: &mut Context<Self>,
     ) -> bool {
         let range = self.selection.range();
         let caret = self.selection.head;
         match key {
             "enter" => {
-                if self.multiline.is_some() && !by_word {
-                    self.edit(range, "\n");
+                if self.multiline.is_some() && reach != Reach::Line {
+                    self.user_edit(EditKind::Typing, range, "\n");
                 } else if let Some(submit) = self.on_submit.as_ref() {
                     submit(self.value.clone(), cx);
                 }
@@ -398,62 +523,99 @@ impl TextField {
             }
             "backspace" => {
                 let range = if range.is_empty() {
-                    let from = if by_word {
-                        prev_word_boundary(&self.value, caret)
-                    } else {
-                        prev_boundary(&self.value, caret)
+                    let from = match reach {
+                        Reach::Character => prev_boundary(&self.value, caret),
+                        Reach::Word => prev_word_boundary(&self.value, caret),
+                        // Already at the start of the line, Cmd-Backspace joins
+                        // it to the one above, as AppKit's does.
+                        Reach::Line => match move_to_line_edge(&self.value, caret, false) {
+                            start if start == caret => prev_boundary(&self.value, caret),
+                            start => start,
+                        },
                     };
                     from..caret
                 } else {
                     range
                 };
-                self.edit(range, "");
+                self.user_edit(EditKind::DeleteBackward, range, "");
                 true
             }
             "delete" => {
                 let range = if range.is_empty() {
-                    let to = if by_word {
-                        next_word_boundary(&self.value, caret)
-                    } else {
-                        next_boundary(&self.value, caret)
+                    let to = match reach {
+                        Reach::Character => next_boundary(&self.value, caret),
+                        Reach::Word => next_word_boundary(&self.value, caret),
+                        Reach::Line => match move_to_line_edge(&self.value, caret, true) {
+                            end if end == caret => next_boundary(&self.value, caret),
+                            end => end,
+                        },
                     };
                     caret..to
                 } else {
                     range
                 };
-                self.edit(range, "");
+                self.user_edit(EditKind::DeleteForward, range, "");
                 true
             }
             "left" | "right" => {
                 let forward = key == "right";
-                self.selection =
-                    move_horizontal(&self.value, self.selection, forward, extend, by_word);
-                self.caret_on = true;
+                self.selection = match reach {
+                    Reach::Line => move_to_edge(self.selection, extend, forward, |at| {
+                        move_to_line_edge(&self.value, at, forward)
+                    }),
+                    reach => move_horizontal(
+                        &self.value,
+                        self.selection,
+                        forward,
+                        extend,
+                        reach == Reach::Word,
+                    ),
+                };
+                self.moved_caret();
                 true
             }
             "up" | "down" => {
                 let forward = key == "down";
-                let moved = move_vertical(&self.value, self.selection, forward, extend);
+                let moved = match reach {
+                    // Cmd-Up and Cmd-Down go to either end of the whole value.
+                    Reach::Line => {
+                        let end = if forward { self.value.len() } else { 0 };
+                        move_to_edge(self.selection, extend, forward, |_| end)
+                    }
+                    _ => move_vertical(&self.value, self.selection, forward, extend),
+                };
                 if moved == self.selection {
                     // Nothing to move: let the key reach whatever scrolls behind
                     // the field instead of swallowing it.
                     return false;
                 }
                 self.selection = moved;
-                self.caret_on = true;
+                self.moved_caret();
                 true
             }
             "home" | "end" => {
                 let edge = move_to_line_edge(&self.value, self.selection.head, key == "end");
                 self.selection = self.selection.with_head(edge, extend);
-                self.caret_on = true;
+                self.moved_caret();
                 true
             }
             _ => false,
         }
     }
 
+    /// The caret moved without an edit, which ends the run of typing that an
+    /// undo would otherwise take back together with whatever is typed next.
+    fn moved_caret(&mut self) {
+        self.caret_on = true;
+        self.history.break_group();
+    }
+
     /// Select-all, copy, cut, and the paste fallback.
+    ///
+    /// Each of these is also an action (see the `actions!` at the top), which is
+    /// how the Edit menu reaches the focused field. When the app binds the keys,
+    /// the binding fires first and this never sees them; it remains so that a
+    /// field still works in a window that binds nothing.
     ///
     /// Paste lives here *and* in the platform handler. macOS routes Cmd-V through
     /// `NSInputContext` first, so when the system handles it this never runs;
@@ -462,42 +624,91 @@ impl TextField {
         if !by_word {
             return false;
         }
-        let range = self.selection.range();
         match key.to_ascii_lowercase().as_str() {
-            "a" => {
-                self.selection = Selection::select_all(self.value.len());
-                self.caret_on = true;
-                true
-            }
-            "c" => {
-                if self.secret {
-                    return true;
-                }
-                let text = self.selected_text();
-                if !text.is_empty() {
-                    cx.write_to_clipboard(ClipboardItem::new_string(text));
-                }
-                true
-            }
-            "x" => {
-                if self.secret {
-                    return true;
-                }
-                let text = self.selected_text();
-                if !text.is_empty() {
-                    cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
-                    self.edit(range, "");
-                }
-                true
-            }
-            "v" => {
-                if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                    self.edit(range, &text);
-                }
-                true
-            }
-            _ => false,
+            "a" => self.select_all(),
+            "c" => self.copy(cx),
+            "x" => self.cut(cx),
+            "v" => self.paste(cx),
+            _ => return false,
         }
+        true
+    }
+
+    /// Cmd-Z and Shift-Cmd-Z, the unbound fallback for [`Undo`] and [`Redo`].
+    ///
+    /// Claimed whether or not there is anything to undo, so the key never falls
+    /// through to a shortcut behind the field.
+    fn handle_history_key(
+        &mut self,
+        key: &str,
+        command: bool,
+        shift: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !command || !key.eq_ignore_ascii_case("z") {
+            return false;
+        }
+        if shift {
+            self.redo(cx);
+        } else {
+            self.undo(cx);
+        }
+        true
+    }
+
+    fn select_all(&mut self) {
+        self.selection = Selection::select_all(self.value.len());
+        self.moved_caret();
+    }
+
+    fn copy(&mut self, cx: &mut Context<Self>) {
+        if self.secret {
+            return;
+        }
+        let text = self.selected_text();
+        if !text.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    fn cut(&mut self, cx: &mut Context<Self>) {
+        if self.secret {
+            return;
+        }
+        let text = self.selected_text();
+        if !text.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            self.user_edit(EditKind::Clipboard, self.selection.range(), "");
+        }
+    }
+
+    fn paste(&mut self, cx: &mut Context<Self>) {
+        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            self.user_edit(EditKind::Clipboard, self.selection.range(), &text);
+        }
+    }
+
+    /// One of the Edit menu's commands, as the focused field receives it.
+    ///
+    /// Claimed even when it does nothing: an action that bubbled past the field
+    /// would reach the window, which has no better idea of what to undo.
+    fn edit_command(&mut self, command: EditCommand, cx: &mut Context<Self>) {
+        if !self.enabled {
+            return;
+        }
+        match command {
+            EditCommand::Undo => {
+                self.undo(cx);
+            }
+            EditCommand::Redo => {
+                self.redo(cx);
+            }
+            EditCommand::Cut => self.cut(cx),
+            EditCommand::Copy => self.copy(cx),
+            EditCommand::Paste => self.paste(cx),
+            EditCommand::SelectAll => self.select_all(),
+        }
+        cx.notify();
     }
 
     // ── Caret placement ────────────────────────────────────────────────────
@@ -641,7 +852,7 @@ impl TextField {
             clicked
         };
         self.dragging = true;
-        self.caret_on = true;
+        self.moved_caret();
         cx.notify();
     }
 
@@ -653,9 +864,15 @@ impl TextField {
         let modifiers: Modifiers = keystroke.modifiers;
         // `secondary` is Cmd on macOS and Ctrl elsewhere, so one spelling of
         // "the shortcut modifier" is right on every platform.
-        let by_word = modifiers.secondary();
-        let handled = self.handle_clipboard_key(&keystroke.key, by_word, cx)
-            || self.handle_edit_key(&keystroke.key, modifiers.shift, by_word, cx);
+        let command = modifiers.secondary();
+        let handled = self.handle_clipboard_key(&keystroke.key, command, cx)
+            || self.handle_history_key(&keystroke.key, command, modifiers.shift, cx)
+            || self.handle_edit_key(
+                &keystroke.key,
+                modifiers.shift,
+                Reach::from_modifiers(modifiers),
+                cx,
+            );
         if handled {
             // Stopping propagation is also what stops AppKit inserting the same
             // character again on the way down.
@@ -775,7 +992,27 @@ impl Render for TextField {
                 MouseButton::Left,
                 cx.listener(|field, event, window, cx| field.mouse_down(event, window, cx)),
             )
-            .on_key_down(cx.listener(|field, event, _window, cx| field.key_down(event, cx)));
+            .on_key_down(cx.listener(|field, event, _window, cx| field.key_down(event, cx)))
+            // The Edit menu dispatches to whatever holds focus, so these are
+            // what make its items reach this field — and what enable them.
+            .on_action(
+                cx.listener(|field, _: &Undo, _, cx| field.edit_command(EditCommand::Undo, cx)),
+            )
+            .on_action(
+                cx.listener(|field, _: &Redo, _, cx| field.edit_command(EditCommand::Redo, cx)),
+            )
+            .on_action(
+                cx.listener(|field, _: &Cut, _, cx| field.edit_command(EditCommand::Cut, cx)),
+            )
+            .on_action(
+                cx.listener(|field, _: &Copy, _, cx| field.edit_command(EditCommand::Copy, cx)),
+            )
+            .on_action(
+                cx.listener(|field, _: &Paste, _, cx| field.edit_command(EditCommand::Paste, cx)),
+            )
+            .on_action(cx.listener(|field, _: &SelectAll, _, cx| {
+                field.edit_command(EditCommand::SelectAll, cx)
+            }));
 
         TextFieldElement {
             child: element.into_any_element(),
@@ -1583,6 +1820,132 @@ impl Selection {
     }
 }
 
+// ── Modifiers ──────────────────────────────────────────────────────────────
+
+/// How far one press of an editing key reaches, from the modifier held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    Character,
+    /// Option: a word, for movement and deletion alike.
+    Word,
+    /// Cmd: the edge of the line, or of the value for Up and Down.
+    Line,
+}
+
+impl Reach {
+    /// Cmd wins over Option, as it does in AppKit: Cmd-Option-Left is a line
+    /// move, not a word move.
+    fn from_modifiers(modifiers: Modifiers) -> Self {
+        if modifiers.secondary() {
+            Self::Line
+        } else if modifiers.alt {
+            Self::Word
+        } else {
+            Self::Character
+        }
+    }
+}
+
+/// The Edit menu's commands, one per action, so the handlers share one body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditCommand {
+    Undo,
+    Redo,
+    Cut,
+    Copy,
+    Paste,
+    SelectAll,
+}
+
+// ── Undo ───────────────────────────────────────────────────────────────────
+
+/// What an edit was, for deciding whether the next one joins its group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditKind {
+    /// Text from the keyboard or an input method, Return included.
+    Typing,
+    /// Backspace, at any reach.
+    DeleteBackward,
+    /// Forward delete, at any reach.
+    DeleteForward,
+    /// Cut or paste. Never joins anything: each is a step of its own.
+    Clipboard,
+}
+
+/// The value and selection as they were before a group of edits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Snapshot {
+    value: String,
+    selection: Selection,
+}
+
+/// A field's undo and redo stacks, with AppKit's coalescing.
+///
+/// Pure state, so the grouping rules are tested without a window. The caller
+/// says when an edit is about to happen and where it left the caret; this
+/// decides whether that edit opens a new step.
+#[derive(Debug, Default)]
+struct UndoHistory {
+    undo: Vec<Snapshot>,
+    redo: Vec<Snapshot>,
+    /// The group a following edit may join: its kind, and the selection its
+    /// last edit left. An edit joins only when it is the same kind *and* starts
+    /// exactly there, so typing over a selection or after a click is new.
+    open: Option<(EditKind, Selection)>,
+}
+
+impl UndoHistory {
+    /// Steps kept per field. Each holds a whole value, and the composer's is
+    /// capped at 32,000 characters, so this bounds a field to a few megabytes.
+    const LIMIT: usize = 100;
+
+    /// Record the state before an edit, unless the edit continues the open
+    /// group. Any edit at all makes the redo stack unreachable.
+    fn will_edit(&mut self, kind: EditKind, before: Snapshot) {
+        let joins = kind != EditKind::Clipboard && self.open == Some((kind, before.selection));
+        if !joins {
+            self.undo.push(before);
+            if self.undo.len() > Self::LIMIT {
+                self.undo.remove(0);
+            }
+        }
+        self.redo.clear();
+    }
+
+    /// Note where an edit left the selection, which is where the next edit has
+    /// to start in order to join it.
+    fn did_edit(&mut self, kind: EditKind, after: Selection) {
+        self.open = Some((kind, after));
+    }
+
+    /// End the open group, so the next edit starts a step of its own.
+    fn break_group(&mut self) {
+        self.open = None;
+    }
+
+    fn undo(&mut self, current: Snapshot) -> Option<Snapshot> {
+        let previous = self.undo.pop()?;
+        self.redo.push(current);
+        self.open = None;
+        Some(previous)
+    }
+
+    fn redo(&mut self, current: Snapshot) -> Option<Snapshot> {
+        let next = self.redo.pop()?;
+        self.undo.push(current);
+        self.open = None;
+        Some(next)
+    }
+
+    fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+
+    fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+}
+
 // ── Pure text helpers ──────────────────────────────────────────────────────
 
 /// Clamp a range to the value and to character boundaries, so no edit can split
@@ -1659,7 +2022,7 @@ fn class_of(c: char) -> CharClass {
 }
 
 /// The word around `at`, for double-click selection.
-fn word_range(value: &str, at: usize) -> Range<usize> {
+pub(crate) fn word_range(value: &str, at: usize) -> Range<usize> {
     let at = snap_back(value, at);
     let Some(first) = value[at..].chars().next() else {
         return at..at;
@@ -1682,49 +2045,40 @@ fn word_range(value: &str, at: usize) -> Range<usize> {
     start..end
 }
 
-/// The offset a word-wise backspace deletes back to.
+/// Where Option-Left lands, and what Option-Backspace deletes back to: the
+/// start of the previous word.
 ///
-/// Whitespace goes first: Cmd-Backspace on "foo bar" removes the space and then
-/// "foo", never "foobar".
+/// Whitespace is crossed on the way rather than being a stop of its own, as in
+/// AppKit: from "foo bar |" the word is "bar", and from "foo |" it is "foo", so
+/// one press always removes a word and never just the space before it.
 fn prev_word_boundary(value: &str, at: usize) -> usize {
-    let head = &value[..snap_back(value, at)];
-    let trimmed = head.trim_end();
-    if trimmed.is_empty() {
+    let head = value[..snap_back(value, at)].trim_end();
+    let Some(last) = head.chars().next_back() else {
         return 0;
-    }
-    if trimmed.len() < head.len() {
-        return trimmed.len();
-    }
-    let class = class_of(trimmed.chars().next_back().unwrap_or(' '));
-    let last = trimmed.chars().next_back().map_or(0, char::len_utf8);
-    let word = &trimmed[..trimmed.len() - last];
-    // One past the last character of a different class, so leading whitespace is
-    // skipped along with the word rather than stopping the scan half way.
-    word.char_indices()
+    };
+    let class = class_of(last);
+    // One past the last character of a different class.
+    head.char_indices()
         .rev()
         .find(|(_, c)| class_of(*c) != class)
         .map_or(0, |(index, c)| index + c.len_utf8())
 }
 
-/// The offset a word-wise forward delete stops at.
+/// Where Option-Right lands, and what Option-Delete deletes up to: the end of
+/// the next word, crossing any whitespace before it.
 fn next_word_boundary(value: &str, at: usize) -> usize {
     let at = snap_back(value, at);
     let tail = &value[at..];
-    if tail.is_empty() {
+    let trimmed = tail.trim_start();
+    let start = at + (tail.len() - trimmed.len());
+    let Some(first) = trimmed.chars().next() else {
         return value.len();
-    }
-    let leading = tail.len() - tail.trim_start().len();
-    if leading > 0 {
-        return at + leading;
-    }
-    let first = tail.chars().next().map_or(0, char::len_utf8);
-    let rest = &tail[first..];
-    let class = class_of(tail.chars().next().unwrap_or(' '));
-    let end = rest
+    };
+    let class = class_of(first);
+    trimmed
         .char_indices()
         .find(|(_, c)| class_of(*c) != class)
-        .map_or(rest.len(), |(index, _)| index);
-    at + first + end
+        .map_or(value.len(), |(index, _)| start + index)
 }
 
 /// Move the caret one character or one word, optionally extending.
@@ -1839,6 +2193,33 @@ fn move_to_line_edge(value: &str, at: usize, to_end: bool) -> usize {
     } else {
         start
     }
+}
+
+/// A Cmd-arrow move to the edge `edge` finds from an offset.
+///
+/// Extending measures from the head and keeps the anchor. Otherwise a selection
+/// is left from the side it was heading towards, as an ordinary arrow does, so
+/// Cmd-Left on a selection goes to the start of the line its start is on.
+fn move_to_edge(
+    selection: Selection,
+    extend: bool,
+    forward: bool,
+    edge: impl Fn(usize) -> usize,
+) -> Selection {
+    if extend {
+        return Selection {
+            anchor: selection.anchor,
+            head: edge(selection.head),
+        };
+    }
+    let from = if selection.is_empty() {
+        selection.head
+    } else if forward {
+        selection.range().end
+    } else {
+        selection.range().start
+    };
+    Selection::collapsed(edge(from))
 }
 
 /// UTF-16 length, which is the unit every `InputHandler` range is in.
@@ -2427,31 +2808,325 @@ mod tests {
     // ── Word and line movement ─────────────────────────────────────────────
 
     #[test]
-    fn word_delete_removes_whitespace_before_the_word() {
-        // Cmd-Backspace on "foo bar" removes "bar", leaving "foo "; from just
-        // after the space it removes the space instead.
+    fn a_word_delete_crosses_the_whitespace_before_the_word() {
+        // Option-Backspace on "foo bar" removes "bar", leaving "foo "; from
+        // just after the space it removes "foo " — a word, never a lone space.
         assert_eq!(prev_word_boundary("foo bar", 7), 4);
-        assert_eq!(prev_word_boundary("foo bar", 4), 3);
+        assert_eq!(prev_word_boundary("foo bar", 4), 0);
         assert_eq!(prev_word_boundary("foo", 3), 0);
         assert_eq!(prev_word_boundary("  foo", 5), 2);
         // Punctuation ends a word, so "bar" goes and "foo." stays.
         assert_eq!(prev_word_boundary("foo.bar", 7), 4);
-        assert_eq!(prev_word_boundary("foo bar ", 8), 7);
+        assert_eq!(prev_word_boundary("foo bar ", 8), 4);
+        assert_eq!(
+            prev_word_boundary("one\ntwo", 4),
+            0,
+            "a newline is crossed too"
+        );
+        assert_eq!(prev_word_boundary("   ", 3), 0);
     }
 
     #[test]
     fn word_boundaries_work_on_multibyte_text() {
         // 'é' is two bytes, so the space after it is at byte 3.
-        assert_eq!(prev_word_boundary("aé b", 4), 3);
+        assert_eq!(prev_word_boundary("aé b", 5), 4);
+        assert_eq!(prev_word_boundary("aé b", 4), 0);
         assert_eq!(next_word_boundary("aé b", 0), 3);
+        assert_eq!(next_word_boundary("aé b", 3), 5);
     }
 
     #[test]
     fn a_forward_word_delete_skips_leading_whitespace_then_one_word() {
         assert_eq!(next_word_boundary("foo bar", 0), 3);
-        assert_eq!(next_word_boundary("foo bar", 3), 4);
+        assert_eq!(next_word_boundary("foo bar", 3), 7);
         assert_eq!(next_word_boundary("foo", 0), 3);
+        assert_eq!(next_word_boundary("foo   ", 3), 6);
         assert_eq!(next_word_boundary("", 0), 0);
+    }
+
+    /// Press `key` with `modifiers` in a field holding `value` with the caret at
+    /// `caret`, and return the value and selection that result.
+    fn press(
+        value: &str,
+        caret: usize,
+        key: &str,
+        modifiers: Modifiers,
+        multiline: bool,
+    ) -> (String, Selection) {
+        let test = gpui::TestAppContext::single();
+        test.update(|cx| {
+            let field = cx.new(|cx| {
+                let field = TextField::new(cx);
+                if multiline {
+                    field.multiline(4.0)
+                } else {
+                    field
+                }
+            });
+            field.update(cx, |field, cx| {
+                field.set_value(value, cx);
+                field.selection = Selection::collapsed(caret);
+                let reach = Reach::from_modifiers(modifiers);
+                field.handle_edit_key(key, modifiers.shift, reach, cx);
+                (field.value.clone(), field.selection)
+            })
+        })
+    }
+
+    #[test]
+    fn cmd_arrows_go_to_the_edges_of_the_line_and_option_arrows_by_word() {
+        let value = "one two\nthree four";
+        let cmd = Modifiers::command();
+        let option = Modifiers::alt();
+        // Caret in the middle of "three".
+        assert_eq!(press(value, 10, "left", cmd, true).1.head, 8);
+        assert_eq!(press(value, 10, "right", cmd, true).1.head, value.len());
+        assert_eq!(press(value, 2, "right", cmd, true).1.head, 7);
+        assert_eq!(press(value, 10, "left", option, true).1.head, 8);
+        assert_eq!(press(value, 10, "right", option, true).1.head, 13);
+        assert_eq!(press(value, 13, "right", option, true).1.head, value.len());
+        // A plain arrow still moves one character.
+        assert_eq!(press(value, 10, "left", Modifiers::none(), true).1.head, 9);
+        // Shift extends from where the caret was.
+        let extended = press(value, 10, "left", Modifiers::command_shift(), true).1;
+        assert_eq!(
+            extended,
+            Selection {
+                anchor: 10,
+                head: 8
+            }
+        );
+        // Cmd-Up and Cmd-Down reach either end of the whole value.
+        assert_eq!(press(value, 10, "up", cmd, true).1.head, 0);
+        assert_eq!(press(value, 2, "down", cmd, true).1.head, value.len());
+    }
+
+    #[test]
+    fn cmd_backspace_deletes_to_the_line_start_and_option_backspace_a_word() {
+        let value = "one two\nthree four";
+        let (after, selection) = press(value, 13, "backspace", Modifiers::command(), true);
+        assert_eq!(after, "one two\n four");
+        assert_eq!(selection, Selection::collapsed(8));
+        let (after, _) = press(value, value.len(), "backspace", Modifiers::alt(), true);
+        assert_eq!(after, "one two\nthree ");
+        let (after, _) = press(value, 14, "backspace", Modifiers::alt(), true);
+        assert_eq!(after, "one two\nfour", "the word and the space after it");
+        // At the very start of a line it joins the line to the one above.
+        let (after, _) = press(value, 8, "backspace", Modifiers::command(), true);
+        assert_eq!(after, "one twothree four");
+        // Forward: Option-Delete takes a word, Cmd-Delete the rest of the line.
+        let (after, _) = press(value, 8, "delete", Modifiers::alt(), true);
+        assert_eq!(after, "one two\n four");
+        let (after, _) = press(value, 3, "delete", Modifiers::command(), true);
+        assert_eq!(after, "one\nthree four");
+    }
+
+    #[test]
+    fn cmd_return_submits_a_multiline_field_and_option_return_breaks_the_line() {
+        assert_eq!(press("ab", 1, "enter", Modifiers::alt(), true).0, "a\nb");
+        assert_eq!(press("ab", 1, "enter", Modifiers::command(), true).0, "ab");
+    }
+
+    // ── Undo ───────────────────────────────────────────────────────────────
+
+    /// Type `text` one character at a time, the way the platform delivers it.
+    fn type_text(field: &mut TextField, text: &str) {
+        for c in text.chars() {
+            field.commit_text(None, c.encode_utf8(&mut [0; 4]));
+        }
+    }
+
+    #[test]
+    fn a_run_of_typing_undoes_as_one_step_and_redoes_as_one() {
+        let test = gpui::TestAppContext::single();
+        test.update(|cx| {
+            let field = cx.new(TextField::new);
+            field.update(cx, |field, cx| {
+                type_text(field, "hello world");
+                assert!(field.undo(cx));
+                assert_eq!(field.value(), "");
+                assert!(!field.undo(cx), "nothing older than the run");
+                assert!(field.redo(cx));
+                assert_eq!(field.value(), "hello world");
+                assert_eq!(field.selection, Selection::collapsed(11));
+                assert!(!field.redo(cx));
+            });
+        });
+    }
+
+    #[test]
+    fn moving_the_caret_or_switching_to_deleting_starts_a_new_step() {
+        let test = gpui::TestAppContext::single();
+        test.update(|cx| {
+            let field = cx.new(TextField::new);
+            field.update(cx, |field, cx| {
+                type_text(field, "abc");
+                field.handle_edit_key("left", false, Reach::Character, cx);
+                type_text(field, "X");
+                field.handle_edit_key("backspace", false, Reach::Character, cx);
+                field.handle_edit_key("backspace", false, Reach::Character, cx);
+                assert_eq!(field.value(), "ac");
+
+                assert!(field.undo(cx), "both backspaces are one step");
+                assert_eq!(field.value(), "abXc");
+                assert!(field.undo(cx), "the typing after the move is its own");
+                assert_eq!(field.value(), "abc");
+                assert_eq!(field.selection, Selection::collapsed(2));
+                assert!(field.undo(cx));
+                assert_eq!(field.value(), "");
+            });
+        });
+    }
+
+    #[test]
+    fn cut_paste_and_typing_over_a_selection_are_each_their_own_step() {
+        let test = gpui::TestAppContext::single();
+        test.update(|cx| {
+            let field = cx.new(TextField::new);
+            cx.write_to_clipboard(ClipboardItem::new_string("!".into()));
+            field.update(cx, |field, cx| {
+                type_text(field, "one");
+                field.edit_command(EditCommand::Paste, cx);
+                field.edit_command(EditCommand::Paste, cx);
+                field.edit_command(EditCommand::SelectAll, cx);
+                type_text(field, "two");
+                assert_eq!(field.value(), "two");
+
+                field.undo(cx);
+                assert_eq!(field.value(), "one!!");
+                assert_eq!(
+                    field.selection,
+                    Selection::select_all(5),
+                    "selection restored"
+                );
+                field.undo(cx);
+                assert_eq!(field.value(), "one!", "two pastes are two steps");
+                field.undo(cx);
+                assert_eq!(field.value(), "one");
+            });
+        });
+    }
+
+    #[test]
+    fn a_new_edit_after_undo_discards_the_redo_and_a_no_op_records_nothing() {
+        let test = gpui::TestAppContext::single();
+        test.update(|cx| {
+            let field = cx.new(TextField::new);
+            field.update(cx, |field, cx| {
+                // Backspace in an empty field changes nothing to undo.
+                field.handle_edit_key("backspace", false, Reach::Character, cx);
+                assert!(!field.can_undo());
+                type_text(field, "draft");
+                field.undo(cx);
+                assert!(field.can_redo());
+                type_text(field, "x");
+                assert!(!field.can_redo());
+                assert!(!field.redo(cx));
+                assert_eq!(field.value(), "x");
+            });
+        });
+    }
+
+    #[test]
+    fn assigning_a_value_is_not_undoable() {
+        // Clearing the composer after a send must not leave the sent prompt one
+        // Cmd-Z away.
+        let test = gpui::TestAppContext::single();
+        test.update(|cx| {
+            let field = cx.new(TextField::new);
+            field.update(cx, |field, cx| {
+                type_text(field, "sent prompt");
+                field.set_value("", cx);
+                assert!(!field.undo(cx));
+                assert_eq!(field.value(), "");
+            });
+        });
+    }
+
+    #[test]
+    fn the_history_is_bounded() {
+        let mut history = UndoHistory::default();
+        for index in 0..UndoHistory::LIMIT + 10 {
+            history.will_edit(
+                EditKind::Clipboard,
+                Snapshot {
+                    value: index.to_string(),
+                    selection: Selection::collapsed(0),
+                },
+            );
+        }
+        assert_eq!(history.undo.len(), UndoHistory::LIMIT);
+        assert_eq!(history.undo[0].value, "10", "the oldest steps go first");
+    }
+
+    #[test]
+    fn an_undo_group_never_splits_an_ime_composition() {
+        let mut test = gpui::TestAppContext::single();
+        test.add_window(|window, cx| {
+            let field = cx.new(|cx| TextField::new(cx).multiline(4.0));
+            field.update(cx, |field, cx| {
+                type_text(field, "ab");
+                // A click ends the typing run, so the composition opens a step.
+                field.moved_caret();
+                field.replace_and_mark_text_in_range(None, "k", Some(1..1), window, cx);
+                // The IME moves its selection inside the preedit as it goes,
+                // which must not read as the caret leaving the group.
+                field.replace_and_mark_text_in_range(None, "かん", Some(1..1), window, cx);
+                assert!(!field.undo(cx), "no undo while the IME is composing");
+                assert_eq!(field.value, "abかん");
+                field.replace_and_mark_text_in_range(None, "漢", Some(1..1), window, cx);
+                field.replace_text_in_range(None, "漢", window, cx);
+                type_text(field, "字");
+                assert_eq!(field.value, "ab漢字");
+
+                assert!(field.undo(cx));
+                assert_eq!(field.value, "ab", "the composition and what followed it");
+                assert!(field.undo(cx));
+                assert_eq!(field.value, "");
+            });
+            Probe { field }
+        });
+        test.refresh().unwrap();
+    }
+
+    #[test]
+    fn the_edit_menu_reaches_the_focused_field_through_its_actions() {
+        let mut test = gpui::TestAppContext::single();
+        let field = test.update(|cx| cx.new(TextField::new));
+        let mounted = field.clone();
+        let window = test.add_window(move |_, _| Probe { field: mounted });
+        window
+            .update(&mut test, |_, window, cx| {
+                field.read(cx).focus_handle().focus(window);
+            })
+            .unwrap();
+        test.refresh().unwrap();
+        test.update(|cx| field.update(cx, |field, _| type_text(field, "menu")));
+        window
+            .update(&mut test, |_, window, cx| {
+                assert!(window.is_action_available(&Undo, cx), "Undo is enabled");
+                window.dispatch_action(Box::new(Undo), cx);
+            })
+            .unwrap();
+        test.run_until_parked();
+        test.read(|cx| assert_eq!(field.read(cx).value(), ""));
+        window
+            .update(&mut test, |_, window, cx| {
+                window.dispatch_action(Box::new(Redo), cx);
+                window.dispatch_action(Box::new(SelectAll), cx);
+                window.dispatch_action(Box::new(Cut), cx);
+            })
+            .unwrap();
+        test.run_until_parked();
+        test.read(|cx| {
+            assert_eq!(field.read(cx).value(), "");
+            assert_eq!(
+                cx.read_from_clipboard()
+                    .and_then(|item| item.text())
+                    .as_deref(),
+                Some("menu")
+            );
+        });
     }
 
     #[test]

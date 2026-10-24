@@ -46,7 +46,11 @@ impl Agent {
 ///
 /// This is derived state kept alongside the thread so the sidebar can render
 /// without consulting the conversation engine, which may be mid-flight.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+///
+/// A state this build does not know reads as idle. A newer build may record
+/// one, such as a cancelled turn, and refusing it would fail the whole thread
+/// over a status the next turn replaces anyway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum AgentExecutionState {
     #[default]
@@ -67,7 +71,46 @@ impl AgentExecutionState {
     ];
 }
 
+impl<'de> Deserialize<'de> for AgentExecutionState {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        known_or_default(deserializer, &Self::ALL)
+    }
+}
+
+/// Read a unit variant by the name its `Serialize` writes, and anything else as
+/// the type's default.
+///
+/// Matching against the serialized form keeps the names in one place: the
+/// `rename_all` on the enum is the only spelling of each variant.
+fn known_or_default<'de, D, T>(deserializer: D, known: &[T]) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Copy + Default + Serialize,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(known
+        .iter()
+        .copied()
+        .find(|candidate| serde_json::to_value(candidate).is_ok_and(|name| name == value))
+        .unwrap_or_default())
+}
+
+/// A saved access override this build cannot read, read as no override.
+///
+/// Deliberately not the enum's own default: that is `FullAccess`, so a level a
+/// newer build added — most likely a narrower one — would come back as the
+/// widest. Inheriting leaves the thread under the app's or provider's policy.
+fn access_or_inherit<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<AgentAccess>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or(None))
+}
+
 /// How much the agent may do without asking.
+///
+/// Decoding stays strict here, so that a protocol mismatch is reported. Saved
+/// overrides are read through `access_or_inherit` instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum AgentAccess {
@@ -116,7 +159,11 @@ pub struct AgentConfiguration {
     pub effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "access_or_inherit"
+    )]
     pub agent_access: Option<AgentAccess>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window_size: Option<u64>,
@@ -304,6 +351,63 @@ mod tests {
             back.resolved_access(AgentAccess::Supervised),
             AgentAccess::Supervised
         );
+    }
+
+    #[test]
+    fn an_execution_state_from_a_newer_build_reads_as_idle_and_known_ones_round_trip() {
+        // Refusing an unknown state failed the thread, and with it the whole
+        // project file and its backup, which hold the same bytes.
+        for value in [
+            serde_json::json!("cancelled"),
+            serde_json::json!(42),
+            serde_json::Value::Null,
+        ] {
+            let mut saved = serde_json::to_value(Agent::with_id(Uuid::nil(), "kept")).unwrap();
+            saved["execution_state"] = value;
+            let agent: Agent = serde_json::from_value(saved).unwrap();
+            assert_eq!(agent.execution_state, AgentExecutionState::Idle);
+            assert_eq!(agent.title, "kept");
+        }
+        for state in AgentExecutionState::ALL {
+            let written = serde_json::to_value(state).unwrap();
+            assert_eq!(
+                serde_json::from_value::<AgentExecutionState>(written).unwrap(),
+                state
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(AgentExecutionState::WaitingForApproval).unwrap(),
+            "waitingForApproval",
+            "the saved spelling changed"
+        );
+    }
+
+    #[test]
+    fn a_saved_access_level_this_build_cannot_read_inherits_instead_of_widening() {
+        for value in [serde_json::json!("readOnly"), serde_json::json!(7)] {
+            let c: AgentConfiguration = serde_json::from_value(serde_json::json!({
+                "model_id": "kept-model",
+                "agent_access": value,
+            }))
+            .unwrap();
+            assert_eq!(c.agent_access, None, "{value}");
+            assert_eq!(c.model_id.as_deref(), Some("kept-model"));
+            assert_eq!(
+                c.resolved_access(AgentAccess::Supervised),
+                AgentAccess::Supervised
+            );
+        }
+        for access in AgentAccess::ALL {
+            let c = AgentConfiguration {
+                agent_access: Some(access),
+                ..Default::default()
+            };
+            let back: AgentConfiguration =
+                serde_json::from_value(serde_json::to_value(&c).unwrap()).unwrap();
+            assert_eq!(back, c);
+        }
+        // The enum itself stays strict, so a protocol mismatch is reported.
+        assert!(serde_json::from_str::<AgentAccess>(r#""readOnly""#).is_err());
     }
 
     #[test]

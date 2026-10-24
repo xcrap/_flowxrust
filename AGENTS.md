@@ -96,6 +96,11 @@ touching any foreground, background, or accent token.
 - `on_accent` clears 3:1 on every accent, in every tone and mode.
 - Banner text (`fg`, `fg_secondary`) clears 4.5:1 on every `*_muted` fill.
 - Diff foregrounds clear 3:1 on their own diff backgrounds.
+- Status glyphs clear 3:1 on their provider tile, the error glyph on the
+  provider tint included, and the context meter's arc clears 3:1 on the
+  composer at every fill level. Light-mode `warning` is too pale for that arc,
+  so it uses `warning_ink`.
+- Selected transcript text stays readable over `text_selection`.
 
 One documented shortfall, recorded rather than hidden: where a status hue is
 used as an *icon on its own tint*, light-mode `warning` bottoms out at 2.29:1
@@ -130,7 +135,8 @@ before styling a screen ad hoc.
 
 | Module | Provides |
 |---|---|
-| `button` | Labelled button (primary/secondary/ghost/danger), icon button, compact action button. Hover and press are declarative `.hover`/`.active` refinements, so a button repaints without re-rendering. |
+| `button` | Labelled button (primary/secondary/ghost/danger), icon button, compact action button (with an on/disabled variant, `compact_action_toggle`), and `glyph_button` for rows too dense for an icon button's 28 pt hit target. Hover and press are declarative `.hover`/`.active` refinements, so a button repaints without re-rendering. |
+| `checkbox` | A labelled checkbox whose whole row toggles. |
 | `surface` | Card, panel, divider, banner, empty state, section header. |
 | `status` | Badge, activity dot, typing indicator, pulsing dot, context-usage ring. |
 | `segmented` | Segmented control for exclusive choices. |
@@ -276,6 +282,14 @@ and each one exists because its alternative was tried first.
   interrupted write leaves a truncated file that opens fine and then does not
   parse; a fallback that only triggers on `read` would never fire for the damage
   it was added to survive.
+- **One unreadable entry costs only that entry.** Lists decode element by
+  element and unknown enum values read as the default. An entry this build
+  cannot read is kept as raw JSON and written back unchanged, so a newer build's
+  data survives a round trip through an older one.
+
+Both copies are written to a unique, owner-only temp file, flushed with
+`F_FULLFSYNC` before the rename, and the directory is flushed after both
+renames. A fixed temp name let two instances truncate each other's file.
 
 Files under the application-support directory are created `0700`. Everything
 there can contain prompts and code, so it does not inherit a wider mode.
@@ -303,10 +317,10 @@ Three rules, each of which is a bug that was written first:
   npm-installed provider's script needs the interpreter beside it. Empty `PATH`
   entries are dropped, because an empty component means the working directory.
 - **Quarantine is never bypassed.** A downloaded binary carries
-  `com.apple.quarantine` until a human clears it. FlowX reports it and stops. The
-  one exception is an injectable assessor, which exists for a signature check on
-  a notarized build. The attribute reader is injectable for the same reason: the
-  policy cannot be tested if setting up the condition needs `xattr`.
+  `com.apple.quarantine` until a human clears it. FlowX reports it and stops,
+  and never removes the attribute. The assessor and the attribute reader are
+  injectable, because the policy cannot be tested if setting up the condition
+  needs `xattr` or a signed binary.
 - **Indirection is resolved before the quarantine check**, so a clean-looking
   symlink cannot hide a quarantined target. The reported path is the resolved one,
   so swapping a link later cannot redirect a launch.
@@ -329,6 +343,13 @@ What counts as quarantined is narrower than "has the attribute", for two reasons
 The extra directories are directories: the candidate is `<dir>/<name>`. Checking
 the directory itself always missed, and the search silently fell through to a
 login shell that does not read `~/.zshrc`.
+
+The search paths are the Swift app's, in its order: Codex prefers the copy
+bundled in ChatGPT.app or Codex.app, then Homebrew, `~/.local/bin`, `~/.npm/bin`
+and nvm. A glob may sit mid-path (`~/.nvm/versions/node/*/bin/codex`), and
+versions sort by number, so v22 wins over v9. The launch `PATH` leads with the
+directory the binary was *found* in, then the resolved one: an nvm link resolves
+into `lib/node_modules`, which has no `node` beside it.
 
 Discovery tests run with `without_extra_directories`. Without it a "not found"
 assertion can be satisfied, or defeated, by whatever happens to be installed on
@@ -374,8 +395,24 @@ Four rules cost real time to get right, and each has a test:
   dead server report itself as a rejected method.
 - **A request against a dead or closed process fails immediately.** Otherwise
   every request after a crash waits out the full 30-second control timeout with
-  the composer disabled.
+  the composer disabled. That includes `initialize`: the exit watcher starts
+  before the handshake, so a server that dies answering it fails at once, with
+  its stderr.
 
+Two more, for how a turn ends:
+
+- **Silence is never a failure.** A turn ends on completion, a provider or
+  process error, the stream closing, or Stop. A quiet `docker build` or a long
+  think is not a hang, and a silence timeout killed exactly those turns.
+- **Stop ends the tools too.** Each provider runs in its own process group
+  (`fx-agent::process`). Stop sends the provider's interrupt, then SIGTERM to the
+  group, a short grace, then SIGKILL. A turn that finished normally only stops
+  the server, so a dev server the agent started on purpose keeps running.
+
+Read-only command checks for both providers go through one classifier,
+`fx-agent::shell`, which fails closed on control operators, substitutions and
+the write flags of otherwise read-only tools (`find -delete`, `sort -o`,
+`git diff --output`).
 `LineFramer` remembers how far it has scanned. Without that, a line arriving in
 many chunks is rescanned from the front each time — quadratic, which for a 64 MB
 message is billions of comparisons. The `scan_offset` field in the Swift original
@@ -401,9 +438,12 @@ strip above it. Four rules, each of which is a bug that was written first:
   first result. It tracks completion for the spinner; that is all.
 
 Tool output is read from `aggregatedOutput` first, then `output`, `result`,
-`error`, `changes` — that order is the server's. Reading only `output`/`result`
-yields an empty result for every real tool call, which then looks trivial and is
-dropped, so the transcript silently loses every tool output.
+`error`, `contentItems`, `changes`, `results`, `agentsStates` — that order is the
+server's, and live turns and restored history share one reader
+(`codex::session::tool_outcome`). Reading only `output`/`result` yields an empty
+result for every real tool call, which then looks trivial and is dropped, so the
+transcript silently loses every tool output. An explicit `null` is not output:
+Codex sends `"error": null` on every successful MCP call.
 
 Whether a row is prose or a collapsed activity is a *view* decision, made by
 `TranscriptActivityGroupingPolicy` in `fx-core`. It reads content only, never
@@ -453,6 +493,13 @@ ancestor's actions for a target the ancestor does not own.
 receives only a `Window` and an `App`, so the state has to be reachable without
 being captured.
 
+Every key binding, the menu bar, and Settings' Shortcuts page come from one
+table, `commands::key_bindings()`. Add a shortcut there, never with a separate
+`bind_keys` call, or the page and the menus stop telling the truth. A menu item
+is enabled exactly when something on the focused path handles its action, so
+commands that need a project or an idle thread register their handlers only
+then.
+
 ### Text input
 
 GPUI 0.2.2 ships no text-input element. `crates/fx-app/src/text_field.rs` is
@@ -468,6 +515,10 @@ Two decisions there are load-bearing:
 - **`Return` inserts a newline in a multi-line field and only submits in a
   single-line one.** Cmd/Ctrl-Return submits in both, and is claimed explicitly
   because macOS reports `key_char: Some("\n")` for it.
+- **IME composition is a marked range, not committed text.** While one is
+  marked, GPUI routes keys to the input context first, so Return confirms the
+  composition rather than submitting. Text with no replacement range replaces
+  the marked range. Undo groups never split a composition.
 
 ### Running a turn
 
@@ -477,8 +528,17 @@ the conversation from a background thread, so the conversation is behind a
 
 The runner's callback **may not capture `App`**: it fires on another thread and
 `App` is neither `Send` nor reachable from there. It sends to an `mpsc` channel
-instead, which `AppState::drain_updates` reads at the top of every render. That
-is also what makes a finished turn repaint without anything asking it to.
+instead, which a 33 ms poller drains while anything is busy. The poller
+repaints only when the drain applied something or a running thread's revision
+moved, so a quiet turn costs no frames, and a finished turn's `Finished` update
+is what repaints it without anything asking.
+
+Two things stay off the UI thread. Transcripts are saved by one writer thread
+(`conversation_writer.rs`): at most one waiting save per thread, a newer save
+replaces it, and an unchanged file is not rewritten. Transcripts are read in
+the background on first view (`request_conversation`); a render never reads
+one, and the centre column shows a loading state until it lands. Tests that
+read the store right after a save call `flush_saves()` first.
 
 `DenyUnlessReadOnly` only bites when the thread is opened at a level that asks:
 `AgentAccess::FullAccess` maps to `("never", "danger-full-access")`, so Codex
@@ -489,14 +549,31 @@ never asks and FlowX never gets to refuse. The access level has to be
 
 GPUI 0.2.2's scrollable elements have **no keyboard handling at all**. The
 Swift original got arrows and page keys from `NSScrollView` for free, so the
-transcript adds `.track_focus()` plus an `on_key_down` that pages the handle —
+transcript adds `.track_focus()` plus an `on_key_down` that pages the list —
 claiming only the keys it moves, and stopping propagation for those alone.
 
-`track_scroll` reaches `Window::current_view()`, which unwraps a stack that only
-`View::paint` populates. That means **a transcript cannot be painted through
-`VisualTestContext::draw`** — a bare element is not a view. Mount a one-line
-`Render` probe and refresh instead; that is what `paint()` in the `fx-app` tests
-does.
+The transcript is a `gpui::list` aligned to the bottom: only the rows in view
+are built, laid out and painted, and every other row keeps the height it was
+last measured at. With no scroll position of its own the list shows its last
+rows and stays there as they grow, which is what following the bottom is. Three
+rules, each of which was a bug first:
+
+- **Splice every row that changed.** Each pass stamps the rows and splices only
+  the stretch whose stamps moved, so a delta re-measures the tail and nothing
+  else. A reader scrolled into a spliced row is put back at the same offset;
+  GPUI otherwise moves them to the row's top on every delta.
+- **A pinned list's position is "the end", a viewport below the screen.** A
+  step taken from there barely moves, so paging starts from what is on screen.
+- **What is off screen is not layout.** Selection reads the rows it does not
+  see from the messages, through `selection::Document`, which has to produce the
+  keys and text the rows would draw.
+  `the_document_reads_the_same_paragraphs_the_rows_draw` pins that.
+
+The list's paint, like `track_scroll`, reaches `Window::current_view()`, which
+unwraps a stack that only `View::paint` populates. That means **a transcript
+cannot be painted through `VisualTestContext::draw`** — a bare element is not a
+view. Mount a one-line `Render` probe and refresh instead; that is what
+`paint()` in the `fx-app` tests does.
 
 `Window::request_animation_frame()` is unsafe from a render function for the
 same reason — it calls `current_view()` and asserts the draw phase. Use
@@ -514,6 +591,52 @@ Each view test builds its own `TestAppContext` and its own `TempDir`. Sharing on
 store directory across tests is a race: they run concurrently in one process and
 overwrite each other's snapshot, which surfaces as a test that fails only in a
 full run.
+
+## The inspector
+
+The inspector shows the working tree's diff and is the one place FlowX writes
+to a repository. `inspector.rs` is the shell; its child modules are the Git
+layer (`git_inspector.rs`), the shared poller (`repository_monitor.rs`), the
+diff viewer (`diff_view.rs`) and the commit composer (`commit_composer.rs`).
+The pure halves live in `fx-core::git`: `diff` parses, `operations` plans
+commits and pushes, `revision` hashes a snapshot.
+
+Five rules, each of which is a bug that was written first:
+
+- **One poller.** The title-bar count and the inspector both observe the one
+  `RepositoryMonitor`, which reads every five seconds and notifies only when
+  the read differs. Two timers ran `git status` and both numstat passes twice.
+- **A snapshot has a real revision.** `content_revision` hashes the status and
+  numstat text, every changed path's metadata (nanoseconds, inode, ctime) and
+  the index. A constant revision made every poll look like a change.
+- **Diff lines are classified by hunk state, never by prefix.** Inside a hunk
+  the `@@` counts say how many lines follow, and every one is content: a
+  removed `-- comment` arrives as `--- comment`, an added `++i` as `+++i`.
+- **A refresh never blanks the diff.** The selection is a path, not a status
+  record (its line counts change on every edit). The shown document stays
+  until its replacement is parsed, which is then scrolled back to the same
+  file and line. A failed load is not retried until something changes or
+  Refresh is pressed, because the check runs on every render.
+- **Untracked directories are not files.** A nested repository is reported as
+  `?? vendor/lib/`; counting its lines always failed, which pinned "Line totals
+  are partial" on forever.
+
+Every Git job runs on one shared multi-thread runtime whose workers have an
+8 MiB stack. Jobs are *built* there (`spawn_git` takes a closure), because
+debug-build futures overflow a dispatch worker's small stack.
+
+Writes follow `fx-core::git::operations`: paths after `--` under
+`--literal-pathspecs`, no plan ever contains a force flag, and a failure shows
+git's whole combined output. A chosen-files commit stages only paths with work
+outside the index and commits with `--only`, including a rename's source. Push
+runs plain `git push` when `branch.<name>.merge` is set (it survives a gone
+upstream, which is how an empty clone starts) and otherwise
+`push --set-upstream -- <remote> HEAD`.
+
+Open in Editor never hands an agent-written file to its default handler, which
+for `.app` or `.command` means running it. Only passive viewer types keep their
+default; everything else goes to the registered source-code editor, then
+`open -t`.
 
 ## Porting conventions
 

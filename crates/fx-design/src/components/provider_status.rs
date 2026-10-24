@@ -34,6 +34,46 @@ impl ProviderIdentity {
     }
 }
 
+/// What a status tile paints, split out so it can be asserted without a window.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ProviderStatusPalette {
+    /// The glyph: the provider's identity, or `error` once a turn has failed.
+    pub glyph: Rgba,
+    pub border: Rgba,
+    /// The provider's tint behind the glyph.
+    pub fill: Rgba,
+}
+
+/// The tile's colours for one activity, at one point of the waiting pulse.
+///
+/// `pulse` runs from 0 to 1 and back while waiting, and is ignored otherwise.
+/// The fill is always the provider's tint, so a failed tile still says whose
+/// it is; only the glyph and its edge turn to `error`.
+pub fn provider_status_palette(
+    provider: ProviderIdentity,
+    activity: ActivityState,
+    pulse: f32,
+    theme: &Theme,
+) -> ProviderStatusPalette {
+    let identity = provider.color(theme);
+    let glyph = if activity == ActivityState::Error {
+        Colors::error(theme)
+    } else {
+        identity
+    };
+    let (border, fill) = if activity == ActivityState::Waiting {
+        let pulse = pulse.clamp(0.0, 1.0);
+        (0.3 + 0.4 * pulse, 0.08 + 0.1 * pulse)
+    } else {
+        (0.25, 0.12)
+    };
+    ProviderStatusPalette {
+        glyph,
+        border: glyph.with_alpha(border),
+        fill: identity.with_alpha(fill),
+    }
+}
+
 pub fn provider_status(
     id: impl Into<SharedString>,
     provider: ProviderIdentity,
@@ -59,7 +99,6 @@ struct ProviderStatus {
 impl RenderOnce for ProviderStatus {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = global::current();
-        let identity = self.provider.color(&theme);
         let (clock, scheduled) = window.with_element_namespace(self.id.clone(), |window| {
             (
                 window.use_keyed_state("activity-clock", cx, |_, _| Instant::now()),
@@ -92,14 +131,11 @@ impl RenderOnce for ProviderStatus {
         } else {
             1.0
         };
-        let ink = if self.activity == ActivityState::Error {
-            Colors::error(&theme)
-        } else {
-            identity
-        };
+        let palette = provider_status_palette(self.provider, self.activity, pulse, &theme);
+        let ink = palette.glyph;
         let glyph: AnyElement = match self.activity {
             ActivityState::Running => spinner_arc(
-                identity,
+                ink,
                 elapsed / FxAnimation::ACTIVITY_SPIN.as_secs_f32() * 360.0,
             )
             .into_any_element(),
@@ -137,8 +173,8 @@ impl RenderOnce for ProviderStatus {
             .justify_center()
             .rounded(px(Radii::SM))
             .border(px(BorderWidth::HAIRLINE))
-            .border_color(ink.with_alpha(if waiting { 0.3 + 0.4 * pulse } else { 0.25 }))
-            .bg(identity.with_alpha(if waiting { 0.08 + 0.1 * pulse } else { 0.12 }))
+            .border_color(palette.border)
+            .bg(palette.fill)
             .tooltip(move |window, cx| super::tooltip(detail.clone(), window, cx))
             .child(glyph)
     }

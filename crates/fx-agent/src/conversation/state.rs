@@ -15,6 +15,7 @@
 //!   for work the user already stopped.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use fx_core::{AgentAccess, ConversationMessage, MessageRole, Timestamp};
 use serde::{Deserialize, Serialize};
@@ -194,12 +195,30 @@ pub struct UsageTotals {
 }
 
 impl UsageTotals {
+    /// Saturating, because every count here comes from a provider's payload,
+    /// and an overflow in a debug build is a panic on the render path.
     fn add(&mut self, usage: Usage) {
-        self.input_tokens += usage.input_tokens;
-        self.output_tokens += usage.output_tokens;
-        self.cached_input_tokens += usage.cached_input_tokens;
-        self.reasoning_output_tokens += usage.reasoning_output_tokens;
-        self.total_tokens += usage.total_tokens;
+        self.input_tokens = self.input_tokens.saturating_add(usage.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(usage.output_tokens);
+        self.cached_input_tokens = self
+            .cached_input_tokens
+            .saturating_add(usage.cached_input_tokens);
+        self.reasoning_output_tokens = self
+            .reasoning_output_tokens
+            .saturating_add(usage.reasoning_output_tokens);
+        self.total_tokens = self.total_tokens.saturating_add(usage.total_tokens);
+    }
+
+    /// Take a provider's cumulative totals as they are.
+    ///
+    /// Codex reports the thread's running total on every update. Adding each
+    /// update counted the same tokens again every time it reported.
+    fn replace(&mut self, usage: Usage) {
+        self.input_tokens = usage.input_tokens;
+        self.output_tokens = usage.output_tokens;
+        self.cached_input_tokens = usage.cached_input_tokens;
+        self.reasoning_output_tokens = usage.reasoning_output_tokens;
+        self.total_tokens = usage.total_tokens;
     }
 
     /// Context fill as a fraction, or `None` when the window is unknown.
@@ -214,7 +233,10 @@ impl UsageTotals {
 pub struct Conversation {
     pub id: Uuid,
     pub agent_id: Uuid,
-    messages: VecDeque<ConversationMessage>,
+    /// Shared rather than owned, so a view can keep a pass's messages after
+    /// the lock is released without copying them. A message is never changed
+    /// once it is here; only appended, trimmed, or replaced wholesale.
+    messages: VecDeque<Arc<ConversationMessage>>,
     /// Provider history is already bounded by the reader's byte limits. Keep
     /// all of it, including after a new locally streamed turn is appended.
     retain_full_history: bool,
@@ -252,6 +274,13 @@ impl Conversation {
     // ── Messages ───────────────────────────────────────────────────────────
 
     pub fn messages(&self) -> impl ExactSizeIterator<Item = &ConversationMessage> {
+        self.messages.iter().map(|message| &**message)
+    }
+
+    /// The messages as shared handles, for a reader that keeps them past the
+    /// lock: a view that renders from a snapshot holds these instead of copying
+    /// every tool output and image a turn carries.
+    pub fn shared_messages(&self) -> impl ExactSizeIterator<Item = &Arc<ConversationMessage>> {
         self.messages.iter()
     }
 
@@ -265,7 +294,7 @@ impl Conversation {
     }
 
     pub fn append(&mut self, message: ConversationMessage) {
-        self.messages.push_back(message);
+        self.messages.push_back(Arc::new(message));
         self.trim();
         self.message_revision += 1;
         self.touch();
@@ -287,7 +316,7 @@ impl Conversation {
     /// transcript so a refresh cannot erase something the user is trying to
     /// send.
     pub fn replace_messages(&mut self, messages: Vec<ConversationMessage>) {
-        self.messages = messages.into();
+        self.messages = messages.into_iter().map(Arc::new).collect();
         self.trim();
         self.message_revision += 1;
         self.touch();
@@ -458,6 +487,30 @@ impl Conversation {
         self.queued.iter().position(|q| q.id == id)
     }
 
+    /// The queued prompt at this position, counting from the front.
+    pub fn queued_at(&self, index: usize) -> Option<&QueuedPrompt> {
+        self.queued.get(index)
+    }
+
+    /// Replace a queued prompt's text in place, keeping its place and its id.
+    ///
+    /// Trimmed, and refused when nothing is left: an edit that empties a
+    /// queued prompt is a removal, which is a different control.
+    pub fn update_queued(&mut self, id: Uuid, text: &str) -> bool {
+        let text = text.trim();
+        if text.is_empty() {
+            return false;
+        }
+        let Some(queued) = self.queued.iter_mut().find(|queued| queued.id == id) else {
+            return false;
+        };
+        if queued.text != text {
+            queued.text = text.to_string();
+            self.touch();
+        }
+        true
+    }
+
     // ── Approvals and questions ─────────────────────────────────────────────
 
     pub fn pending_approvals(&self) -> &[PendingApproval] {
@@ -533,6 +586,12 @@ impl Conversation {
         self.touch();
     }
 
+    /// Replace the totals with a provider's own running count.
+    pub fn record_cumulative_usage(&mut self, usage: Usage) {
+        self.usage.replace(usage);
+        self.touch();
+    }
+
     pub fn record_context(&mut self, used: u64, window: u64) {
         self.usage.current_context_tokens = used;
         self.usage.reported_context_window = Some(window);
@@ -580,6 +639,16 @@ impl Conversation {
     pub fn set_session_id(&mut self, session_id: impl Into<String>) {
         self.session_id = Some(session_id.into());
         self.touch();
+    }
+
+    /// Forget the provider session, so the next turn opens a fresh one.
+    ///
+    /// The transcript stays: restarting a session that stopped answering is a
+    /// statement about the provider's side of the thread, not about its history.
+    pub fn clear_session_id(&mut self) {
+        if self.session_id.take().is_some() {
+            self.touch();
+        }
     }
 
     // ── Activities ──────────────────────────────────────────────────────────
@@ -667,11 +736,19 @@ impl Conversation {
                 }
             }
             ProviderEvent::TextDelta(delta) => self.append_streaming(&delta),
+            // The streamed message is whole. Committing here is what keeps two
+            // consecutive messages from running together into one row.
+            ProviderEvent::TextEnd => self.commit_streaming(),
             ProviderEvent::Text(text) => {
-                // Streamed text arrives as deltas; a completed item with text is
-                // the fallback for a provider that does not stream.
-                if self.streaming_text.is_empty() {
-                    self.append_streaming(&text);
+                // A message that did not stream is its own row. It used to fill
+                // the buffer only when the buffer was empty, so the second of two
+                // such messages was dropped.
+                if !text.is_empty() {
+                    self.commit_streaming();
+                    self.append(ConversationMessage::text(
+                        fx_core::MessageRole::Assistant,
+                        text,
+                    ));
                 }
             }
             ProviderEvent::ToolUse { id, name, input } => {
@@ -756,6 +833,7 @@ impl Conversation {
                 });
             }
             ProviderEvent::Usage(usage) => self.record_usage(usage),
+            ProviderEvent::CumulativeUsage(usage) => self.record_cumulative_usage(usage),
             ProviderEvent::ContextUsage { used, window } => self.record_context(used, window),
             ProviderEvent::ModelChanged { model, reason } => {
                 self.record_activity(format!("Switched to {model}"), false);
@@ -933,18 +1011,69 @@ mod tests {
         assert_eq!(c.streaming_text(), "", "text leaked into the next turn");
     }
 
-    #[test]
-    fn a_completed_text_item_only_fills_in_when_nothing_streamed() {
-        // A provider that does not stream still produces text.
-        let mut c = Conversation::new(Uuid::nil());
-        c.apply(ProviderEvent::Text("only here".into()));
-        assert_eq!(c.streaming_text(), "only here");
+    fn texts(c: &Conversation) -> Vec<String> {
+        c.messages()
+            .map(ConversationMessage::text_content)
+            .collect()
+    }
 
-        // One that streams must not have its text duplicated by a final item.
+    #[test]
+    fn consecutive_messages_stay_separate_rows_whether_or_not_they_streamed() {
+        // Two streamed messages with no tool call between them used to merge
+        // with no separator.
         let mut c = Conversation::new(Uuid::nil());
-        c.append_streaming("streamed ");
-        c.apply(ProviderEvent::Text("streamed ".into()));
-        assert_eq!(c.streaming_text(), "streamed ");
+        c.apply(ProviderEvent::TextDelta("First.".into()));
+        c.apply(ProviderEvent::TextEnd);
+        c.apply(ProviderEvent::TextDelta("Second.".into()));
+        c.apply(ProviderEvent::TextEnd);
+        assert_eq!(texts(&c), ["First.", "Second."]);
+
+        // And a second message that did not stream used to be dropped, because
+        // the buffer still held the first.
+        let mut c = Conversation::new(Uuid::nil());
+        c.apply(ProviderEvent::TextDelta("First.".into()));
+        c.apply(ProviderEvent::Text("Second.".into()));
+        c.apply(ProviderEvent::Text("Third.".into()));
+        c.apply(ProviderEvent::Text(String::new()));
+        assert_eq!(texts(&c), ["First.", "Second.", "Third."]);
+        assert!(!c.is_streaming());
+    }
+
+    #[test]
+    fn cumulative_usage_replaces_and_turn_usage_saturates() {
+        let mut c = Conversation::new(Uuid::nil());
+        for total in [100, 150] {
+            c.apply(ProviderEvent::CumulativeUsage(Usage {
+                input_tokens: total,
+                total_tokens: total,
+                ..Usage::default()
+            }));
+        }
+        assert_eq!(c.usage().total_tokens, 150, "a running total was added up");
+
+        c.apply(ProviderEvent::Usage(Usage {
+            input_tokens: u64::MAX,
+            total_tokens: u64::MAX,
+            ..Usage::default()
+        }));
+        assert_eq!(c.usage().input_tokens, u64::MAX);
+        assert_eq!(c.usage().total_tokens, u64::MAX);
+    }
+
+    #[test]
+    fn a_finished_compaction_leaves_the_compacting_phase() {
+        let mut c = Conversation::new(Uuid::nil());
+        c.apply(ProviderEvent::Lifecycle(
+            crate::provider::Lifecycle::TurnStarted,
+        ));
+        c.apply(ProviderEvent::Lifecycle(
+            crate::provider::Lifecycle::Compacting,
+        ));
+        assert_eq!(c.phase(), Phase::Compacting);
+        c.apply(ProviderEvent::Lifecycle(
+            crate::provider::Lifecycle::Compacted,
+        ));
+        assert_eq!(c.phase(), Phase::Running);
     }
 
     #[test]
@@ -1252,6 +1381,27 @@ mod tests {
     }
 
     #[test]
+    fn editing_a_queued_prompt_keeps_its_place_and_refuses_an_empty_edit() {
+        let mut c = Conversation::new(Uuid::nil());
+        let ids: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
+        for (index, id) in ids.iter().enumerate() {
+            c.enqueue(QueuedPrompt {
+                id: *id,
+                text: format!("q{index}"),
+                attachment_count: 0,
+            });
+        }
+        let before = c.revision();
+        assert!(c.update_queued(ids[1], "  rewritten  "));
+        assert!(c.revision() > before, "an edit must repaint the strip");
+        assert_eq!(c.queued_at(1).unwrap().text, "rewritten");
+        assert_eq!(c.queued_position(ids[1]), Some(1));
+        assert!(!c.update_queued(ids[1], " \n "));
+        assert_eq!(c.queued_at(1).unwrap().text, "rewritten");
+        assert!(!c.update_queued(Uuid::new_v4(), "nobody"));
+    }
+
+    #[test]
     fn only_three_queued_previews_are_shown() {
         let mut c = Conversation::new(Uuid::nil());
         for i in 0..6 {
@@ -1320,6 +1470,35 @@ mod tests {
             "a retry was offered against the wrong thread"
         );
         assert!(c.unsent().is_none());
+    }
+
+    #[test]
+    fn shared_messages_are_handed_out_without_copying() {
+        // A view keeps these past the lock. If appending or reading moved them,
+        // every pass would be back to copying the whole transcript.
+        let mut c = Conversation::new(Uuid::nil());
+        c.append(user_message("first"));
+        let before: Vec<Arc<ConversationMessage>> = c.shared_messages().cloned().collect();
+        c.append(assistant_message("second"));
+        let after: Vec<Arc<ConversationMessage>> = c.shared_messages().cloned().collect();
+        assert!(Arc::ptr_eq(&before[0], &after[0]));
+        assert_eq!(after.len(), 2);
+        assert_eq!(c.messages().len(), 2);
+    }
+
+    #[test]
+    fn clearing_the_session_keeps_the_transcript_and_reports_the_change() {
+        let mut c = Conversation::new(Uuid::nil());
+        c.append(user_message("hello"));
+        c.set_session_id("s1");
+        let before = c.revision();
+        c.clear_session_id();
+        assert!(c.session_id().is_none());
+        assert_eq!(c.message_count(), 1);
+        assert!(c.revision() > before, "a view would not learn of the reset");
+        let after = c.revision();
+        c.clear_session_id();
+        assert_eq!(c.revision(), after, "clearing nothing is not a change");
     }
 
     #[test]

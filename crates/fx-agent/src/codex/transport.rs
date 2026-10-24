@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
@@ -61,6 +61,10 @@ pub const MAX_STDERR_BYTES: usize = 64 * 1024;
 /// A process that exits closes both at once, so this is normally no wait at
 /// all; the bound only matters when a child it spawned still holds stderr.
 const STDERR_DRAIN: Duration = Duration::from_millis(250);
+
+/// How long a stopping server, and then its process group, gets to exit on
+/// SIGTERM before it is killed.
+pub const TERMINATE_GRACE: Duration = Duration::from_millis(500);
 
 /// Why a request did not produce a result.
 #[derive(Debug, thiserror::Error)]
@@ -291,10 +295,25 @@ impl Exit {
     }
 }
 
+/// A request that has been written and whose answer has not been awaited.
+///
+/// Split from [`Transport::request`] so a caller can stop waiting without
+/// losing the answer. A turn stopped between writing `turn/start` and reading
+/// its reply still has to learn whether Codex took the prompt, and which turn
+/// to interrupt.
+#[derive(Debug)]
+pub struct PendingResponse {
+    id: i64,
+    method: String,
+    receiver: oneshot::Receiver<Outcome>,
+}
+
 /// The live connection to one `codex app-server`.
 #[derive(Debug)]
 pub struct Transport {
     child: Mutex<Option<Child>>,
+    /// The server's own process group, which its tools inherit.
+    group: Option<crate::process::Group>,
     stdin: mpsc::UnboundedSender<Vec<u8>>,
     /// Closed when the reader task finishes, for both EOF and a hard failure.
     events: mpsc::Receiver<ServerEvent>,
@@ -330,6 +349,8 @@ impl Transport {
             // that failed to open.
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // Its own group, so Stop can reach the tools it runs as well as itself.
+        crate::process::in_own_group(&mut command);
         if let Some(directory) = &launch.working_directory {
             command.current_dir(directory);
         }
@@ -341,6 +362,7 @@ impl Transport {
         let mut child = command
             .spawn()
             .map_err(|error| TransportError::Spawn(format!("{}: {error}", launch.executable)))?;
+        let group = crate::process::Group::led_by(&child);
 
         let stdout = child.stdout.take().expect("stdout was piped");
         let stderr = child.stderr.take().expect("stderr was piped");
@@ -412,6 +434,7 @@ impl Transport {
 
         let transport = Self {
             child: Mutex::new(Some(child)),
+            group,
             stdin: stdin_tx,
             events,
             shared,
@@ -468,6 +491,19 @@ impl Transport {
         method: &str,
         params: Option<Value>,
     ) -> Result<Value, TransportError> {
+        let mut pending = self.send_request(method, params).await?;
+        self.response(&mut pending).await
+    }
+
+    /// Write a request without waiting for its answer.
+    ///
+    /// Once this returns, the server has the request: whatever happens to the
+    /// caller, the answer is still waiting in the returned slot.
+    pub async fn send_request(
+        &self,
+        method: &str,
+        params: Option<Value>,
+    ) -> Result<PendingResponse, TransportError> {
         // One critical section: whether the process is alive, and who is waiting,
         // cannot be two separate steps or a request can slip in after the
         // watcher drained the map and then wait out the full control timeout with
@@ -489,8 +525,21 @@ impl Transport {
                 "the app-server stdin is closed".into(),
             ));
         }
+        Ok(PendingResponse {
+            id,
+            method: method.to_string(),
+            receiver,
+        })
+    }
 
-        self.await_outcome(receiver, method, Some(json!(id))).await
+    /// Wait for the answer to a request [`Self::send_request`] wrote.
+    ///
+    /// Cancel-safe: dropping this future leaves the answer in `pending`, so a
+    /// later call still receives it.
+    pub async fn response(&self, pending: &mut PendingResponse) -> Result<Value, TransportError> {
+        let method = pending.method.clone();
+        self.await_outcome(&mut pending.receiver, &method, Some(json!(pending.id)))
+            .await
     }
 
     /// Send a request that carries a reserved id, used only by the handshake.
@@ -527,7 +576,7 @@ impl Transport {
     /// into three errors.
     async fn await_outcome(
         &self,
-        receiver: oneshot::Receiver<Outcome>,
+        receiver: impl std::future::Future<Output = Result<Outcome, oneshot::error::RecvError>>,
         method: &str,
         abandon: Option<Value>,
     ) -> Result<Value, TransportError> {
@@ -601,15 +650,35 @@ impl Transport {
         self.shared.exited.lock().await.clone()
     }
 
-    /// Stop the server.
+    /// Stop the server once its work is done.
     ///
-    /// The child is killed rather than waited for, because a server that ignores
-    /// stdin closing would otherwise keep the app alive at quit.
+    /// SIGTERM first, so Codex can finish writing the thread it just updated,
+    /// then SIGKILL after a grace period, because a server that ignores SIGTERM
+    /// would otherwise keep the app alive at quit. The process group is left
+    /// alone: nothing is running at the end of a turn, and anything left
+    /// deliberately in the background is not FlowX's to end.
     pub async fn close(&self) {
         if let Some(mut child) = self.child.lock().await.take() {
-            let _ = child.start_kill();
-            let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+            crate::process::stop_leader(&mut child, TERMINATE_GRACE).await;
         }
+        self.mark_closed().await;
+    }
+
+    /// Stop the server and everything it started, for Stop or a failed turn.
+    ///
+    /// The whole process group gets SIGTERM, a grace period, and then SIGKILL.
+    /// Killing only the server, as `close` once did for every ending, left a
+    /// `sleep 200` or a quiet `docker build` running after the user pressed
+    /// Stop, with nothing left to report on it.
+    pub async fn terminate(&self) {
+        let mut slot = self.child.lock().await;
+        match (self.group, slot.as_mut()) {
+            (Some(group), leader) => group.terminate(leader, TERMINATE_GRACE).await,
+            (None, Some(child)) => crate::process::stop_leader(child, TERMINATE_GRACE).await,
+            (None, None) => {}
+        }
+        slot.take();
+        drop(slot);
         self.mark_closed().await;
     }
 
@@ -640,6 +709,81 @@ impl Drop for Transport {
             && let Some(child) = child.as_mut()
         {
             let _ = child.start_kill();
+        }
+    }
+}
+
+/// A second way to send requests to a running server, from a task other than
+/// the one reading its events.
+///
+/// [`Transport::next_event`] takes `&mut`, so whoever drives a turn holds the
+/// transport for the turn's whole length. Steering that turn is a request made
+/// *during* it, from somewhere else, and this handle is that somewhere else. It
+/// shares the pending map and the stdin writer, so its answer is correlated by
+/// the same reader task as every other response — the turn's driver does not
+/// have to be polled for it to arrive.
+#[derive(Debug, Clone)]
+pub struct Requester {
+    stdin: mpsc::UnboundedSender<Vec<u8>>,
+    shared: Arc<Shared>,
+}
+
+impl Transport {
+    /// A cloneable handle for requests made while something else reads events.
+    pub fn requester(&self) -> Requester {
+        Requester {
+            stdin: self.stdin.clone(),
+            shared: self.shared.clone(),
+        }
+    }
+}
+
+impl Requester {
+    /// Send a request and wait for its response, under the same rules as
+    /// [`Transport::request`]: a dead process fails at once, and a server
+    /// that never answers fails after [`CONTROL_REQUEST_TIMEOUT`].
+    pub async fn request(
+        &self,
+        method: &str,
+        params: Option<Value>,
+    ) -> Result<Value, TransportError> {
+        let (id, receiver) = {
+            let mut pending = self.shared.pending.lock().await;
+            pending
+                .register_or_dead(method)
+                .map_err(|reason| TransportError::Exited { stderr: reason })?
+        };
+        let bytes = Outgoing::Request {
+            id,
+            method: method.to_string(),
+            params,
+        }
+        .encode()?;
+        if self.stdin.send(bytes).is_err() {
+            self.shared.pending.lock().await.abandon(&json!(id));
+            return Err(TransportError::Write(
+                "the app-server stdin is closed".into(),
+            ));
+        }
+        // The same three outcomes as `Transport::await_outcome`, which needs a
+        // whole transport to call; this handle has only the shared half.
+        match tokio::time::timeout(CONTROL_REQUEST_TIMEOUT, receiver).await {
+            Ok(Ok(Outcome::Answered(Ok(value)))) => Ok(value),
+            Ok(Ok(Outcome::Answered(Err(error)))) => Err(TransportError::Rejected {
+                method: method.to_string(),
+                code: error.code,
+                message: error.message,
+            }),
+            Ok(Ok(Outcome::Dead(reason))) => Err(TransportError::Exited { stderr: reason }),
+            Ok(Err(_)) => Err(TransportError::Exited {
+                stderr: "the transport was dropped before Codex answered.".into(),
+            }),
+            Err(_) => {
+                self.shared.pending.lock().await.abandon(&json!(id));
+                Err(TransportError::TimedOut {
+                    method: method.to_string(),
+                })
+            }
         }
     }
 }
@@ -742,20 +886,22 @@ async fn record_exit(shared: &Arc<Shared>, stderr: String) {
     });
 }
 
-async fn read_stderr(stderr: tokio::process::ChildStderr, shared: Arc<Shared>) {
-    let mut lines = BufReader::new(stderr).lines();
-    let mut buffer = String::new();
-    while let Ok(Some(line)) = lines.next_line().await {
-        buffer.push_str(&line);
-        buffer.push('\n');
+async fn read_stderr(mut stderr: tokio::process::ChildStderr, shared: Arc<Shared>) {
+    // Raw bytes, capped as they are read. A line reader stopped at the first
+    // byte that was not UTF-8, which closed the pipe and made the server's next
+    // diagnostic a write error; and `\r`-only progress output was one line that
+    // grew without bound before the cap could apply.
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 8 * 1024];
+    while let Ok(read) = stderr.read(&mut chunk).await {
+        if read == 0 {
+            break;
+        }
         // The *tail* is kept, not the head. The last thing a CLI writes before it
         // dies is the reason it died, so a cap that kept the head would preserve
         // the banner and discard the diagnosis — which is the only useful part.
-        if buffer.len() > MAX_STDERR_BYTES {
-            let excess = buffer.len() - MAX_STDERR_BYTES;
-            buffer.drain(..excess);
-        }
-        *shared.stderr.lock().await = buffer.clone();
+        crate::process::keep_tail(&mut buffer, &chunk[..read], MAX_STDERR_BYTES);
+        *shared.stderr.lock().await = crate::process::decode(&buffer);
     }
 }
 
@@ -1134,6 +1280,64 @@ mod process {
                 assert!(message.contains("/nonexistent/codex"), "{message}");
             }
             other => panic!("expected a spawn failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn terminating_ends_the_tools_the_server_started() {
+        // Stop used to SIGKILL the server alone, at once. The server was not in
+        // a group of its own, so the `sleep 200` it was running kept going.
+        let Some(server) = FakeServer::new() else {
+            return;
+        };
+        let transport = connect(&server).await.expect("started");
+        let started = transport
+            .request("spawn-child", None)
+            .await
+            .expect("the tool started");
+        let pid = libc::pid_t::try_from(started["pid"].as_i64().expect("a pid")).unwrap();
+        let _reap = crate::process::testing::KillOnDrop(pid);
+
+        transport.terminate().await;
+        assert!(
+            crate::process::testing::gone_within(pid, Duration::from_secs(5)).await,
+            "the tool outlived the server it belonged to"
+        );
+        assert!(matches!(
+            transport.request("echo", None).await,
+            Err(TransportError::Exited { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn stderr_that_is_not_text_does_not_stop_its_capture() {
+        // A line reader stopped at the first invalid byte and dropped the pipe,
+        // so the server's next write to stderr failed — and the reason it gave
+        // when it died was never captured.
+        let Some(server) = FakeServer::new() else {
+            return;
+        };
+        let transport = connect(&server).await.expect("started");
+        transport
+            .request("stderr-noise", None)
+            .await
+            .expect("answered");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        transport
+            .request("stderr-noise", None)
+            .await
+            .expect("the server could still write to stderr");
+        transport
+            .notify(Outgoing::Notification {
+                method: "die".into(),
+                params: None,
+            })
+            .expect("written");
+        match transport.request("echo", None).await {
+            Err(TransportError::Exited { stderr }) => {
+                assert!(stderr.contains("told to die"), "{stderr}")
+            }
+            other => panic!("expected an exit, got {other:?}"),
         }
     }
 

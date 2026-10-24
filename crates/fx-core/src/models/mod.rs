@@ -8,6 +8,7 @@
 pub mod agent;
 pub mod conversation;
 pub mod git;
+pub mod goal;
 pub mod project;
 pub mod tool_approval;
 
@@ -21,6 +22,7 @@ pub use conversation::{
     MessageRole,
 };
 pub use git::{GitFileStatus, GitRepositoryInfo};
+pub use goal::{ConversationGoal, GoalStatus};
 pub use project::Project;
 pub use tool_approval::{
     ApprovalStatus, ToolApprovalRequest, ToolRiskLevel, UserInputOption, UserInputQuestion,

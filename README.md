@@ -5,7 +5,7 @@ written in Rust with [GPUI](https://gpui.rs). It is an ongoing port of the Swift
 FlowX application in the sibling `_flowx` repository.
 
 The current milestone connects the application shell, provider sessions,
-persistence, settings and a read-only repository inspector. **The Swift port is
+persistence, settings and a repository inspector with commit and push. **The Swift port is
 not complete.** The remaining work is listed below.
 
 ## Current milestone
@@ -50,9 +50,15 @@ not complete.** The remaining work is listed below.
 - Settings preview base tone, accent, text size and appearance immediately across
   the window. Done saves the choices; Cancel restores the previous appearance.
   Provider runtime checks report failures.
-- A read-only Changes inspector shows only changed files, with staged/unstaged
-  diffs, new-file previews and refresh. Reads are bounded, and preview paths are
-  checked against the project root.
+- A Changes inspector shows the project diff in unstaged, staged or base
+  (against `HEAD`) comparisons, inline or split, with a file navigator,
+  collapse/expand all and Open in Editor. A refresh keeps the open file and
+  scroll position. Reads are bounded, and paths are checked against the project
+  root.
+- Commit from the inspector with a message and a scope: all changes, the index
+  as staged, or chosen files. Push publishes the current branch (setting its
+  upstream the first time) and never forces. Both run off the UI thread and
+  show Git's own output when they fail.
 - A compact title-bar indicator shows green added-line and red removed-line
   counts and toggles the Changes inspector. It disappears for clean working
   trees and refreshes every five seconds and after a turn. Binary-only changes
@@ -150,8 +156,8 @@ support location. `RUST_LOG` controls diagnostic logging.
 | Transcript | Markdown tables, syntax highlighting, text selection/copy behavior, and remaining Swift transcript interactions. |
 | Swift data migration | Import the Swift application’s project layout, settings and unsent drafts. Provider-native history is discovered independently. |
 | Thread management | Synchronize local rename/archive/delete actions with provider-native lifecycle APIs and complete remaining sidebar parity. |
-| Composer | Complete attachment controls, follow-up queueing and steering behavior. |
-| Git workspace | Build on the read-only inspector with the remaining diff navigation and editing workflows, staging, commit and push UI. |
+| Composer | Goals for Claude, Codex goal updates arriving mid-turn, and pasting a file copied in Finder (GPUI's clipboard returns its name first). |
+| Git workspace | Hunk- and line-level staging, discarding changes, fetch and pull, a navigator filter, and the side-by-side navigator for panels wider than 720 pt. |
 | Distribution and parity | Finish workspace geometry/shortcut parity, application packaging, signing/notarization and broader live-provider acceptance testing. |
 
 ## Workspace structure

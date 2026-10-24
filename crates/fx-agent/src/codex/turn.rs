@@ -12,8 +12,12 @@
 //!   content is how a turn ends up showing its own id.
 //! - **Only `turn/completed` ends the turn.** A tool call, a stream gap, or the
 //!   process going quiet all mean the turn is still running. Only an explicit
-//!   completion, an error, or the server dying ends it — and a turn that ends
-//!   early looks to the user like the model stopped mid-sentence.
+//!   completion, an error, the server dying, or the user's Stop ends it — and a
+//!   turn that ends early looks to the user like the model stopped
+//!   mid-sentence. There is deliberately no silence timer: `sleep 200`, a quiet
+//!   `docker build`, and long reasoning all say nothing for minutes, and a timer
+//!   that failed them also got Codex killed mid-turn. The process dying is
+//!   watched instead, through the event stream closing.
 //! - **Approvals are answered by policy here.** A caller with a user in the loop
 //!   answers them itself; without one, an unanswered request would leave Codex
 //!   blocked, so the turn answers with the configured policy and reports what it
@@ -26,25 +30,15 @@ use fx_core::AgentAccess;
 use serde_json::{Value, json};
 
 use crate::codex::session::{
-    CodexWriterConflict, TurnRequest, parse_notification, thread_id_from_result, thread_params,
-    turn_params,
+    CodexWriterConflict, TurnNotifications, TurnRequest, is_read_only_command_value,
+    thread_id_from_result, thread_params, turn_params,
 };
-use crate::codex::transport::{ServerEvent, Transport, TransportError};
+use crate::codex::session::{goal_set_params, steer_params};
+use crate::codex::transport::Requester;
+use crate::codex::transport::{PendingResponse, ServerEvent, Transport, TransportError};
 use crate::provider::{ApprovalRequest, ProviderError, ProviderEvent, RiskLevel, UserResponse};
+use fx_core::models::goal::{ConversationGoal, GoalStatus};
 use tokio::sync::mpsc;
-
-/// How long a whole turn may take before FlowX gives up on it.
-///
-/// Longer than a single control request, because a turn is minutes of model
-/// time. It exists so a server that stops talking without dying still surfaces as
-/// a failure instead of a spinner that never stops.
-pub const TURN_TIMEOUT: Duration = Duration::from_secs(60 * 60);
-
-/// How long to wait after the last event before assuming the server is stuck.
-///
-/// Shorter than the whole-turn budget so a stalled turn is reported while there
-/// is still something to tell the user about.
-pub const TURN_SILENCE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How a turn ended.
 #[derive(Debug, Clone, PartialEq)]
@@ -91,32 +85,6 @@ impl TurnOutcome {
     }
 }
 
-/// A command argument as text.
-///
-/// Codex sends the command as an argv array far more often than as a string, and
-/// a policy check that only understood the string form would treat every array
-/// command as unknown — which under a deny-unless-read-only policy means
-/// refusing every read.
-fn command_text(command: &Value) -> Option<String> {
-    match command {
-        Value::String(text) => Some(text.clone()),
-        // An argv array is joined rather than refused: Codex sends the command
-        // that way far more often than as a string, and a policy check that only
-        // understood the string form would treat every array command as unknown,
-        // which under a deny-unless-read-only policy means refusing every read.
-        //
-        // The join allocates. It is owned by the caller rather than leaked,
-        // because this runs on every approval in a turn.
-        Value::Array(words) => words
-            .iter()
-            .filter_map(Value::as_str)
-            .collect::<Vec<_>>()
-            .join(" ")
-            .into(),
-        _ => None,
-    }
-}
-
 /// What to do with a tool call Codex asks permission for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ApprovalPolicy {
@@ -147,15 +115,28 @@ impl ApprovalPolicy {
                 let arguments = input.get("arguments").unwrap_or(input);
                 match tool_name {
                     "webSearch" | "imageView" | "sleep" => true,
+                    // Either form: Codex sends argv far more often than a line,
+                    // and a check that understood only lines would refuse every
+                    // read under this policy.
                     "commandExecution" => arguments
                         .get("command")
-                        .and_then(command_text)
-                        .is_some_and(|command| {
-                            crate::codex::session::is_read_only_command(&command)
-                        }),
+                        .is_some_and(is_read_only_command_value),
                     _ => false,
                 }
             }
+        }
+    }
+
+    /// The same decision for one of Claude's tools.
+    ///
+    /// Claude names its tools differently, and `allows` knows only Codex's
+    /// names, so under this policy it refused every Claude tool — `Read`
+    /// included.
+    pub fn allows_claude_tool(&self, tool_name: &str, input: &Value) -> bool {
+        match self {
+            Self::AllowAll => true,
+            Self::Ask | Self::DenyAll => false,
+            Self::DenyUnlessReadOnly => crate::claude::stream::is_read_only_tool(tool_name, input),
         }
     }
 
@@ -179,12 +160,19 @@ impl ApprovalPolicy {
 pub struct CodexSession {
     transport: Transport,
     thread_id: String,
+    /// The running turn, once Codex has acknowledged `turn/start`. That
+    /// acknowledgement is the proof Codex has the prompt.
     active_turn_id: Option<String>,
+    /// A `turn/start` that has been written and not yet answered.
+    ///
+    /// Held here rather than inside the turn's future, so a Stop that drops
+    /// the future between the write and the reply can still collect the reply:
+    /// it says whether the prompt was taken, and which turn to interrupt.
+    starting: Option<PendingResponse>,
+    /// The running turn's id, readable by a [`TurnSteerer`] while
+    /// `run_turn_interactive` holds the session mutably.
+    steer_turn: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     approvals: ApprovalPolicy,
-    /// How long the whole turn may take.
-    turn_timeout: Duration,
-    /// How long to wait between events before declaring the turn stalled.
-    silence_timeout: Duration,
 }
 
 impl std::fmt::Debug for CodexSession {
@@ -192,7 +180,6 @@ impl std::fmt::Debug for CodexSession {
         f.debug_struct("CodexSession")
             .field("thread_id", &self.thread_id)
             .field("approvals", &self.approvals)
-            .field("turn_timeout", &self.turn_timeout)
             .finish()
     }
 }
@@ -238,35 +225,45 @@ impl CodexSession {
             transport,
             thread_id,
             active_turn_id: None,
+            starting: None,
+            steer_turn: Default::default(),
             approvals,
-            turn_timeout: TURN_TIMEOUT,
-            silence_timeout: TURN_SILENCE_TIMEOUT,
         })
-    }
-
-    /// Override the timeouts.
-    ///
-    /// A stalled turn has to be reported rather than left spinning, but the
-    /// budget has to be a parameter or the test for it takes minutes.
-    pub fn with_timeouts(mut self, turn_timeout: Duration, silence_timeout: Duration) -> Self {
-        self.turn_timeout = turn_timeout;
-        self.silence_timeout = silence_timeout;
-        self
     }
 
     pub fn thread_id(&self) -> &str {
         &self.thread_id
     }
 
+    /// Whether Codex acknowledged the latest `turn/start`, which is the proof
+    /// it has the prompt. A prompt it has must not be offered back for
+    /// sending again, or Codex receives it twice.
+    pub fn prompt_accepted(&self) -> bool {
+        self.active_turn_id.is_some()
+    }
+
     /// Ask Codex to stop the turn in flight.
     ///
     /// Best-effort: the turn may already be over, and a failure here must not
-    /// replace the real outcome.
-    pub async fn interrupt(&self) -> Result<(), ProviderError> {
+    /// replace the real outcome. A Stop that arrived while `turn/start` was
+    /// still unanswered first waits for that answer: Codex already has the
+    /// prompt, and without the turn id there is nothing to interrupt.
+    pub async fn interrupt(&mut self) -> Result<(), ProviderError> {
+        if let Some(mut starting) = self.starting.take() {
+            let ack = self
+                .transport
+                .response(&mut starting)
+                .await
+                .map_err(classify_turn_error)?;
+            self.active_turn_id = Some(turn_id_of(&ack));
+        }
+        let Some(turn_id) = self.active_turn_id.as_deref() else {
+            return Ok(());
+        };
         self.transport
             .request(
                 "turn/interrupt",
-                Some(json!({ "threadId": self.thread_id, "turnId": self.active_turn_id })),
+                Some(json!({ "threadId": self.thread_id, "turnId": turn_id })),
             )
             .await
             .map(|_| ())
@@ -285,8 +282,8 @@ impl CodexSession {
         self.drive_turn(request, None, sink, || {}, |_| {}).await
     }
 
-    /// Run with an interactive response channel. Waiting for the user suspends
-    /// silence/turn timers, while process exits and cancellation remain live.
+    /// Run with an interactive response channel. Process exits and
+    /// cancellation stay live while the turn waits for the user.
     pub async fn run_turn_interactive(
         &mut self,
         request: &TurnRequest<'_>,
@@ -308,30 +305,30 @@ impl CodexSession {
         mut resolved: impl FnMut(String),
     ) -> Result<TurnOutcome, ProviderError> {
         let thread_id = self.thread_id.clone();
-        let ack = self
-            .transport
-            .request("turn/start", Some(turn_params(request)))
-            .await
-            .map_err(classify_turn_error)?;
-        let turn_id = ack
-            .get("turn")
-            .and_then(|turn| turn.get("id"))
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
+        self.active_turn_id = None;
+        // Written, then awaited from `self`: if this future is dropped by a
+        // Stop in between, the reply is still collected by `interrupt`.
+        let starting = self.starting.insert(
+            self.transport
+                .send_request("turn/start", Some(turn_params(request)))
+                .await
+                .map_err(classify_turn_error)?,
+        );
+        let ack = self.transport.response(starting).await;
+        self.starting = None;
+        let turn_id = turn_id_of(&ack.map_err(classify_turn_error)?);
         self.active_turn_id = Some(turn_id.clone());
+        *self
+            .steer_turn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(turn_id.clone());
         accepted();
-        let mut deadline = tokio::time::Instant::now() + self.turn_timeout;
         let mut events = Vec::new();
+        let mut notifications = TurnNotifications::new();
         let mut pending: HashMap<String, PendingRequest> = HashMap::new();
         let mut items: HashMap<String, Value> = HashMap::new();
 
         loop {
-            let waiting = !pending.is_empty();
-            let silence = self
-                .silence_timeout
-                .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
-            let began = tokio::time::Instant::now();
             let next = tokio::select! {
                 next = self.transport.next_event() => next,
                 response = async {
@@ -340,7 +337,6 @@ impl CodexSession {
                         None => std::future::pending().await,
                     }
                 } => {
-                    if waiting { deadline += began.elapsed(); }
                     match response {
                         Some(response) => {
                             let id = response.id().to_owned();
@@ -363,13 +359,7 @@ impl CodexSession {
                     }
                     continue;
                 },
-                _ = tokio::time::sleep(silence), if !waiting => {
-                    return Ok(TurnOutcome::Failed { thread_id, reason: "Codex stopped sending updates before the turn finished.".into(), events });
-                }
             };
-            if waiting {
-                deadline += began.elapsed();
-            }
             let Some(next) = next else {
                 let reason = self
                     .transport
@@ -402,7 +392,7 @@ impl CodexSession {
                             resolved(id);
                         }
                     }
-                    for event in parse_notification(&method, &params) {
+                    for event in notifications.parse(&method, &params) {
                         sink(event.clone());
                         events.push(event);
                         if let Some(outcome) =
@@ -492,9 +482,15 @@ impl CodexSession {
         }
     }
 
-    /// Stop the session.
+    /// Stop the session once its turn is done.
     pub async fn close(self) {
         self.transport.close().await;
+    }
+
+    /// Stop the session and every process it started, for a turn that was
+    /// stopped or failed part-way.
+    pub async fn terminate(self) {
+        self.transport.terminate().await;
     }
 
     /// Whether the underlying process has exited.
@@ -503,8 +499,210 @@ impl CodexSession {
     }
 }
 
+/// How long a compaction may run before FlowX stops waiting for it.
+///
+/// A compaction is one summarising model call, not a turn of work, so unlike a
+/// turn — which silence alone never ends — it has a deadline.
+pub const COMPACTION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// Guidance for a running turn, sent from outside the task driving it.
+///
+/// `run_turn_interactive` holds the session mutably for the turn's length, so
+/// `turn/steer` cannot go through the session itself. This holds what a steer
+/// needs instead — a [`Requester`] on the same process, the thread, and the
+/// turn id `drive_turn` records once Codex acknowledges the turn.
+#[derive(Debug, Clone)]
+pub struct TurnSteerer {
+    requester: Requester,
+    thread_id: String,
+    turn: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+}
+
+impl TurnSteerer {
+    /// Add guidance to the turn in flight. Images come first, as in a turn.
+    ///
+    /// Codex rejects a steer aimed at a turn that is not the active one, which
+    /// is why the expected id is always sent, and why a reply naming another
+    /// turn is a failure rather than a success.
+    pub async fn steer(&self, prompt: &str, image_paths: &[String]) -> Result<(), ProviderError> {
+        let Some(turn_id) = self
+            .turn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        else {
+            return Err(ProviderError::Unavailable(
+                "Codex has not started a steerable turn yet, or the active turn has already ended."
+                    .into(),
+            ));
+        };
+        let result = self
+            .requester
+            .request(
+                "turn/steer",
+                Some(steer_params(&self.thread_id, &turn_id, prompt, image_paths)),
+            )
+            .await
+            .map_err(map_error)?;
+        if result.get("turnId").and_then(Value::as_str) != Some(turn_id.as_str()) {
+            return Err(ProviderError::Unavailable(
+                "Codex did not confirm guidance for the expected active turn.".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl CodexSession {
+    /// A handle that can steer this session's turns while one is running.
+    pub fn steerer(&self) -> TurnSteerer {
+        TurnSteerer {
+            requester: self.transport.requester(),
+            thread_id: self.thread_id.clone(),
+            turn: self.steer_turn.clone(),
+        }
+    }
+
+    /// Ask Codex to compact the thread's context, and wait for it to finish.
+    ///
+    /// `thread/compact/start` is answered at once and the compaction runs
+    /// afterwards, so returning on the answer would close the process with the
+    /// work still in flight. This waits for `thread/compacted`, or for the
+    /// compaction turn to complete, feeding what it sees to `sink` on the way.
+    pub async fn compact(
+        &mut self,
+        mut sink: impl FnMut(ProviderEvent),
+    ) -> Result<(), ProviderError> {
+        let thread_id = self.thread_id.clone();
+        self.transport
+            .request(
+                "thread/compact/start",
+                Some(json!({ "threadId": thread_id })),
+            )
+            .await
+            .map_err(map_error)?;
+        sink(ProviderEvent::Lifecycle(
+            crate::provider::Lifecycle::Compacting,
+        ));
+        let deadline = tokio::time::Instant::now() + COMPACTION_TIMEOUT;
+        let mut notifications = TurnNotifications::new();
+        loop {
+            let next = tokio::time::timeout_at(deadline, self.transport.next_event())
+                .await
+                .map_err(|_| {
+                    ProviderError::Unavailable(
+                        "Codex did not finish compacting the context in time.".into(),
+                    )
+                })?;
+            let Some(next) = next else {
+                let reason = self
+                    .transport
+                    .exit_reason()
+                    .await
+                    .map(|exit| exit.reason())
+                    .unwrap_or_else(|| "the Codex connection closed".into());
+                return Err(ProviderError::Unavailable(reason));
+            };
+            match next {
+                ServerEvent::Notification { method, params } => {
+                    if params
+                        .get("threadId")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| id != thread_id)
+                    {
+                        continue;
+                    }
+                    if method == "flowx/server-exited" {
+                        continue;
+                    }
+                    let finished = matches!(method.as_str(), "thread/compacted" | "turn/completed");
+                    for event in notifications.parse(&method, &params) {
+                        if let ProviderEvent::Error(reason) = event {
+                            return Err(ProviderError::Protocol(reason));
+                        }
+                        // The compaction turn's own completion is not an
+                        // answer, and must not commit anything as one.
+                        if !matches!(event, ProviderEvent::Done { .. }) {
+                            sink(event);
+                        }
+                    }
+                    if finished {
+                        if method == "turn/completed" {
+                            sink(ProviderEvent::Lifecycle(
+                                crate::provider::Lifecycle::Compacted,
+                            ));
+                        }
+                        return Ok(());
+                    }
+                }
+                ServerEvent::Request { id, method, .. } => {
+                    // Nothing in a compaction needs the user, and an unanswered
+                    // request would leave Codex blocked on it.
+                    self.transport
+                        .refuse(id, -32601, &format!("FlowX cannot service {method}."))
+                        .map_err(map_error)?;
+                }
+            }
+        }
+    }
+
+    /// The thread's goal, if it has one (`thread/goal/get`).
+    pub async fn goal(&self) -> Result<Option<ConversationGoal>, ProviderError> {
+        let result = self
+            .transport
+            .request(
+                "thread/goal/get",
+                Some(json!({ "threadId": self.thread_id })),
+            )
+            .await
+            .map_err(map_error)?;
+        Ok(result.get("goal").and_then(ConversationGoal::from_codex))
+    }
+
+    /// Set the objective, the status, or both (`thread/goal/set`).
+    pub async fn set_goal(
+        &self,
+        objective: Option<&str>,
+        status: Option<GoalStatus>,
+    ) -> Result<ConversationGoal, ProviderError> {
+        let result = self
+            .transport
+            .request(
+                "thread/goal/set",
+                Some(goal_set_params(&self.thread_id, objective, status)),
+            )
+            .await
+            .map_err(map_error)?;
+        result
+            .get("goal")
+            .and_then(ConversationGoal::from_codex)
+            .ok_or_else(|| ProviderError::Protocol("Codex did not return a goal.".into()))
+    }
+
+    /// Remove the thread's goal (`thread/goal/clear`).
+    pub async fn clear_goal(&self) -> Result<(), ProviderError> {
+        self.transport
+            .request(
+                "thread/goal/clear",
+                Some(json!({ "threadId": self.thread_id })),
+            )
+            .await
+            .map(|_| ())
+            .map_err(map_error)
+    }
+}
+
 fn request_key(id: &Value) -> String {
     format!("codex:{id}")
+}
+
+/// The turn id out of a `turn/start` acknowledgement.
+fn turn_id_of(ack: &Value) -> String {
+    ack.get("turn")
+        .and_then(|turn| turn.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
 }
 
 fn belongs_to_turn(params: &Value, thread_id: &str, turn_id: &str) -> bool {
@@ -561,7 +759,6 @@ impl PendingRequest {
                         }
                     })
                     .to_owned();
-                let command = params.get("command").and_then(command_text);
                 ProviderEvent::Approval(ApprovalRequest {
                     id,
                     tool_name: tool_name.clone(),
@@ -569,7 +766,7 @@ impl PendingRequest {
                     risk: if tool_name == "permissions" {
                         RiskLevel::Dangerous
                     } else {
-                        crate::codex::session::risk_for(&tool_name, command.as_deref())
+                        crate::codex::session::risk_for(&tool_name, params.get("command"))
                     },
                 })
             }
@@ -729,6 +926,8 @@ fn classify_turn_error(error: TransportError) -> ProviderError {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::codex::fake_server::FakeServer;
     use crate::codex::transport::Launch;
@@ -821,29 +1020,78 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_turn_that_never_completes_is_reported_rather_than_spinning() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_quiet_turn_is_not_failed_for_its_silence() {
+        // `sleep 200`, a quiet `docker build`, long reasoning: minutes with no
+        // event at all. The turn used to fail after 120 s of that, and the app
+        // then killed Codex mid-turn. A real child and pipe, with only Tokio's
+        // clock moved past the old cutoff.
         let Some(server) = FakeServer::new() else {
             return;
         };
-        // Short budgets, so the test does not take minutes.
-        let mut session = session_with(&server, &[])
-            .await
-            .with_timeouts(Duration::from_secs(10), Duration::from_millis(400));
+        let mut session = session_with(&server, &[]).await;
         let thread_id = session.thread_id().to_string();
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(10),
-            session.run_turn(&TurnRequest::new(&thread_id, "hang", "/tmp"), |_| {}),
-        )
+        let (started, mut seen) = mpsc::unbounded_channel();
+        let turn = tokio::spawn(async move {
+            session
+                .run_turn(&TurnRequest::new(&thread_id, "quiet", "/tmp"), |event| {
+                    let _ = started.send(event);
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !matches!(seen.recv().await, Some(ProviderEvent::Lifecycle(_)) | None) {}
+        })
         .await
-        .expect("the turn stopped rather than spinning")
-        .expect("no transport error");
-        match outcome {
-            TurnOutcome::Failed { reason, .. } => {
-                assert!(reason.contains("before the turn finished"), "{reason}")
-            }
-            other => panic!("expected a failure, got {other:?}"),
+        .expect("the turn started");
+
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(60 * 60 + 1)).await;
+        // Let the turn observe the moved clock before the child speaks, so an
+        // elapsed timer cannot race the completion and hide the regression.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
         }
+        tokio::time::resume();
+        std::fs::write(server.file("release-quiet"), "go").unwrap();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(10), turn)
+            .await
+            .expect("the turn finished")
+            .unwrap()
+            .expect("no transport error");
+        assert!(outcome.is_completed(), "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn a_stop_before_the_turn_start_reply_still_learns_which_turn_to_stop() {
+        // Codex has the prompt as soon as `turn/start` is written. A Stop that
+        // dropped the turn before the reply used to forget it: the prompt read
+        // as never sent, and the interrupt named no turn at all.
+        let Some(server) = FakeServer::new() else {
+            return;
+        };
+        let mut session = session_with(&server, &[]).await;
+        let thread_id = session.thread_id().to_string();
+        let dropped = tokio::time::timeout(
+            Duration::from_millis(50),
+            session.run_turn(&TurnRequest::new(&thread_id, "slow-ack", "/tmp"), |_| {}),
+        )
+        .await;
+        assert!(dropped.is_err(), "the reply arrived before the stop");
+        assert!(!session.prompt_accepted());
+
+        session.interrupt().await.expect("interrupted");
+        assert!(
+            session.prompt_accepted(),
+            "the late reply was not collected"
+        );
+        let interrupt = server
+            .handshake()
+            .into_iter()
+            .find(|entry| entry["method"] == "turn/interrupt")
+            .expect("an interrupt was sent");
+        assert_eq!(interrupt["params"]["turnId"], "turn-1");
     }
 
     #[tokio::test]
@@ -978,7 +1226,7 @@ mod tests {
         let Some(server) = FakeServer::new() else {
             return;
         };
-        let session = session_with(&server, &[]).await;
+        let mut session = session_with(&server, &[]).await;
         // The turn is over; asking to interrupt must not panic or hang.
         let _ = session.interrupt().await;
     }
@@ -1054,13 +1302,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn interactive_approval_waits_past_silence_budget_and_uses_modern_wire_shape() {
+    async fn interactive_approval_waits_for_the_user_and_uses_modern_wire_shape() {
         let Some(server) = FakeServer::new() else {
             return;
         };
-        let mut session = interactive_session(&server)
-            .await
-            .with_timeouts(Duration::from_secs(3), Duration::from_millis(100));
+        let mut session = interactive_session(&server).await;
         let thread = session.thread_id().to_owned();
         let (sender, mut responses) = mpsc::unbounded_channel();
         let mut resolved = Vec::new();
@@ -1244,6 +1490,40 @@ mod tests {
         assert!(policy.allows("webSearch", &json!({ "arguments": {} })));
         // Nothing unknown is auto-approved.
         assert!(!policy.allows("someNewTool", &json!({ "arguments": {} })));
+        // The shapes that used to slip through: a write flag, a second command,
+        // and an argv whose quotes would hide one once joined.
+        for command in [
+            json!("find . -delete"),
+            json!("ls & rm -rf x"),
+            json!("cat x\nrm y"),
+            json!(["find", ".", "'", "-delete", "'"]),
+        ] {
+            assert!(
+                !policy.allows("commandExecution", &json!({ "command": command })),
+                "{command} was approved"
+            );
+        }
+        assert!(policy.allows(
+            "commandExecution",
+            &json!({ "command": "/bin/zsh -lc 'rg -n foo src'" })
+        ));
+    }
+
+    #[test]
+    fn claude_tools_are_judged_by_claudes_own_names() {
+        // `allows` knows only Codex's names, so every Claude tool — `Read`
+        // included — was refused under the read-only policy.
+        let policy = ApprovalPolicy::DenyUnlessReadOnly;
+        for tool in ["Read", "Grep", "Glob", "LS"] {
+            assert!(policy.allows_claude_tool(tool, &json!({})), "{tool}");
+        }
+        assert!(policy.allows_claude_tool("Bash", &json!({ "command": "git status" })));
+        assert!(!policy.allows_claude_tool("Bash", &json!({ "command": "git push" })));
+        for tool in ["Edit", "Write", "MultiEdit", "NotebookEdit", "SomethingNew"] {
+            assert!(!policy.allows_claude_tool(tool, &json!({})), "{tool}");
+        }
+        assert!(ApprovalPolicy::AllowAll.allows_claude_tool("Write", &json!({})));
+        assert!(!ApprovalPolicy::DenyAll.allows_claude_tool("Read", &json!({})));
     }
 
     #[test]

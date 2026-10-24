@@ -478,11 +478,53 @@ pub fn compact_action_button(
     icon: Option<Icon>,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
+    compact_action_toggle(label, icon, false, true, on_click)
+}
+
+/// How a compact action looks: `(foreground, background, border)`.
+pub fn compact_action_palette(
+    selected: bool,
+    hovered: bool,
+    theme: &crate::theme::Theme,
+) -> (gpui::Rgba, gpui::Rgba, gpui::Rgba) {
+    if selected {
+        (
+            Colors::fg(theme),
+            Colors::bg_selected(theme),
+            Colors::border_medium(theme),
+        )
+    } else if hovered {
+        (
+            Colors::fg(theme),
+            Colors::bg_hover(theme),
+            Colors::border_subtle(theme),
+        )
+    } else {
+        (
+            Colors::fg_secondary(theme),
+            Colors::bg_elevated(theme),
+            Colors::border_subtle(theme),
+        )
+    }
+}
+
+/// A compact action that can show an on state, such as a panel it reveals,
+/// or be disabled while the work it starts is still running.
+pub fn compact_action_toggle(
+    label: impl Into<SharedString>,
+    icon: Option<Icon>,
+    selected: bool,
+    enabled: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
     let theme = global::current();
     let label = label.into();
     let button_id: SharedString = format!("compact-action:{label}").into();
+    let debug_label = button_id.to_string();
+    let (foreground, background, border) = compact_action_palette(selected, false, &theme);
 
     let mut content = div()
+        .debug_selector(move || debug_label)
         .flex()
         .flex_row()
         .flex_shrink_0()
@@ -490,7 +532,7 @@ pub fn compact_action_button(
         .justify_center()
         .gap(px_len(Spacing::XXS));
     if let Some(i) = icon {
-        content = content.child(i.render(IconSize::Micro, Colors::fg_secondary(&theme), &theme));
+        content = content.child(i.render(IconSize::Micro, foreground, &theme));
     }
     content = content
         .child(
@@ -503,16 +545,105 @@ pub fn compact_action_button(
         .min_h(px_len(Layout::CONTROL_COMPACT_HEIGHT))
         .rounded(px_len(Radii::SM))
         .border(px_len(BorderWidth::HAIRLINE))
-        .border_color(Colors::border_subtle(&theme))
-        .bg(Colors::bg_elevated(&theme))
-        .text_color(Colors::fg_secondary(&theme));
+        .border_color(border)
+        .bg(background)
+        .text_color(foreground)
+        .opacity(if enabled { 1.0 } else { DISABLED_OPACITY });
 
     content
         .id(button_id)
-        .hover(|s: StyleRefinement| {
-            s.fx_background(Colors::bg_hover(&theme))
-                .fx_text_color(Colors::fg(&theme))
+        .hover(move |s: StyleRefinement| {
+            if !enabled || selected {
+                return s;
+            }
+            let (foreground, background, _) = compact_action_palette(false, true, &theme);
+            s.fx_background(background).fx_text_color(foreground)
         })
+        .active(move |s| {
+            if enabled {
+                s.fx_opacity(PRESSED_OPACITY)
+            } else {
+                s
+            }
+        })
+        .cursor(if enabled {
+            CursorStyle::PointingHand
+        } else {
+            CursorStyle::default()
+        })
+        .on_click(move |event, window, cx| {
+            if enabled {
+                on_click(event, window, cx);
+            }
+        })
+}
+
+/// A glyph-sized action for rows too dense for an icon button's hit target,
+/// such as a diff file header that shares the code rows' height.
+///
+/// The click stops propagating, so a glyph inside a clickable row does not
+/// also trigger the row.
+pub fn glyph_button(
+    id: impl Into<SharedString>,
+    icon: Icon,
+    label: impl Into<SharedString>,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let theme = global::current();
+    let label = label.into();
+    let debug_label = format!("glyph-button:{label}");
+    div()
+        .debug_selector(move || debug_label.clone())
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .p(px_len(Spacing::XXXS))
+        .rounded(px_len(Radii::XS))
+        .child(icon.render(IconSize::Small, Colors::fg_tertiary(&theme), &theme))
+        .id(id.into())
+        .hover(|s: StyleRefinement| s.fx_background(Colors::bg_hover(&theme)))
+        .active(|s| s.fx_opacity(PRESSED_OPACITY))
+        .cursor(CursorStyle::PointingHand)
+        .tooltip(move |window, cx| crate::components::tooltip::tooltip(label.clone(), window, cx))
+        .on_click(move |event, window, cx| {
+            cx.stop_propagation();
+            on_click(event, window, cx);
+        })
+}
+
+/// A text-only disclosure, such as "Show full message".
+///
+/// No chrome at all: it reads as part of the content it expands rather than as
+/// a toolbar control, which is how the original drew it under a long prompt.
+pub fn text_disclosure(
+    label: impl Into<SharedString>,
+    expanded: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    let theme = global::current();
+    let label = label.into();
+    let chevron = if expanded {
+        Icon::CHEVRON_UP
+    } else {
+        Icon::CHEVRON_DOWN
+    };
+    div()
+        .flex()
+        .flex_row()
+        .flex_shrink_0()
+        .items_center()
+        .gap(px_len(Spacing::XS))
+        .text_color(Colors::fg_secondary(&theme))
+        .child(
+            div()
+                .whitespace_nowrap()
+                .fx_role(TextRole::CaptionMedium)
+                .child(label.clone()),
+        )
+        .child(chevron.render(IconSize::Micro, Colors::fg_secondary(&theme), &theme))
+        .id(SharedString::from(format!("disclosure:{label}")))
+        .hover(|s: StyleRefinement| s.fx_text_color(Colors::fg(&theme)))
         .active(|s| s.fx_opacity(PRESSED_OPACITY))
         .cursor(CursorStyle::PointingHand)
         .on_click(on_click)
@@ -806,6 +937,23 @@ mod tests {
                         icon_button_palette(variant, selected, hovered, true, Some(tint), &theme);
                     assert_eq!(p.foreground, tint, "tint was overridden");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn a_selected_compact_action_reads_as_on_in_every_theme() {
+        for theme in themes() {
+            let (rest_fg, rest_bg, _) = compact_action_palette(false, false, &theme);
+            let (on_fg, on_bg, _) = compact_action_palette(true, false, &theme);
+            let (_, hover_bg, _) = compact_action_palette(false, true, &theme);
+            assert_ne!(rest_bg, on_bg);
+            assert_ne!(rest_bg, hover_bg, "no hover feedback");
+            // The fills are translucent washes over the elevated panel.
+            let panel = Colors::bg_elevated(&theme);
+            for (fg, bg) in [(on_fg, on_bg), (rest_fg, rest_bg)] {
+                let fill = crate::theme::composite(bg, panel);
+                assert!(crate::theme::contrast(fg, fill) >= 4.5);
             }
         }
     }

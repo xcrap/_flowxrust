@@ -103,6 +103,57 @@ pub(crate) fn settled_state(outcome: &fx_agent::codex::TurnOutcome) -> AgentExec
     }
 }
 
+/// Whether a finished turn is called out until its thread is opened.
+///
+/// Only a completed turn the reader was not looking at. A failure keeps its
+/// own mark in the status tile for as long as it is the saved outcome, and a
+/// cancelled turn was stopped by the reader, who has nothing new to see.
+pub(crate) fn completion_needs_attention(
+    outcome: &fx_agent::codex::TurnOutcome,
+    selected: bool,
+) -> bool {
+    !selected && matches!(outcome, fx_agent::codex::TurnOutcome::Completed { .. })
+}
+
+/// Whether a row shows the unseen-completion dot beside its status tile.
+///
+/// The dot qualifies the tile's checkmark — finished, and not opened since —
+/// so it is drawn only while the tile shows that outcome. A thread that starts
+/// another turn, or whose saved outcome is gone, shows the tile alone.
+pub(crate) fn shows_unseen_completion(
+    unseen: bool,
+    selected: bool,
+    activity: ActivityState,
+) -> bool {
+    unseen && !selected && activity == ActivityState::Completed
+}
+
+/// The provider's own id for a thread, when it has one yet.
+///
+/// The loaded conversation is preferred because it learns a new session's id
+/// the moment the turn starts; the binding covers threads never opened here.
+pub(crate) fn provider_thread_id(state: &AppState, agent_id: uuid::Uuid) -> Option<String> {
+    state
+        .conversation_by_agent(agent_id)
+        .and_then(|conversation| {
+            conversation
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .session_id()
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            state
+                .snapshot
+                .projects
+                .iter()
+                .flat_map(|record| &record.native_bindings)
+                .find(|binding| binding.agent_id == agent_id)
+                .map(|binding| binding.session_id.clone())
+        })
+        .filter(|id| !id.trim().is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,5 +249,57 @@ mod tests {
             activity(None, false, AgentExecutionState::Running).0,
             ActivityState::Idle
         );
+    }
+
+    #[test]
+    fn only_a_completed_turn_away_from_the_reader_needs_attention() {
+        use fx_agent::codex::TurnOutcome;
+        let completed = TurnOutcome::Completed {
+            thread_id: "thread".into(),
+            stop_reason: "end_turn".into(),
+            events: Vec::new(),
+        };
+        assert!(completion_needs_attention(&completed, false));
+        assert!(!completion_needs_attention(&completed, true));
+        for outcome in [
+            TurnOutcome::Failed {
+                thread_id: "thread".into(),
+                reason: "boom".into(),
+                events: Vec::new(),
+            },
+            TurnOutcome::Cancelled {
+                thread_id: "thread".into(),
+                events: Vec::new(),
+            },
+        ] {
+            assert!(!completion_needs_attention(&outcome, false), "{outcome:?}");
+        }
+    }
+
+    #[test]
+    fn the_unseen_dot_only_qualifies_a_completed_tile_on_another_row() {
+        assert!(shows_unseen_completion(
+            true,
+            false,
+            ActivityState::Completed
+        ));
+        assert!(!shows_unseen_completion(
+            true,
+            true,
+            ActivityState::Completed
+        ));
+        assert!(!shows_unseen_completion(
+            false,
+            false,
+            ActivityState::Completed
+        ));
+        for activity in ActivityState::ALL {
+            if activity != ActivityState::Completed {
+                assert!(
+                    !shows_unseen_completion(true, false, activity),
+                    "{activity:?}"
+                );
+            }
+        }
     }
 }

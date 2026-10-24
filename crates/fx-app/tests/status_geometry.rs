@@ -131,7 +131,7 @@ fn menu_rows_grow_to_fit_their_supporting_label() {
     assert!(row.size.height > px(28.0));
 }
 
-struct ProviderProbe(ActivityState);
+struct ProviderProbe(ActivityState, ContextUsage);
 
 impl Render for ProviderProbe {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
@@ -144,39 +144,59 @@ impl Render for ProviderProbe {
                 self.0,
                 "Status",
             ))
-            .child(context_meter(
-                ContextUsage {
-                    used: Some(50_000),
-                    limit: Some(200_000),
-                },
-                ProviderIdentity::Claude,
-            ))
+            .child(context_meter(self.1, ProviderIdentity::Claude))
     }
 }
 
 #[test]
 fn live_provider_states_paint_without_moving_or_growing_the_context_control() {
+    // Every activity against every kind of label: unreported, short, and the
+    // widest. A fixed usage could not catch a label that wraps or pushes the
+    // tile, and a fixed-size tile cannot grow on its own.
+    let usages = [
+        ("—", None, Some(200_000)),
+        ("5%", Some(10_000), Some(200_000)),
+        ("100%", Some(250_000), Some(200_000)),
+    ];
     let mut test = gpui::TestAppContext::single();
-    let window = test.add_window(|_, _| ProviderProbe(ActivityState::Idle));
+    let window =
+        test.add_window(|_, _| ProviderProbe(ActivityState::Idle, ContextUsage::default()));
     let mut visual = gpui::VisualTestContext::from_window(window.into(), &test);
-    let mut initial = None;
-    for activity in ActivityState::ALL {
-        window
-            .update(&mut test, |probe, _, cx| {
-                probe.0 = activity;
-                cx.notify();
-            })
-            .unwrap();
-        test.refresh().unwrap();
-        let tile = visual.debug_bounds("provider-status").unwrap();
-        let meter = visual.debug_bounds("composer-context").unwrap();
-        assert_eq!(tile.size, gpui::size(px(20.0), px(20.0)));
-        assert!(tile.right() <= meter.left());
-        assert!(meter.size.width < px(65.0));
-        if let Some(previous) = initial {
-            assert_eq!((tile, meter), previous);
+    let mut first_tile = None;
+    let mut first_meter = None;
+    for (label, used, limit) in usages {
+        let usage = ContextUsage { used, limit };
+        assert_eq!(usage.label(), label);
+        let mut same_usage = None;
+        for activity in ActivityState::ALL {
+            window
+                .update(&mut test, |probe, _, cx| {
+                    *probe = ProviderProbe(activity, usage);
+                    cx.notify();
+                })
+                .unwrap();
+            test.refresh().unwrap();
+            let tile = visual.debug_bounds("provider-status").unwrap();
+            let meter = visual.debug_bounds("composer-context").unwrap();
+            assert_eq!(tile.size, gpui::size(px(20.0), px(20.0)));
+            assert!(tile.right() <= meter.left(), "{label} {activity:?}");
+            assert!(meter.size.width < px(65.0), "{label}: {meter:?}");
+            // The activity never moves or resizes either control.
+            if let Some(previous) = same_usage {
+                assert_eq!((tile, meter), previous, "{label} {activity:?}");
+            }
+            same_usage = Some((tile, meter));
+            // The label only widens the meter to its right: the tile and the
+            // meter's leading edge, height, and vertical place all hold.
+            let tile_origin = *first_tile.get_or_insert(tile);
+            assert_eq!(tile, tile_origin, "{label} {activity:?}");
+            let (origin, height) = *first_meter.get_or_insert((meter.origin, meter.size.height));
+            assert_eq!(
+                (meter.origin, meter.size.height),
+                (origin, height),
+                "{label} {activity:?}"
+            );
         }
-        initial = Some((tile, meter));
     }
 }
 

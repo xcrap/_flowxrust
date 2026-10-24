@@ -44,6 +44,7 @@ pub fn handle(cx: &mut App) -> Entity<WorkspaceUi> {
 
 pub fn has_modal(state: &Entity<AppState>, cx: &App) -> bool {
     state.read(cx).picker.is_some()
+        || state.read(cx).palette.is_some()
         || cx.try_global::<UiHandle>().is_some_and(|handle| {
             let ui = handle.0.read(cx);
             ui.settings.is_some() || ui.thread_dialog.is_some() || ui.request.is_some()
@@ -95,6 +96,7 @@ fn apply_settings(
         codex_defaults: defaults.0,
         claude_defaults: defaults.1,
         auto_titles,
+        follow_up_mode: state.read(cx).preferences.follow_up_mode.clone(),
     };
     match state.read(cx).store.save_preferences(&saved) {
         Err(error) => {
@@ -175,6 +177,9 @@ pub fn open_settings(state: Entity<AppState>, window: &mut Window, cx: &mut App)
         cx,
     );
     let apply_titles = title_settings.clone();
+    let follow_up =
+        crate::follow_up_settings::FollowUpSettings::new(state.read(cx).follow_up_mode(), cx);
+    let apply_follow_up = follow_up.clone();
     let baseline = SettingsDraft::from_theme(&global::current());
     let sheet = SettingsSheet::open(
         window,
@@ -182,6 +187,7 @@ pub fn open_settings(state: Entity<AppState>, window: &mut Window, cx: &mut App)
         Box::new(move |draft, window, cx| {
             let defaults = apply_defaults.read(cx).values();
             let auto_titles = apply_titles.read(cx).values();
+            let follow_up = apply_follow_up.read(cx).value();
             apply_settings(
                 &state,
                 &apply_ui,
@@ -191,6 +197,7 @@ pub fn open_settings(state: Entity<AppState>, window: &mut Window, cx: &mut App)
                 auto_titles,
                 cx,
             );
+            save_follow_up(&state, follow_up, cx);
             window.blur();
         }),
         Box::new(move |window, cx| {
@@ -209,10 +216,30 @@ pub fn open_settings(state: Entity<AppState>, window: &mut Window, cx: &mut App)
         sheet.set_archives(archives);
         sheet.set_provider_defaults(defaults, cx);
         sheet.set_title_settings(title_settings, cx);
+        sheet.set_follow_up_settings(follow_up, cx);
     });
     ui.update(cx, |ui, cx| {
         ui.settings = Some(sheet);
         ui.recheck(cx);
+    });
+}
+
+/// Persist the "While responding" choice, when it changed.
+///
+/// Saved after the rest of the sheet rather than threaded through
+/// `apply_settings`, which every settings test calls with its own arguments.
+fn save_follow_up(state: &Entity<AppState>, mode: crate::state::FollowUp, cx: &mut App) {
+    if state.read(cx).follow_up_mode() == mode {
+        return;
+    }
+    state.update(cx, |state, cx| {
+        let mut saved = state.preferences.clone();
+        saved.follow_up_mode = mode.preference().into();
+        match state.store.save_preferences(&saved) {
+            Ok(()) => state.preferences = saved,
+            Err(error) => state.last_error = Some(format!("Could not save settings: {error}")),
+        }
+        cx.notify();
     });
 }
 
@@ -1071,6 +1098,66 @@ mod tests {
                     .agent_access,
                 Some(fx_core::AgentAccess::Supervised)
             );
+        });
+    }
+
+    #[test]
+    fn the_while_responding_choice_saves_on_done_and_not_on_escape() {
+        use gpui::{VisualTestContext, px, size};
+        let temp = tempfile::tempdir().unwrap();
+        let mut test = gpui::TestAppContext::single();
+        let (_health_sender, health_receiver) = mpsc::channel();
+        let state = test.update(|cx| {
+            let ui = handle(cx);
+            ui.update(cx, |ui, _| ui.health_results = Some(health_receiver));
+            let state = state(cx, temp.path());
+            crate::AppHandle::install(state.clone(), cx);
+            state
+        });
+        let for_view = state.clone();
+        let window = test.add_window(move |_, _| crate::FlowX::new(for_view));
+        let mut visual = VisualTestContext::from_window(window.into(), &test);
+        visual.simulate_resize(size(px(1280.0), px(900.0)));
+        test.refresh().unwrap();
+        let choose_queue = |test: &mut gpui::TestAppContext| {
+            window
+                .update(test, |_, window, cx| {
+                    open_settings(state.clone(), window, cx)
+                })
+                .unwrap();
+            test.refresh().unwrap();
+            test.update(|cx| {
+                let sheet = handle(cx).read(cx).settings.clone().unwrap();
+                let editor = sheet.read(cx).follow_up_settings().unwrap();
+                editor.update(cx, |editor, cx| {
+                    editor.set(crate::state::FollowUp::Queue, cx)
+                });
+            });
+            test.update(|cx| {
+                let sheet = handle(cx).read(cx).settings.clone().unwrap();
+                assert!(sheet.read(cx).is_dirty(), "the choice is a change to apply");
+            });
+            test.refresh().unwrap();
+        };
+
+        choose_queue(&mut test);
+        visual.simulate_keystrokes("escape");
+        test.read(|cx| {
+            assert_eq!(
+                state.read(cx).follow_up_mode(),
+                crate::state::FollowUp::Steer
+            );
+        });
+
+        choose_queue(&mut test);
+        visual.simulate_keystrokes("enter");
+        test.read(|cx| {
+            assert_eq!(
+                state.read(cx).follow_up_mode(),
+                crate::state::FollowUp::Queue
+            );
+            let saved = state.read(cx).store.load_preferences().unwrap();
+            assert_eq!(saved.follow_up_mode, "queue");
         });
     }
 

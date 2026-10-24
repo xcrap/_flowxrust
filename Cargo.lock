@@ -2118,6 +2118,7 @@ dependencies = [
  "base64",
  "chrono",
  "fx-core",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
@@ -2189,6 +2190,7 @@ version = "0.1.0"
 dependencies = [
  "directories",
  "fx-core",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",

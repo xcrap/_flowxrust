@@ -1,12 +1,12 @@
 //! Live project Git summary in the title bar, independent of inspector visibility.
-
-use std::path::PathBuf;
-use std::time::Duration;
+//!
+//! It shares the inspector's [`RepositoryMonitor`] rather than polling on its
+//! own, so the title bar and the inspector can never disagree about the tree.
 
 use gpui::prelude::*;
-use gpui::{AnyElement, AnyView, App, Context, Entity, Task, Window, div};
+use gpui::{AnyElement, AnyView, App, Context, Entity, Subscription, Window, div};
 
-use crate::inspector::repository::{self, Snapshot};
+use crate::inspector::monitor::{self, RepositoryMonitor};
 use crate::state::AppState;
 
 #[derive(Clone)]
@@ -15,14 +15,9 @@ impl gpui::Global for ChangesHandle {}
 
 struct ProjectChanges {
     state: Entity<AppState>,
-    source: Option<String>,
-    generation: u64,
-    was_busy: bool,
+    monitor: Entity<RepositoryMonitor>,
     inspector_visible: bool,
-    snapshot: Option<Snapshot>,
-    loading: bool,
-    read_task: Option<Task<()>>,
-    poll_task: Option<Task<()>>,
+    _observation: Subscription,
 }
 
 pub(crate) fn view(state: Entity<AppState>, cx: &mut App) -> AnyElement {
@@ -31,7 +26,8 @@ pub(crate) fn view(state: Entity<AppState>, cx: &mut App) -> AnyElement {
         .map(|handle| handle.0.clone())
         .filter(|changes| changes.read(cx).state == state);
     let changes = existing.unwrap_or_else(|| {
-        let changes = cx.new(|_| ProjectChanges::new(state));
+        let monitor = monitor::shared(&state, cx);
+        let changes = cx.new(|cx| ProjectChanges::new(state, monitor, cx));
         cx.set_global(ChangesHandle(changes.clone()));
         changes
     });
@@ -40,97 +36,39 @@ pub(crate) fn view(state: Entity<AppState>, cx: &mut App) -> AnyElement {
 }
 
 impl ProjectChanges {
-    fn new(state: Entity<AppState>) -> Self {
+    fn new(
+        state: Entity<AppState>,
+        monitor: Entity<RepositoryMonitor>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let observation = cx.observe(&monitor, |_, _, cx| cx.notify());
         Self {
             state,
-            source: None,
-            generation: 0,
-            was_busy: false,
+            monitor,
             inspector_visible: false,
-            snapshot: None,
-            loading: false,
-            read_task: None,
-            poll_task: None,
+            _observation: observation,
         }
     }
 
     fn sync(&mut self, cx: &mut Context<Self>) {
-        let state = self.state.read(cx);
-        let source = state
-            .active_project()
-            .map(|project| project.root_path.clone());
-        let busy = state.is_busy();
-        let inspector_visible = state.snapshot.right_panel_visible;
+        self.monitor.update(cx, |monitor, cx| monitor.sync(cx));
+        let inspector_visible = self.state.read(cx).snapshot.right_panel_visible;
         if self.inspector_visible != inspector_visible {
             self.inspector_visible = inspector_visible;
             cx.notify();
         }
-        if self.source != source {
-            self.source = source;
-            self.generation += 1;
-            self.read_task = None;
-            self.loading = false;
-            self.snapshot = None;
-            self.refresh(cx);
-            cx.notify();
-        } else if self.was_busy && !busy {
-            self.refresh(cx);
-        }
-        self.was_busy = busy;
-        if self.poll_task.is_none() {
-            self.poll_task = Some(cx.spawn(async move |this, cx| {
-                loop {
-                    gpui::Timer::after(Duration::from_secs(5)).await;
-                    if this.update(cx, |this, cx| this.refresh(cx)).is_err() {
-                        break;
-                    }
-                }
-            }));
-        }
-    }
-
-    fn refresh(&mut self, cx: &mut Context<Self>) {
-        let Some(root) = self.source.clone() else {
-            return;
-        };
-        if self.loading {
-            return;
-        }
-        self.loading = true;
-        let generation = self.generation;
-        let task = repository::spawn_read(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| error.to_string())?;
-            runtime.block_on(repository::changes_snapshot(&PathBuf::from(root)))
-        });
-        self.read_task = Some(cx.spawn(async move |this, cx| {
-            let result = repository::finish_read(task).await;
-            let _ = this.update(cx, |this, cx| this.complete_read(generation, result, cx));
-        }));
-    }
-
-    fn complete_read(
-        &mut self,
-        generation: u64,
-        result: Result<Snapshot, String>,
-        cx: &mut Context<Self>,
-    ) {
-        if self.generation != generation {
-            return;
-        }
-        self.loading = false;
-        // Never present stale line totals as current after a failed read. The
-        // inspector remains accessible through its permanent toolbar control.
-        self.snapshot = result.ok();
-        cx.notify();
     }
 }
 
 impl Render for ProjectChanges {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let Some(snapshot) = &self.snapshot else {
+        let monitor = self.monitor.read(cx);
+        // Never present stale line totals as current after a failed read. The
+        // inspector remains accessible through its permanent toolbar control.
+        if monitor.error().is_some() {
+            return div().into_any_element();
+        }
+        let Some(snapshot) = monitor.snapshot() else {
             return div().into_any_element();
         };
         let Some(repo) = snapshot
@@ -154,17 +92,18 @@ impl Render for ProjectChanges {
             detail.push('\n');
             detail.push_str(notice);
         }
+        let (additions, deletions, files) = (repo.additions, repo.deletions, repo.files.len());
         let state = self.state.clone();
         fx_design::components::change_indicator(
-            if partial { 0 } else { repo.additions },
-            if partial { 0 } else { repo.deletions },
-            repo.files.len(),
+            if partial { 0 } else { additions },
+            if partial { 0 } else { deletions },
+            files,
             state.read(cx).snapshot.right_panel_visible,
             detail,
             move |_, _, cx| {
                 state.update(cx, |state, cx| {
                     state.toggle_inspector();
-                    state.save();
+                    state.save_after_panel_moves(cx);
                     cx.notify();
                 });
             },
@@ -175,7 +114,9 @@ impl Render for ProjectChanges {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inspector::repository::{self, Snapshot};
     use gpui::px;
+
     fn git(root: &std::path::Path, args: &[&str]) {
         let output = std::process::Command::new(fx_core::git::GIT)
             .args(args)
@@ -217,6 +158,19 @@ mod tests {
         test.update(|cx| cx.new(|cx| AppState::restore(fx_store::AppPaths::at(path), cx)))
     }
 
+    /// A title bar whose monitor holds `snapshot`.
+    fn changes_with(
+        test: &mut gpui::TestAppContext,
+        state: &Entity<AppState>,
+        snapshot: Snapshot,
+    ) -> Entity<ProjectChanges> {
+        test.update(|cx| {
+            let monitor = cx.new(|_| RepositoryMonitor::new(state.clone()));
+            monitor.update(cx, |monitor, cx| monitor.complete_read(0, Ok(snapshot), cx));
+            cx.new(|cx| ProjectChanges::new(state.clone(), monitor, cx))
+        })
+    }
+
     struct TestView(Entity<ProjectChanges>);
     impl Render for TestView {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
@@ -237,13 +191,7 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let mut test = gpui::TestAppContext::single();
         let state = state(&mut test, data.path());
-        let changes = test.update(|cx| {
-            cx.new(|_| {
-                let mut changes = ProjectChanges::new(state.clone());
-                changes.snapshot = Some(snapshot(root.path()));
-                changes
-            })
-        });
+        let changes = changes_with(&mut test, &state, snapshot(root.path()));
         let mounted = changes.clone();
         let window = test.add_window(move |_, _| TestView(mounted));
         let mut visual = gpui::VisualTestContext::from_window(window.into(), &test);
@@ -264,8 +212,9 @@ mod tests {
             test.update(|_| {});
         }
         std::fs::write(root.path().join("sample.txt"), "original\n").unwrap();
-        changes.update(&mut test, |changes, cx| {
-            changes.complete_read(0, Ok(snapshot(root.path())), cx)
+        let monitor = test.read(|cx| changes.read(cx).monitor.clone());
+        monitor.update(&mut test, |monitor, cx| {
+            monitor.complete_read(0, Ok(snapshot(root.path())), cx)
         });
         test.refresh().unwrap();
         test.update(|_| {});
@@ -278,49 +227,21 @@ mod tests {
     }
 
     #[test]
-    fn switched_project_rejects_previous_counts_and_failed_reads_drop_stale_totals() {
+    fn a_failed_read_hides_stale_totals() {
         let root = repo();
         std::fs::write(root.path().join("sample.txt"), "edited\n").unwrap();
-        let other = repo();
         let data = tempfile::tempdir().unwrap();
         let mut test = gpui::TestAppContext::single();
         let state = state(&mut test, data.path());
-        state.update(&mut test, |state, _| {
-            state.add_project(&root.path().to_string_lossy());
+        let changes = changes_with(&mut test, &state, snapshot(root.path()));
+        let monitor = test.read(|cx| changes.read(cx).monitor.clone());
+        monitor.update(&mut test, |monitor, cx| {
+            monitor.complete_read(0, Err("read failed".into()), cx)
         });
-        let changes = test.update(|cx| cx.new(|_| ProjectChanges::new(state.clone())));
-        let generation = changes.update(&mut test, |changes, cx| {
-            changes.sync(cx);
-            changes.complete_read(changes.generation, Ok(snapshot(root.path())), cx);
-            assert!(changes.snapshot.is_some());
-            changes.generation
-        });
-        state.update(&mut test, |state, _| {
-            state.add_project(&other.path().to_string_lossy());
-        });
-        changes.update(&mut test, |changes, cx| {
-            changes.sync(cx);
-            assert!(changes.snapshot.is_none());
-            changes.complete_read(generation, Ok(snapshot(root.path())), cx);
-            assert!(
-                changes.snapshot.is_none(),
-                "the previous project's read must be ignored"
-            );
-            changes.complete_read(changes.generation, Ok(snapshot(other.path())), cx);
-            assert!(
-                changes
-                    .snapshot
-                    .as_ref()
-                    .unwrap()
-                    .repository
-                    .as_ref()
-                    .unwrap()
-                    .files
-                    .is_empty()
-            );
-            changes.complete_read(changes.generation, Err("read failed".into()), cx);
-            assert!(changes.snapshot.is_none());
-        });
+        let window = test.add_window(move |_, _| TestView(changes));
+        test.refresh().unwrap();
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), &test);
+        assert!(visual.debug_bounds("project-change-indicator").is_none());
     }
 
     #[test]
@@ -332,18 +253,40 @@ mod tests {
         let state = state(&mut test, data.path());
         let mut snapshot = snapshot(root.path());
         snapshot.notice = Some("Line counts are incomplete".into());
-        let changes = test.update(|cx| {
-            cx.new(|_| {
-                let mut changes = ProjectChanges::new(state);
-                changes.snapshot = Some(snapshot);
-                changes
-            })
-        });
+        let changes = changes_with(&mut test, &state, snapshot);
         let window = test.add_window(move |_, _| TestView(changes));
         test.refresh().unwrap();
         let mut visual = gpui::VisualTestContext::from_window(window.into(), &test);
         assert!(visual.debug_bounds("project-change-indicator").is_some());
         assert!(visual.debug_bounds("project-added-count").is_none());
         assert!(visual.debug_bounds("project-deleted-count").is_none());
+    }
+
+    #[test]
+    fn the_title_bar_and_the_inspector_share_one_poller() {
+        let root = repo();
+        let data = tempfile::tempdir().unwrap();
+        let mut test = gpui::TestAppContext::single();
+        let state = state(&mut test, data.path());
+        state.update(&mut test, |state, _| {
+            state.add_project(&root.path().to_string_lossy());
+            state.toggle_inspector();
+        });
+        test.update(|cx| {
+            assert!(state.read(cx).snapshot.right_panel_visible);
+            let _ = view(state.clone(), cx);
+            let _ = crate::inspector::view(state.clone(), cx);
+            // Both again, as every frame does.
+            let _ = view(state.clone(), cx);
+            let _ = crate::inspector::view(state.clone(), cx);
+            let monitor = monitor::shared(&state, cx);
+            let title = cx.global::<ChangesHandle>().0.read(cx).monitor.clone();
+            assert_eq!(title, monitor, "the title bar must use the shared monitor");
+            assert_eq!(
+                monitor.read(cx).reads(),
+                1,
+                "opening a project reads it once, not once per view"
+            );
+        });
     }
 }

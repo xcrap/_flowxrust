@@ -1,11 +1,11 @@
 //! A small context gauge, independent of the send/stop action.
 
 use gpui::prelude::*;
-use gpui::{PathBuilder, canvas, div, point, px};
+use gpui::{PathBuilder, Rgba, canvas, div, point, px};
 
 use super::ProviderIdentity;
 use crate::styled::FxStyled;
-use crate::theme::{Colors, Layout, Radii, Spacing, TextRole, global};
+use crate::theme::{Colors, Layout, Radii, Spacing, TextRole, Theme, global};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ContextUsage {
@@ -58,15 +58,44 @@ fn tokens(value: u64) -> String {
     format!("{grouped} tokens")
 }
 
+/// Fractions of the context window at which the arc turns to a warning, then
+/// to an error.
+const CONTEXT_WARNING_AT: f32 = 0.75;
+const CONTEXT_CRITICAL_AT: f32 = 0.9;
+
+/// What the gauge paints, split out so it can be asserted without a window.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ContextMeterPalette {
+    /// The filled arc, which alone says how full the context is.
+    pub ring: Rgba,
+    /// The unfilled circle behind it.
+    pub track: Rgba,
+}
+
+/// The gauge's colours at one usage level.
+///
+/// The warning step is `warning_ink`, not `warning`: light-mode `warning` is
+/// 2.9:1 on the composer, under the 3:1 the arc needs as the only signal.
+pub fn context_meter_palette(
+    usage: ContextUsage,
+    provider: ProviderIdentity,
+    theme: &Theme,
+) -> ContextMeterPalette {
+    let ring = match usage.fraction() {
+        Some(f) if f >= CONTEXT_CRITICAL_AT => Colors::error(theme),
+        Some(f) if f >= CONTEXT_WARNING_AT => Colors::warning_ink(theme),
+        _ => provider.color(theme),
+    };
+    ContextMeterPalette {
+        ring,
+        track: Colors::border_medium(theme),
+    }
+}
+
 pub fn context_meter(usage: ContextUsage, provider: ProviderIdentity) -> impl IntoElement {
     let theme = global::current();
     let fraction = usage.fraction();
-    let ink = match fraction {
-        Some(f) if f >= 0.9 => Colors::error(&theme),
-        Some(f) if f >= 0.75 => Colors::warning(&theme),
-        _ => provider.color(&theme),
-    };
-    let track = Colors::border_medium(&theme);
+    let ContextMeterPalette { ring: ink, track } = context_meter_palette(usage, provider, &theme);
     let detail = usage.detail();
     div()
         .id("composer.context")
@@ -148,6 +177,29 @@ mod tests {
             .fraction(),
             None
         );
+    }
+
+    #[test]
+    fn the_arc_escalates_at_three_quarters_and_nine_tenths_of_the_window() {
+        let theme = Theme::default();
+        let ring = |used: Option<u64>| {
+            context_meter_palette(
+                ContextUsage {
+                    used,
+                    limit: Some(100),
+                },
+                ProviderIdentity::Claude,
+                &theme,
+            )
+            .ring
+        };
+        let identity = ProviderIdentity::Claude.color(&theme);
+        assert_eq!(ring(None), identity);
+        assert_eq!(ring(Some(74)), identity);
+        assert_eq!(ring(Some(75)), Colors::warning_ink(&theme));
+        assert_eq!(ring(Some(89)), Colors::warning_ink(&theme));
+        assert_eq!(ring(Some(90)), Colors::error(&theme));
+        assert_eq!(ring(Some(500)), Colors::error(&theme));
     }
 
     #[test]

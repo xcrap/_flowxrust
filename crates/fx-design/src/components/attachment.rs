@@ -41,6 +41,51 @@ pub fn image_preview(image: Arc<RenderImage>, width: u32, height: u32) -> AnyEle
         .into_any_element()
 }
 
+/// Edge of a pending attachment's square thumbnail in the composer.
+pub const ATTACHMENT_CHIP_SIZE: f32 = Spacing::HUGE + Spacing::SM;
+
+/// A pending image: a square thumbnail with its remove control in the corner.
+///
+/// `image` is `None` while the thumbnail decodes, or when it cannot be; the
+/// photo glyph stands in at the same size, so the row never jumps.
+pub fn attachment_chip(image: Option<Arc<RenderImage>>, remove: AnyElement) -> AnyElement {
+    let theme = global::current();
+    let thumbnail = match image {
+        Some(image) => img(image)
+            .size_full()
+            .object_fit(ObjectFit::Cover)
+            .into_any_element(),
+        None => div()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(Icon::PHOTO.render(IconSize::Regular, Colors::fg_tertiary(&theme), &theme))
+            .into_any_element(),
+    };
+    div()
+        .debug_selector(|| "attachment.chip".into())
+        .relative()
+        .size(px(ATTACHMENT_CHIP_SIZE))
+        .flex_shrink_0()
+        .overflow_hidden()
+        .rounded(px_len(Radii::MD))
+        .border(px_len(BorderWidth::HAIRLINE))
+        .border_color(Colors::border_subtle(&theme))
+        .bg(Colors::bg_surface(&theme))
+        .child(thumbnail)
+        .child(
+            div()
+                .absolute()
+                .top(px_len(Spacing::XXXS))
+                .right(px_len(Spacing::XXXS))
+                .rounded_full()
+                .bg(Colors::bg_elevated(&theme))
+                .child(remove),
+        )
+        .into_any_element()
+}
+
 /// Missing or invalid images occupy one compact row, never the source's height.
 pub fn attachment_fallback(
     label: impl Into<SharedString>,

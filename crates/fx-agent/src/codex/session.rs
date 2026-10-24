@@ -177,6 +177,25 @@ pub fn steer_params(
     })
 }
 
+/// Parameters for `thread/goal/set`.
+///
+/// Either half may be absent: `/goal pause` changes only the status, and an
+/// objective set from the composer is always made active.
+pub fn goal_set_params(
+    thread_id: &str,
+    objective: Option<&str>,
+    status: Option<fx_core::models::goal::GoalStatus>,
+) -> Value {
+    let mut params = json!({ "threadId": thread_id });
+    if let Some(objective) = objective {
+        params["objective"] = json!(objective);
+    }
+    if let Some(status) = status {
+        params["status"] = json!(status.as_str());
+    }
+    params
+}
+
 /// Parameters for `thread/list`.
 pub fn list_threads_params(
     working_directories: &[String],
@@ -445,14 +464,17 @@ fn is_tool_item(item_type: &str) -> bool {
 }
 
 /// Risk classification for a tool call, used to decide how an approval reads.
-pub fn risk_for(item_type: &str, command: Option<&str>) -> RiskLevel {
+///
+/// `command` is the call's command in whichever form Codex sent it: a string
+/// for a shell line, or an argv array.
+pub fn risk_for(item_type: &str, command: Option<&Value>) -> RiskLevel {
     match item_type {
         "webSearch" | "imageView" | "sleep" => RiskLevel::Safe,
         "commandExecution" => {
             // A shell command can do anything; whether this one does is a
             // judgement the user makes, so it is surfaced as risky.
             match command {
-                Some(cmd) if is_read_only_command(cmd) => RiskLevel::Moderate,
+                Some(command) if is_read_only_command_value(command) => RiskLevel::Moderate,
                 _ => RiskLevel::Dangerous,
             }
         }
@@ -461,30 +483,24 @@ pub fn risk_for(item_type: &str, command: Option<&str>) -> RiskLevel {
     }
 }
 
-/// A crude read-only command check.
+/// The read-only check, shared with Claude so the two cannot disagree.
+pub use crate::shell::is_read_only_command;
+
+/// Whether a command only reads, in either of the two forms Codex sends.
 ///
-/// Deliberately conservative: anything it is unsure about is treated as
-/// dangerous, because the cost of over-warning is a confirmation dialog and the
-/// cost of under-warning is an unapproved mutation.
-pub fn is_read_only_command(command: &str) -> bool {
-    let trimmed = command.trim();
-    const READ_ONLY: [&str; 12] = [
-        "ls", "cat", "pwd", "echo", "head", "tail", "wc", "which", "whoami", "date", "grep", "find",
-    ];
-    let Some(first) = trimmed.split_whitespace().next() else {
-        return false;
-    };
-    // Strip any path prefix so /bin/ls counts.
-    let base = first.rsplit('/').next().unwrap_or(first);
-    // A pipe or redirect can chain something mutating after the read-only head.
-    if trimmed.contains('|')
-        || trimmed.contains('>')
-        || trimmed.contains(';')
-        || trimmed.contains("&&")
-    {
-        return false;
+/// An argv array is classified as argv, never joined into a line and split
+/// again: the join moves a word's boundaries wherever one element holds a
+/// quote, which is a way to hide `-delete` inside what reads as one word.
+pub fn is_read_only_command_value(command: &Value) -> bool {
+    match command {
+        Value::String(text) => is_read_only_command(text),
+        Value::Array(words) => words
+            .iter()
+            .map(Value::as_str)
+            .collect::<Option<Vec<_>>>()
+            .is_some_and(|argv| crate::shell::is_read_only_argv(&argv)),
+        _ => false,
     }
-    READ_ONLY.contains(&base)
 }
 
 /// What a failed tool that said nothing is recorded as.
@@ -613,11 +629,18 @@ pub fn parse_notification(method: &str, params: &Value) -> Vec<ProviderEvent> {
             };
             let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
             if is_ignored_item(item_type) {
-                // A compaction item is the one exception worth surfacing.
-                return if item_type == "contextCompaction" {
-                    vec![ProviderEvent::Lifecycle(Lifecycle::Compacting)]
-                } else {
-                    Vec::new()
+                // A compaction item is the one exception worth surfacing, and
+                // its completion has to end the phase its start began: mapping
+                // both to `Compacting` left a finished compaction on screen for
+                // the rest of the turn.
+                return match (item_type, method) {
+                    ("contextCompaction", "item/started") => {
+                        vec![ProviderEvent::Lifecycle(Lifecycle::Compacting)]
+                    }
+                    ("contextCompaction", _) => {
+                        vec![ProviderEvent::Lifecycle(Lifecycle::Compacted)]
+                    }
+                    _ => Vec::new(),
                 };
             }
             let id = item
@@ -666,7 +689,10 @@ pub fn parse_notification(method: &str, params: &Value) -> Vec<ProviderEvent> {
             }
 
             if method == "item/completed"
-                && let Some(text) = item.get("text").and_then(Value::as_str)
+                && let Some(text) = item
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
             {
                 return vec![ProviderEvent::Text(text.to_string())];
             }
@@ -721,22 +747,31 @@ pub fn parse_notification(method: &str, params: &Value) -> Vec<ProviderEvent> {
             let Some(usage) = usage else {
                 return Vec::new();
             };
-            // `last` is the most recent turn's usage. Its fields carry a
-            // `Tokens` suffix; the outer level adds the context window.
-            let last_usage = usage.get("last").unwrap_or(&Value::Null);
-            let count = |key: &str| last_usage.get(key).and_then(Value::as_u64).unwrap_or(0);
-            let last = Usage {
-                input_tokens: count("inputTokens"),
-                output_tokens: count("outputTokens"),
-                cached_input_tokens: count("cachedInputTokens"),
-                reasoning_output_tokens: count("reasoningOutputTokens"),
-                total_tokens: count("totalTokens"),
+            // `total` is the thread's running count and `last` the most recent
+            // request's. The conversation's totals come from `total`, as they
+            // did in Swift: adding `last` on every update counted each request
+            // again for as long as the thread was open. `last` is what fills
+            // the context window. Fields carry a `Tokens` suffix.
+            let read = |block: &Value| {
+                let count = |key: &str| block.get(key).and_then(Value::as_u64).unwrap_or(0);
+                Usage {
+                    input_tokens: count("inputTokens"),
+                    output_tokens: count("outputTokens"),
+                    cached_input_tokens: count("cachedInputTokens"),
+                    reasoning_output_tokens: count("reasoningOutputTokens"),
+                    total_tokens: count("totalTokens"),
+                }
             };
+            let mut events: Vec<ProviderEvent> = usage
+                .get("total")
+                .filter(|total| total.is_object())
+                .map(|total| ProviderEvent::CumulativeUsage(read(total)))
+                .into_iter()
+                .collect();
             let window = usage.get("modelContextWindow").and_then(Value::as_u64);
-            let mut events = vec![ProviderEvent::Usage(last)];
             if let Some(window) = window.filter(|w| *w > 0) {
                 events.push(ProviderEvent::ContextUsage {
-                    used: last.total_tokens,
+                    used: read(usage.get("last").unwrap_or(&Value::Null)).total_tokens,
                     window,
                 });
             }
@@ -760,7 +795,10 @@ pub fn parse_notification(method: &str, params: &Value) -> Vec<ProviderEvent> {
                         .to_string(),
                 )]
             } else {
-                Vec::new()
+                compaction_status(params)
+                    .map(ProviderEvent::Lifecycle)
+                    .into_iter()
+                    .collect()
             }
         }
 
@@ -788,14 +826,97 @@ pub fn parse_notification(method: &str, params: &Value) -> Vec<ProviderEvent> {
     }
 }
 
+/// Whether a thread status reports compaction starting or finishing.
+///
+/// The status has arrived as a bare string, as `{type|state|status}`, and on
+/// the thread itself, depending on the build. Swift read all of them, and so
+/// does this.
+fn compaction_status(params: &Value) -> Option<Lifecycle> {
+    let normalize = |value: &str| {
+        let value = value.trim().to_ascii_lowercase();
+        if value.contains("compacting") {
+            Some(Lifecycle::Compacting)
+        } else if value.contains("compacted") || value == "compact_boundary" {
+            Some(Lifecycle::Compacted)
+        } else {
+            None
+        }
+    };
+    let read = |value: &Value, keys: &[&str]| {
+        keys.iter()
+            .filter_map(|key| value.get(*key).and_then(Value::as_str))
+            .find_map(normalize)
+    };
+    match params.get("status") {
+        Some(Value::String(status)) => normalize(status),
+        Some(status @ Value::Object(_)) => read(status, &["type", "state", "status"]),
+        _ => None,
+    }
+    .or_else(|| {
+        params
+            .get("thread")
+            .and_then(|thread| read(thread, &["state", "status"]))
+    })
+    .or_else(|| read(params, &["state", "type"]))
+}
+
+/// The stateful half of reading one turn's notifications.
+///
+/// [`parse_notification`] reads each notification on its own, and on its own a
+/// completed `agentMessage` cannot say whether its text already streamed. Swift
+/// remembered which item ids had streamed, and so does this. A completed item
+/// that streamed ends its message, so the next one starts a new row; one that
+/// did not stream arrives whole as [`ProviderEvent::Text`].
+#[derive(Debug, Default)]
+pub struct TurnNotifications {
+    streamed: std::collections::HashSet<String>,
+    /// A delta arrived with no item id, so the next completed message is the
+    /// one it belonged to.
+    streamed_without_id: bool,
+}
+
+impl TurnNotifications {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Translate one notification, given what this turn has already seen.
+    pub fn parse(&mut self, method: &str, params: &Value) -> Vec<ProviderEvent> {
+        let events = parse_notification(method, params);
+        match method {
+            "item/agentMessage/delta" if !events.is_empty() => {
+                match params.get("itemId").and_then(Value::as_str) {
+                    Some(id) => {
+                        self.streamed.insert(id.to_owned());
+                    }
+                    None => self.streamed_without_id = true,
+                }
+            }
+            "item/completed"
+                if params.pointer("/item/type").and_then(Value::as_str) == Some("agentMessage") =>
+            {
+                let id = params
+                    .pointer("/item/id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let streamed = self.streamed.remove(id);
+                if std::mem::take(&mut self.streamed_without_id) || streamed {
+                    return vec![ProviderEvent::TextEnd];
+                }
+            }
+            _ => {}
+        }
+        events
+    }
+}
+
 fn parse_approval(method: &str, params: &Value) -> ApprovalRequest {
     let item = params.get("item").unwrap_or(params);
     let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
-    let command = item.get("command").and_then(Value::as_str).or_else(|| {
-        item.get("input")
-            .and_then(|i| i.get("command"))
-            .and_then(Value::as_str)
-    });
+    let command = item
+        .get("command")
+        .filter(|command| !command.is_null())
+        .or_else(|| item.get("input").and_then(|i| i.get("command")));
     ApprovalRequest {
         id: item
             .get("id")
@@ -1000,6 +1121,19 @@ mod tests {
     }
 
     #[test]
+    fn a_goal_update_names_only_what_changed() {
+        use fx_core::models::goal::GoalStatus;
+        assert_eq!(
+            goal_set_params("t1", None, Some(GoalStatus::Paused)),
+            json!({ "threadId": "t1", "status": "paused" })
+        );
+        assert_eq!(
+            goal_set_params("t1", Some("Ship it"), Some(GoalStatus::Active)),
+            json!({ "threadId": "t1", "objective": "Ship it", "status": "active" })
+        );
+    }
+
+    #[test]
     fn steering_carries_the_turn_it_expects() {
         // Codex rejects a steer aimed at a turn that has already finished.
         let params = steer_params("t1", "turn-9", "actually, use zsh", &[]);
@@ -1120,6 +1254,94 @@ mod tests {
             events,
             vec![ProviderEvent::Lifecycle(Lifecycle::Compacting)]
         );
+    }
+
+    #[test]
+    fn a_completed_compaction_item_ends_the_phase() {
+        // Both ends used to map to `Compacting`, so the phase never left it.
+        let events = parse_notification(
+            "item/completed",
+            &json!({ "item": { "type": "contextCompaction", "id": "c1" } }),
+        );
+        assert_eq!(events, vec![ProviderEvent::Lifecycle(Lifecycle::Compacted)]);
+    }
+
+    #[test]
+    fn a_thread_status_reports_compaction_in_each_shape_codex_has_used() {
+        for (params, expected) in [
+            (json!({ "status": "compacting" }), Lifecycle::Compacting),
+            (
+                json!({ "status": { "type": "Compacted" } }),
+                Lifecycle::Compacted,
+            ),
+            (
+                json!({ "status": { "state": "compacting" } }),
+                Lifecycle::Compacting,
+            ),
+            (
+                json!({ "thread": { "status": "compacted" } }),
+                Lifecycle::Compacted,
+            ),
+            (json!({ "state": "compact_boundary" }), Lifecycle::Compacted),
+        ] {
+            assert_eq!(
+                parse_notification("thread/status/changed", &params),
+                vec![ProviderEvent::Lifecycle(expected)],
+                "{params}"
+            );
+        }
+        assert!(
+            parse_notification(
+                "thread/status/changed",
+                &json!({ "status": { "type": "idle" } })
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn consecutive_agent_messages_become_separate_rows() {
+        // Two messages and no tool call between them: both streamed used to
+        // merge into one row, and a second that did not stream was dropped.
+        let mut turn = TurnNotifications::new();
+        let mut conversation = crate::conversation::Conversation::new(uuid::Uuid::nil());
+        for (method, params) in [
+            (
+                "item/agentMessage/delta",
+                json!({ "itemId": "m1", "delta": "First." }),
+            ),
+            (
+                "item/completed",
+                json!({ "item": { "type": "agentMessage", "id": "m1", "text": "First." } }),
+            ),
+            (
+                "item/agentMessage/delta",
+                json!({ "itemId": "m2", "delta": "Second." }),
+            ),
+            (
+                "item/completed",
+                json!({ "item": { "type": "agentMessage", "id": "m2", "text": "Second." } }),
+            ),
+            (
+                "item/completed",
+                json!({ "item": { "type": "agentMessage", "id": "m3", "text": "Third." } }),
+            ),
+            ("item/agentMessage/delta", json!({ "delta": "Fourth." })),
+            (
+                "item/completed",
+                json!({ "item": { "type": "agentMessage", "id": "m4", "text": "Fourth." } }),
+            ),
+        ] {
+            for event in turn.parse(method, &params) {
+                conversation.apply(event);
+            }
+        }
+        let rows: Vec<String> = conversation
+            .messages()
+            .map(fx_core::ConversationMessage::text_content)
+            .collect();
+        assert_eq!(rows, ["First.", "Second.", "Third.", "Fourth."]);
+        assert!(!conversation.is_streaming());
     }
 
     #[test]
@@ -1294,11 +1516,18 @@ mod tests {
     }
 
     #[test]
-    fn usage_reports_totals_and_context_window_together() {
+    fn usage_reports_the_running_total_and_the_last_request_fills_the_window() {
         let events = parse_notification(
             "thread/tokenUsage/updated",
             &json!({
                 "tokenUsage": {
+                    "total": {
+                        "inputTokens": 900,
+                        "outputTokens": 120,
+                        "cachedInputTokens": 400,
+                        "reasoningOutputTokens": 50,
+                        "totalTokens": 1020
+                    },
                     "last": {
                         "inputTokens": 100,
                         "outputTokens": 20,
@@ -1310,33 +1539,53 @@ mod tests {
                 }
             }),
         );
-        assert_eq!(events.len(), 2);
-        match &events[0] {
-            ProviderEvent::Usage(u) => {
-                assert_eq!(u.cached_input_tokens, 40);
-                assert_eq!(u.total_tokens, 125);
-                // Unsaturated arithmetic would panic here.
-                assert_eq!(u.output_tokens, 20);
-            }
-            other => panic!("{other:?}"),
-        }
-        assert!(matches!(
-            events[1],
-            ProviderEvent::ContextUsage {
-                window: 272_000,
-                ..
-            }
-        ));
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::CumulativeUsage(Usage {
+                    input_tokens: 900,
+                    output_tokens: 120,
+                    cached_input_tokens: 400,
+                    reasoning_output_tokens: 50,
+                    total_tokens: 1020,
+                }),
+                ProviderEvent::ContextUsage {
+                    used: 125,
+                    window: 272_000,
+                },
+            ]
+        );
     }
 
     #[test]
-    fn usage_with_a_missing_last_block_is_still_reported_as_zero() {
-        // A notification shape change must not panic the turn.
-        let events = parse_notification("thread/tokenUsage/updated", &json!({ "tokenUsage": {} }));
-        assert_eq!(events.len(), 1, "{events:?}");
-        match &events[0] {
-            ProviderEvent::Usage(u) => assert_eq!(*u, Usage::default()),
-            other => panic!("{other:?}"),
+    fn repeated_usage_updates_do_not_inflate_the_totals() {
+        // Every update carries the thread's running total. Adding `last` from
+        // each one counted the same requests again and again.
+        let mut conversation = crate::conversation::Conversation::new(uuid::Uuid::nil());
+        for (total, last) in [(100, 100), (150, 50), (150, 0)] {
+            for event in parse_notification(
+                "thread/tokenUsage/updated",
+                &json!({ "tokenUsage": {
+                    "total": { "inputTokens": total, "totalTokens": total },
+                    "last": { "inputTokens": last, "totalTokens": last },
+                    "modelContextWindow": 1000
+                } }),
+            ) {
+                conversation.apply(event);
+            }
+        }
+        assert_eq!(conversation.usage().total_tokens, 150);
+        assert_eq!(conversation.usage().input_tokens, 150);
+    }
+
+    #[test]
+    fn usage_without_a_total_counts_nothing_and_does_not_panic() {
+        // A notification shape change must not panic the turn, nor invent a
+        // total the server did not send.
+        for usage in [json!({}), json!({ "last": { "totalTokens": 10 } })] {
+            let events =
+                parse_notification("thread/tokenUsage/updated", &json!({ "tokenUsage": usage }));
+            assert!(events.is_empty(), "{events:?}");
         }
     }
 
@@ -1346,6 +1595,7 @@ mod tests {
             "thread/tokenUsage/updated",
             &json!({
                 "tokenUsage": {
+                    "total": { "totalTokens": 10 },
                     "last": { "totalTokens": 10 },
                     "modelContextWindow": 0
                 }
@@ -1453,6 +1703,25 @@ mod tests {
             ProviderEvent::Approval(a) => assert_eq!(a.risk, RiskLevel::Moderate),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn an_argv_command_is_rated_as_argv() {
+        // Joined into one line, the quotes would turn `-delete` into part of a
+        // harmless-looking word.
+        let hidden = json!(["find", ".", "'", "-delete", "'"]);
+        assert_eq!(
+            risk_for("commandExecution", Some(&hidden)),
+            RiskLevel::Dangerous
+        );
+        assert_eq!(
+            risk_for(
+                "commandExecution",
+                Some(&json!(["/bin/zsh", "-lc", "rg -n foo"]))
+            ),
+            RiskLevel::Moderate
+        );
+        assert!(!is_read_only_command_value(&json!(["cat", 7])));
     }
 
     #[test]

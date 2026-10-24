@@ -54,6 +54,11 @@ pub struct ClaudeStreamParser {
     seen_tool_ids: VecDeque<String>,
     /// Set once `result` arrives, so a second one is ignored.
     did_finish: bool,
+    /// Set by the first frame that answers the prompt, which is the proof
+    /// Claude read it. Thinking, usage and lifecycle frames count even though
+    /// none of them is shown, because a prompt Claude has read must not be
+    /// offered back for sending again.
+    prompt_consumed: bool,
     /// Control requests waiting on this app's answer, keyed by the id the
     /// parser hands out.
     pending: Vec<PendingControl>,
@@ -148,6 +153,27 @@ impl ClaudeStreamParser {
             .filter(|id| !id.is_empty())
         {
             self.session_id = Some(id.to_owned());
+        }
+
+        // Everything Claude writes in stream-json mode answers a user message,
+        // `init` included. A `control_response` is the exception: it answers
+        // FlowX's own control requests, which come with or without a prompt.
+        if matches!(
+            kind,
+            "system" | "stream_event" | "assistant" | "user" | "result" | "control_request"
+        ) {
+            self.prompt_consumed = true;
+        }
+        // A subagent's narration carries the id of the tool call that started
+        // it. Its text is not the reply and its tools are not the turn's. Let
+        // through, its words filled the main answer and its calls were listed
+        // as the turn's own; what it found comes back as that call's result.
+        if matches!(kind, "stream_event" | "assistant" | "user")
+            && envelope
+                .get("parent_tool_use_id")
+                .is_some_and(|parent| !parent.is_null())
+        {
+            return Vec::new();
         }
 
         match kind {
@@ -403,6 +429,11 @@ impl ClaudeStreamParser {
         self.did_finish
     }
 
+    /// Whether Claude has shown it read the prompt.
+    pub fn prompt_consumed(&self) -> bool {
+        self.prompt_consumed
+    }
+
     pub fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
     }
@@ -421,6 +452,7 @@ impl ClaudeStreamParser {
         self.saw_text_delta = false;
         self.seen_tool_ids.clear();
         self.did_finish = false;
+        self.prompt_consumed = false;
         self.pending.clear();
         self.sequence = 0;
         self.last_refusal = None;
@@ -667,12 +699,19 @@ fn usage_of(envelope: &Value) -> Usage {
     if let Some(models) = model_usage.filter(|models| !models.is_empty()) {
         return models
             .iter()
+            // Saturating: the counts are the provider's, and an overflow in a
+            // debug build is a panic in the middle of a turn.
             .fold(Usage::default(), |mut total, (_, model)| {
-                total.input_tokens += count(model.get("inputTokens"));
-                total.output_tokens += count(model.get("outputTokens"));
-                total.cached_input_tokens += count(model.get("cacheReadInputTokens"));
-                total.total_tokens +=
-                    count(model.get("inputTokens")) + count(model.get("outputTokens"));
+                let input = count(model.get("inputTokens"));
+                let output = count(model.get("outputTokens"));
+                total.input_tokens = total.input_tokens.saturating_add(input);
+                total.output_tokens = total.output_tokens.saturating_add(output);
+                total.cached_input_tokens = total
+                    .cached_input_tokens
+                    .saturating_add(count(model.get("cacheReadInputTokens")));
+                total.total_tokens = total
+                    .total_tokens
+                    .saturating_add(input.saturating_add(output));
                 total
             });
     }
@@ -683,7 +722,7 @@ fn usage_of(envelope: &Value) -> Usage {
         ..Usage::default()
     };
     Usage {
-        total_tokens: usage.input_tokens + usage.output_tokens,
+        total_tokens: usage.input_tokens.saturating_add(usage.output_tokens),
         ..usage
     }
 }
@@ -773,67 +812,22 @@ pub fn risk_for(tool_name: &str, input: &Value) -> RiskLevel {
     }
 }
 
-/// Whether a shell command only reads.
+/// The read-only check, shared with Codex so the two cannot disagree.
+pub use crate::shell::is_read_only_command;
+
+/// Whether a Claude tool call only reads, judged by Claude's own tool names.
 ///
-/// The check is a prefix match on the first word, which is deliberately
-/// conservative: a command whose first word is not a known reader is treated as
-/// dangerous even if the rest of it would have been harmless.
-pub fn is_read_only_command(command: &str) -> bool {
-    const READERS: &[&str] = &[
-        "cat",
-        "head",
-        "tail",
-        "less",
-        "wc",
-        "ls",
-        "pwd",
-        "which",
-        "whoami",
-        "file",
-        "stat",
-        "grep",
-        "rg",
-        "find",
-        "fd",
-        "diff",
-        "git status",
-        "git log",
-        "git diff",
-        "git show",
-        "echo",
-        "date",
-        "uname",
-        // `env` and `printenv` are deliberately absent. With no argument they
-        // print the whole environment, which on a developer machine is where API
-        // keys live, and the approval row would label that read-only.
-        "du",
-        "df",
-        "sort",
-        "uniq",
-        "basename",
-        "dirname",
-    ];
-    let trimmed = command.trim();
-    if trimmed.is_empty() {
-        return false;
+/// The searches and reads are read-only by name; `Bash` is as read-only as its
+/// command; everything else, edits included, is not.
+pub fn is_read_only_tool(tool_name: &str, input: &Value) -> bool {
+    match tool_name {
+        "Read" | "Grep" | "Glob" | "LS" | "NotebookRead" => true,
+        "Bash" => input
+            .get("command")
+            .and_then(Value::as_str)
+            .is_some_and(is_read_only_command),
+        _ => false,
     }
-    // A command that chains anything is not a reader, whatever it starts with.
-    if trimmed.contains('|')
-        || trimmed.contains(';')
-        || trimmed.contains('&')
-        || trimmed.contains('>')
-    {
-        return false;
-    }
-    if trimmed.contains("&&") || trimmed.contains("||") {
-        return false;
-    }
-    READERS.iter().any(|reader| {
-        trimmed == *reader
-            || trimmed
-                .strip_prefix(reader)
-                .is_some_and(|rest| rest.starts_with(char::is_whitespace))
-    })
 }
 
 /// A string field, trimmed, or `None` when it is absent or blank.
@@ -1786,6 +1780,117 @@ mod tests {
                 assert_eq!(usage.total_tokens, 50);
             }
             other => panic!("expected usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_subagents_narration_stays_out_of_the_main_reply() {
+        // Frames carrying `parent_tool_use_id` belong to the Task call that
+        // started the subagent. They used to fill the main answer and list the
+        // subagent's calls as the turn's own.
+        let mut parser = ClaudeStreamParser::new();
+        let mut events = Vec::new();
+        for frame in [
+            json!({"type": "assistant", "parent_tool_use_id": null, "message": {"content": [
+                {"type": "tool_use", "id": "task-1", "name": "Task", "input": {}}]}}),
+            json!({"type": "stream_event", "parent_tool_use_id": "task-1", "event": {
+                "type": "content_block_delta", "delta": {"type": "text_delta", "text": "sub says"}}}),
+            json!({"type": "assistant", "parent_tool_use_id": "task-1", "message": {"content": [
+                {"type": "text", "text": "sub says"},
+                {"type": "tool_use", "id": "sub-tool", "name": "Grep", "input": {}}]}}),
+            json!({"type": "user", "parent_tool_use_id": "task-1", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "sub-tool", "content": "matches"}]}}),
+            json!({"type": "user", "parent_tool_use_id": null, "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "task-1", "content": "summary"}]}}),
+            json!({"type": "assistant", "message": {"content": [
+                {"type": "text", "text": "Done."}]}}),
+        ] {
+            events.extend(parser.events(&line(frame)));
+        }
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::ToolUse {
+                    id: "task-1".into(),
+                    name: "Task".into(),
+                    input: "{}".into(),
+                },
+                ProviderEvent::ToolResult {
+                    id: "task-1".into(),
+                    content: "summary".into(),
+                    is_error: false,
+                },
+                ProviderEvent::Text("Done.".into()),
+            ]
+        );
+        assert!(
+            !parser.saw_text_delta(),
+            "a subagent's delta suppressed the reply"
+        );
+    }
+
+    #[test]
+    fn any_answering_frame_proves_the_prompt_was_read() {
+        // Thinking produces no event at all, and usage and lifecycle frames are
+        // not content, but each shows Claude read the prompt.
+        for frame in [
+            json!({"type": "system", "subtype": "init"}),
+            json!({"type": "system", "subtype": "status", "status": "compacting"}),
+            json!({"type": "stream_event", "event": {"type": "content_block_delta",
+                   "delta": {"type": "thinking_delta", "thinking": "hmm"}}}),
+            json!({"type": "result", "usage": {}}),
+        ] {
+            let mut parser = ClaudeStreamParser::new();
+            parser.events(&line(frame.clone()));
+            assert!(parser.prompt_consumed(), "{frame}");
+        }
+        // An answer to FlowX's own control request comes with or without one.
+        let mut parser = ClaudeStreamParser::new();
+        parser.events(&line(json!({"type": "control_response", "response": {}})));
+        parser.events("not json");
+        assert!(!parser.prompt_consumed());
+    }
+
+    #[test]
+    fn huge_token_counts_saturate_rather_than_overflow() {
+        let mut parser = ClaudeStreamParser::new();
+        let events = parser.events(&line(json!({
+            "type": "result",
+            "modelUsage": {
+                "a": { "inputTokens": u64::MAX, "outputTokens": 1 },
+                "b": { "inputTokens": u64::MAX, "outputTokens": 1 }
+            }
+        })));
+        match &events[0] {
+            ProviderEvent::Usage(usage) => {
+                assert_eq!(usage.input_tokens, u64::MAX);
+                assert_eq!(usage.total_tokens, u64::MAX);
+            }
+            other => panic!("expected usage, got {other:?}"),
+        }
+        let events = ClaudeStreamParser::new().events(&line(json!({
+            "type": "result",
+            "usage": { "input_tokens": u64::MAX, "output_tokens": 5 }
+        })));
+        assert!(
+            matches!(&events[0], ProviderEvent::Usage(usage) if usage.total_tokens == u64::MAX)
+        );
+    }
+
+    #[test]
+    fn read_only_tools_are_named_by_claude_and_bash_is_judged_by_its_command() {
+        for tool in ["Read", "Grep", "Glob", "LS"] {
+            assert!(is_read_only_tool(tool, &json!({})), "{tool}");
+        }
+        assert!(is_read_only_tool("Bash", &json!({ "command": "ls -la" })));
+        for (tool, input) in [
+            ("Bash", json!({ "command": "find . -delete" })),
+            ("Bash", json!({})),
+            ("Edit", json!({})),
+            ("Write", json!({})),
+            ("WebFetch", json!({})),
+        ] {
+            assert!(!is_read_only_tool(tool, &input), "{tool} {input}");
         }
     }
 

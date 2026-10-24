@@ -85,7 +85,12 @@ fn provider_is_locked(state: &mut AppState, id: uuid::Uuid) -> bool {
     }) else {
         return true;
     };
-    let conversation = state.conversation(project_id, id);
+    // Drawn with the composer, so it must not read a transcript. One that is
+    // saved but not loaded yet almost always has history; locking until it
+    // lands is the safe answer, and the bar repaints when it does.
+    let Some(conversation) = state.loaded_or_unsaved(project_id, id) else {
+        return true;
+    };
     let conversation = conversation.lock().unwrap_or_else(|e| e.into_inner());
     conversation.session_id().is_some() || conversation.messages().len() > 0
 }
@@ -442,6 +447,51 @@ mod tests {
                     .provider_id
                     .is_none()
             );
+        });
+    }
+
+    #[test]
+    fn the_provider_lock_never_reads_a_saved_transcript() {
+        // The lock is drawn with every composer, so reading the transcript here
+        // meant reading all of it inside a render.
+        let test = gpui::TestAppContext::single();
+        let dir = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(dir.path().join("state"));
+        let project = Project::new(dir.path().to_str().unwrap());
+        let agent = Agent::new("Saved");
+        let store = Store::new(paths.clone());
+        store
+            .save_app(&PersistedApp {
+                projects: vec![PersistedProject {
+                    project: Some(project.clone()),
+                    agents: vec![agent.clone()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .save_conversation(
+                project.id,
+                agent.id,
+                &fx_store::PersistedConversation::from_messages(
+                    agent.id,
+                    vec![ConversationMessage::text(MessageRole::User, "History")],
+                ),
+            )
+            .unwrap();
+        let state = test.update(|cx| cx.new(|cx| AppState::restore(paths, cx)));
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                assert!(
+                    provider_is_locked(state, agent.id),
+                    "an unread transcript is taken to have history"
+                );
+                assert!(state.conversation_by_agent(agent.id).is_none());
+                assert!(!state.is_loading_conversation(agent.id));
+                state.conversation(project.id, agent.id);
+                assert!(provider_is_locked(state, agent.id));
+            })
         });
     }
 

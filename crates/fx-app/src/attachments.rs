@@ -1,18 +1,26 @@
-//! Transcript image loading. File reads and pixel decoding run in GPUI's asset
-//! executor; only the downsampled first frame is retained for painting.
+//! Image attachments: loading them for the transcript, and holding them in
+//! the composer until they are sent.
+//!
+//! File reads and pixel decoding run in GPUI's asset executor; only the
+//! downsampled first frame is retained for painting.
 
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 
-use fx_core::ConversationImageAssetReference;
-use fx_design::components::attachment::{
-    IMAGE_PREVIEW_MAX_WIDTH, attachment_fallback, image_preview,
+use fx_core::{
+    Attachment, ConversationImageAssetReference, ConversationMessage, MessageContent, MessageRole,
 };
+use fx_design::components::attachment::{
+    IMAGE_PREVIEW_MAX_WIDTH, attachment_chip, attachment_fallback, image_preview,
+};
+use fx_design::components::{IconButtonProps, icon_button};
+use fx_design::icon::Icon;
 use fx_design::styled::{FxRefinement, FxStyled, px_len};
 use fx_design::theme::{Colors, Radii, Spacing, global};
 use fx_store::AppPaths;
@@ -27,39 +35,155 @@ const MAX_DECODED_BYTES: u64 = 128 * 1024 * 1024;
 const THUMBNAIL_WIDTH: u32 = 640;
 const THUMBNAIL_HEIGHT: u32 = 440;
 
-// Repainting the transcript must not copy each attached screenshot again.
-// Keep a small LRU of shared source bytes; decoded thumbnails use GPUI's cache.
+/// How many images' keys are remembered. A key is a few words, so this is
+/// generous: it only has to outnumber the images one transcript paints.
+const MAX_REMEMBERED_KEYS: usize = 4096;
+/// How many shared byte copies are kept, and how large they may grow together.
+const MAX_SHARED_IMAGES: usize = 256;
+const MAX_SHARED_BYTES: usize = 64 * 1024 * 1024;
+/// Bytes sampled from each end, and from the middle, to recognise a buffer.
+const IDENTITY_WINDOW: usize = 64;
+
+/// An inline image with its content key computed once.
+///
+/// `Hash` writes the key alone. GPUI hashes an asset's source on every
+/// `use_asset`, which for the bytes themselves meant a full SipHash of every
+/// screenshot on every repaint, on top of the one this cache already paid.
+#[derive(Clone)]
+pub(crate) struct InlineImage {
+    key: u64,
+    data: Arc<[u8]>,
+}
+
+impl Hash for InlineImage {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.key.hash(state);
+    }
+}
+
+/// Which buffer an inline image is, without reading all of it.
+///
+/// The transcript hands over a borrow of the same `Vec` on every repaint, so
+/// its address and length identify it. The sampled ends are what keep a freed
+/// buffer's address, reused for a different image of the same length, from
+/// inheriting the old key: the last bytes of a PNG or a JPEG are checksums and
+/// entropy-coded data, which two different images do not share.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct Identity {
+    address: usize,
+    len: usize,
+    sample: u64,
+}
+
+impl Identity {
+    fn of(data: &[u8]) -> Self {
+        let mut hasher = std::hash::DefaultHasher::new();
+        let window = IDENTITY_WINDOW.min(data.len());
+        let middle = data.len() / 2;
+        data[..window].hash(&mut hasher);
+        data[middle - middle.min(window / 2)..(middle + window / 2).min(data.len())]
+            .hash(&mut hasher);
+        data[data.len() - window..].hash(&mut hasher);
+        Self {
+            address: data.as_ptr() as usize,
+            len: data.len(),
+            sample: hasher.finish(),
+        }
+    }
+}
+
+struct Shared {
+    data: Arc<[u8]>,
+    used: u64,
+}
+
+// Repainting the transcript must neither hash nor copy each attached
+// screenshot again. Keys are remembered per buffer, so a repaint reads a few
+// hundred bytes rather than the image; shared byte copies are kept per key and
+// evicted least-recently-used. Decoded thumbnails live in GPUI's asset cache.
 #[derive(Default)]
 struct InlineCache {
-    items: VecDeque<(u64, Arc<[u8]>)>,
+    keys: HashMap<Identity, u64>,
+    key_order: VecDeque<Identity>,
+    shared: HashMap<u64, Shared>,
     bytes: usize,
+    clock: u64,
+    /// Full-content hashes taken, which a test reads to prove a repaint takes none.
+    digests: usize,
 }
 
 impl InlineCache {
-    fn intern(&mut self, data: &[u8]) -> Arc<[u8]> {
-        let mut hasher = std::hash::DefaultHasher::new();
-        data.hash(&mut hasher);
-        let digest = hasher.finish();
-        if let Some(index) = self
-            .items
-            .iter()
-            .position(|(key, stored)| *key == digest && stored.as_ref() == data)
-        {
-            let item = self.items.remove(index).expect("located cached image");
-            let result = item.1.clone();
-            self.items.push_back(item);
-            return result;
+    fn intern(&mut self, data: &[u8]) -> InlineImage {
+        self.clock += 1;
+        let identity = Identity::of(data);
+        let key = match self.keys.get(&identity) {
+            Some(&key) => key,
+            None => {
+                let key = self.key_for(data);
+                if self.key_order.len() >= MAX_REMEMBERED_KEYS
+                    && let Some(oldest) = self.key_order.pop_front()
+                {
+                    self.keys.remove(&oldest);
+                }
+                self.keys.insert(identity, key);
+                self.key_order.push_back(identity);
+                key
+            }
+        };
+        if let Some(shared) = self.shared.get_mut(&key) {
+            shared.used = self.clock;
+            return InlineImage {
+                key,
+                data: shared.data.clone(),
+            };
         }
-        while self.items.len() >= 16 || self.bytes + data.len() > 32 * 1024 * 1024 {
-            let Some((_, oldest)) = self.items.pop_front() else {
+        while !self.shared.is_empty()
+            && (self.shared.len() >= MAX_SHARED_IMAGES
+                || self.bytes + data.len() > MAX_SHARED_BYTES)
+        {
+            let Some(oldest) = self
+                .shared
+                .iter()
+                .min_by_key(|(_, shared)| shared.used)
+                .map(|(key, _)| *key)
+            else {
                 break;
             };
-            self.bytes -= oldest.len();
+            if let Some(evicted) = self.shared.remove(&oldest) {
+                self.bytes -= evicted.data.len();
+            }
         }
         let data: Arc<[u8]> = data.into();
         self.bytes += data.len();
-        self.items.push_back((digest, data.clone()));
-        data
+        self.shared.insert(
+            key,
+            Shared {
+                data: data.clone(),
+                used: self.clock,
+            },
+        );
+        InlineImage { key, data }
+    }
+
+    /// The content key for bytes this cache has not seen as a buffer before.
+    ///
+    /// Two different images landing on one 64-bit key would show one in place
+    /// of the other, so a key already holding different bytes is stepped past.
+    /// This runs once per buffer, which is the only place a full compare is
+    /// affordable.
+    fn key_for(&mut self, data: &[u8]) -> u64 {
+        self.digests += 1;
+        let mut hasher = std::hash::DefaultHasher::new();
+        data.hash(&mut hasher);
+        let mut key = hasher.finish();
+        while self
+            .shared
+            .get(&key)
+            .is_some_and(|shared| shared.data.as_ref() != data)
+        {
+            key = key.wrapping_add(1);
+        }
+        key
     }
 }
 
@@ -69,7 +193,7 @@ thread_local! {
 
 #[derive(Clone, Hash)]
 pub(crate) enum ImageInput {
-    Inline(Arc<[u8]>),
+    Inline(InlineImage),
     Mentioned(PathBuf),
     Asset {
         root: PathBuf,
@@ -127,7 +251,7 @@ impl Asset for PreviewLoader {
 
 fn source_bytes(source: &ImageInput) -> Result<Arc<[u8]>, &'static str> {
     let data: Arc<[u8]> = match source {
-        ImageInput::Inline(data) => data.clone(),
+        ImageInput::Inline(image) => image.data.clone(),
         ImageInput::Mentioned(path) => {
             if !path.is_absolute() {
                 return Err("Image unavailable");
@@ -142,6 +266,21 @@ fn source_bytes(source: &ImageInput) -> Result<Arc<[u8]>, &'static str> {
         ImageInput::Unavailable => return Err("Image unavailable"),
     };
     Ok(data)
+}
+
+/// An attachment's original bytes, ready for the clipboard.
+///
+/// The original rather than the preview: a thumbnail pasted elsewhere would
+/// silently be a smaller image than the one that was sent.
+pub(crate) fn clipboard_image(source: &ImageInput) -> Result<gpui::ClipboardItem, &'static str> {
+    let data = source_bytes(source)?;
+    let format = fx_core::services::images::sniff(&data).ok_or("Image format is not supported")?;
+    let format = gpui::ImageFormat::from_mime_type(format.mime_type())
+        .ok_or("Image format is not supported")?;
+    Ok(gpui::ClipboardItem::new_image(&gpui::Image::from_bytes(
+        format,
+        data.to_vec(),
+    )))
 }
 
 fn load_preview(source: &ImageInput) -> Result<DecodedPreview, &'static str> {
@@ -326,6 +465,192 @@ impl RenderOnce for AttachmentPreview {
     }
 }
 
+// ── Composer attachments ──────────────────────────────────────────────────
+
+/// How many images may wait in one composer, and how large they may be
+/// together. The original's limits.
+pub(crate) const MAX_PENDING_ATTACHMENTS: usize = 10;
+pub(crate) const MAX_PENDING_ATTACHMENT_BYTES: usize = 50 * 1024 * 1024;
+
+/// The user's row for a prompt: its images first, then its words, as the
+/// original wrote it.
+pub(crate) fn user_message(text: &str, attachments: &[Attachment]) -> ConversationMessage {
+    let mut content: Vec<MessageContent> = attachments
+        .iter()
+        .filter(|attachment| attachment.is_image())
+        .map(|attachment| MessageContent::Image {
+            data: attachment.data.clone(),
+            mime_type: attachment.mime_type.clone(),
+        })
+        .collect();
+    content.push(MessageContent::Text { text: text.into() });
+    ConversationMessage::new(MessageRole::User, content)
+}
+
+/// The images a user row carries, as attachments again.
+///
+/// This is how an unsent prompt keeps its images through a retry and a
+/// restart: the row it left in the transcript already holds the bytes, so
+/// recovery reads them back rather than storing a second copy beside it.
+pub(crate) fn attachments_in(message: &ConversationMessage) -> Vec<Attachment> {
+    message
+        .content
+        .iter()
+        .filter_map(|content| match content {
+            MessageContent::Image { data, mime_type } => Some((data, mime_type)),
+            _ => None,
+        })
+        .enumerate()
+        .map(|(index, (data, mime_type))| {
+            let extension = fx_core::services::images::sniff(data)
+                .map(|format| format.extension())
+                .unwrap_or("png");
+            Attachment::new(
+                data.clone(),
+                mime_type.clone(),
+                format!("Image {}.{extension}", index + 1),
+            )
+        })
+        .collect()
+}
+
+/// What preparing a batch of images produced: what can attach, and why the
+/// rest cannot.
+#[derive(Debug, Default)]
+pub struct Prepared {
+    pub attachments: Vec<Attachment>,
+    pub errors: Vec<String>,
+}
+
+/// Read images the reader picked or dropped. Blocking IO: call it off the
+/// main thread.
+pub(crate) fn prepare_paths(paths: &[PathBuf]) -> Prepared {
+    let mut prepared = Prepared::default();
+    for path in paths {
+        match fx_core::services::images::prepare(path) {
+            Ok(image) => prepared.attachments.push(image.attachment),
+            Err(error) => prepared.errors.push(describe_image_error(path, &error)),
+        }
+    }
+    prepared
+}
+
+/// Prepare a pasted image. Only formats the providers accept get through:
+/// a TIFF on the clipboard has no PNG beside it to fall back on.
+pub(crate) fn prepare_pasted(image: &gpui::Image) -> Result<Attachment, String> {
+    let extension = match image.format {
+        gpui::ImageFormat::Jpeg => "jpg",
+        gpui::ImageFormat::Gif => "gif",
+        gpui::ImageFormat::Webp => "webp",
+        _ => "png",
+    };
+    fx_core::services::images::prepare_bytes(
+        image.bytes.clone(),
+        &format!("Pasted Image.{extension}"),
+    )
+    .map(|prepared| prepared.attachment)
+    .map_err(|_| "The clipboard does not contain a supported image.".to_string())
+}
+
+fn describe_image_error(path: &Path, error: &fx_core::services::images::ImageError) -> String {
+    use fx_core::services::images::ImageError;
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    match error {
+        ImageError::TooLarge { limit, .. } => {
+            format!("{name} is larger than {} MB.", limit / (1024 * 1024))
+        }
+        ImageError::Unrecognised { .. } | ImageError::NotAFile { .. } => {
+            format!("{name} is not a supported image.")
+        }
+        ImageError::Empty { .. } => format!("{name} is empty."),
+        ImageError::Unreadable { .. } => format!("{name} could not be read."),
+    }
+}
+
+/// Add prepared images under the composer's limits, returning what to say
+/// about anything left out.
+pub(crate) fn admit(pending: &mut Vec<Attachment>, prepared: Prepared) -> Option<String> {
+    let mut errors = prepared.errors;
+    let mut bytes: usize = pending.iter().map(|attachment| attachment.data.len()).sum();
+    for attachment in prepared.attachments {
+        if pending.len() >= MAX_PENDING_ATTACHMENTS {
+            errors.push(format!(
+                "Only {MAX_PENDING_ATTACHMENTS} images can be attached at once."
+            ));
+            break;
+        }
+        if bytes + attachment.data.len() > MAX_PENDING_ATTACHMENT_BYTES {
+            errors.push("Attachments cannot exceed 50 MB in total.".into());
+            break;
+        }
+        bytes += attachment.data.len();
+        pending.push(attachment);
+    }
+    error_summary(errors)
+}
+
+/// At most three distinct reasons, then a count of the rest.
+fn error_summary(errors: Vec<String>) -> Option<String> {
+    let mut unique: Vec<String> = errors;
+    unique.sort();
+    unique.dedup();
+    if unique.is_empty() {
+        return None;
+    }
+    let hidden = unique.len().saturating_sub(3);
+    let mut summary = unique.into_iter().take(3).collect::<Vec<_>>().join(" ");
+    if hidden > 0 {
+        summary.push_str(&format!(" {hidden} more file(s) were skipped."));
+    }
+    Some(summary)
+}
+
+/// What a pending image's remove control calls.
+pub(crate) type RemoveHandler = Rc<dyn Fn(&mut Window, &mut App)>;
+
+/// One image waiting in the composer, with its remove control.
+#[derive(IntoElement)]
+pub(crate) struct PendingChip {
+    input: ImageInput,
+    remove_label: SharedString,
+    on_remove: RemoveHandler,
+}
+
+pub(crate) fn pending_chip(
+    input: ImageInput,
+    remove_label: impl Into<SharedString>,
+    on_remove: RemoveHandler,
+) -> PendingChip {
+    PendingChip {
+        input,
+        remove_label: remove_label.into(),
+        on_remove,
+    }
+}
+
+impl RenderOnce for PendingChip {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let image = window
+            .use_asset::<PreviewLoader>(&self.input, cx)
+            .and_then(Result::ok)
+            .map(|preview| preview.image);
+        let on_remove = self.on_remove;
+        attachment_chip(
+            image,
+            icon_button(
+                IconButtonProps::new(Icon::XMARK, self.remove_label)
+                    .tiny()
+                    .ghost(),
+                move |_, window, cx| on_remove(window, cx),
+            )
+            .into_any_element(),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,15 +703,75 @@ mod tests {
     }
 
     #[test]
-    fn repeated_rendering_reuses_inline_bytes_and_the_cache_evicts_old_sources() {
+    fn repainting_an_inline_image_hashes_its_bytes_once() {
         let mut cache = InlineCache::default();
-        let first = cache.intern(b"first image");
-        assert!(Arc::ptr_eq(&first, &cache.intern(b"first image")));
-        for index in 0..32 {
-            cache.intern(&[index]);
+        let image = png(400, 300);
+        let first = cache.intern(&image);
+        for _ in 0..100 {
+            let again = cache.intern(&image);
+            assert!(Arc::ptr_eq(&first.data, &again.data));
+            assert_eq!(first.key, again.key);
         }
-        assert_eq!(cache.items.len(), 16);
-        assert!(!Arc::ptr_eq(&first, &cache.intern(b"first image")));
+        assert_eq!(cache.digests, 1, "a repaint re-hashed the whole image");
+    }
+
+    #[test]
+    fn more_images_than_the_old_sixteen_neither_rehash_nor_evict_each_other() {
+        // The previous cache held sixteen entries, so a transcript with a
+        // seventeenth screenshot evicted, re-hashed and re-copied every image
+        // on every repaint.
+        let images: Vec<Vec<u8>> = (0..64).map(|index| png(8 + index, 8)).collect();
+        let mut cache = InlineCache::default();
+        let first: Vec<InlineImage> = images.iter().map(|image| cache.intern(image)).collect();
+        for _ in 0..3 {
+            for (image, earlier) in images.iter().zip(&first) {
+                assert!(Arc::ptr_eq(&earlier.data, &cache.intern(image).data));
+            }
+        }
+        assert_eq!(cache.digests, images.len());
+        assert_eq!(cache.shared.len(), images.len());
+    }
+
+    #[test]
+    fn the_asset_key_ignores_the_bytes_and_still_separates_images() {
+        struct Counting(usize);
+        impl Hasher for Counting {
+            fn finish(&self) -> u64 {
+                0
+            }
+            fn write(&mut self, bytes: &[u8]) {
+                self.0 += bytes.len();
+            }
+        }
+        let mut cache = InlineCache::default();
+        let large = png(1200, 900);
+        let input = ImageInput::Inline(cache.intern(&large));
+        let mut hasher = Counting(0);
+        input.hash(&mut hasher);
+        assert!(
+            hasher.0 < 64,
+            "GPUI hashed {} bytes of source per repaint",
+            hasher.0
+        );
+        let other = cache.intern(&png(1200, 901));
+        assert_ne!(cache.intern(&large).key, other.key);
+        // Same bytes in a different buffer resolve to the same key, so a
+        // transcript reloaded from disk reuses the decoded preview.
+        let copy = large.clone();
+        assert_eq!(cache.intern(&copy).key, cache.intern(&large).key);
+    }
+
+    #[test]
+    fn shared_copies_stay_within_their_byte_budget() {
+        let mut cache = InlineCache::default();
+        let big = vec![7u8; MAX_SHARED_BYTES / 3 + 1];
+        for index in 0..4u8 {
+            let mut image = big.clone();
+            image[0] = index;
+            cache.intern(&image);
+        }
+        assert!(cache.bytes <= MAX_SHARED_BYTES);
+        assert_eq!(cache.shared.len(), 2);
     }
 
     #[test]

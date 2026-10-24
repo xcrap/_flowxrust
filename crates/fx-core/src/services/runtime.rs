@@ -355,6 +355,12 @@ impl RuntimeDiscovery {
 
     /// Search for one binary, returning what is there.
     pub async fn find(&self, spec: &BinarySpec) -> Validation {
+        self.search(spec).await.0
+    }
+
+    /// Search, and also return the path a usable binary was matched at, before
+    /// its links were resolved.
+    async fn search(&self, spec: &BinarySpec) -> (Validation, Option<PathBuf>) {
         let mut quarantined: Option<PathBuf> = None;
 
         let mut patterns = spec.search_paths().to_vec();
@@ -369,17 +375,17 @@ impl RuntimeDiscovery {
         }));
         for pattern in patterns {
             let candidates = if pattern.contains('*') {
-                // Newest first: a versioned install should win over an older one
-                // that happens to sort earlier.
-                let mut expanded = expand_glob(&pattern);
-                expanded.sort_by(|a, b| b.cmp(a));
-                expanded
+                // Already newest first, so a versioned install wins over an
+                // older one that happens to sort earlier.
+                expand_glob(&pattern)
             } else {
                 vec![PathBuf::from(&pattern)]
             };
             for candidate in candidates {
                 match self.validate(&candidate) {
-                    Validation::Usable(path) => return Validation::Usable(path),
+                    Validation::Usable(path) => {
+                        return (Validation::Usable(path), Some(candidate));
+                    }
                     Validation::Quarantined(path) => {
                         quarantined = quarantined.or(Some(path));
                     }
@@ -398,15 +404,17 @@ impl RuntimeDiscovery {
         // with it.
         if let Some(path) = shell_lookup(spec).await {
             match self.validate(Path::new(&path)) {
-                Validation::Usable(found) => return Validation::Usable(found),
+                Validation::Usable(found) => {
+                    return (Validation::Usable(found), Some(PathBuf::from(path)));
+                }
                 Validation::Quarantined(found) => quarantined = quarantined.or(Some(found)),
                 Validation::Missing => {}
             }
         }
 
         match quarantined {
-            Some(path) => Validation::Quarantined(path),
-            None => Validation::Missing,
+            Some(path) => (Validation::Quarantined(path), None),
+            None => (Validation::Missing, None),
         }
     }
 
@@ -452,7 +460,8 @@ impl RuntimeDiscovery {
     /// Re-validates rather than trusting the search: discovery happens at startup
     /// and a provider may launch much later.
     pub async fn launch(&self, spec: &BinarySpec) -> Result<RuntimeLaunch, DiscoveryError> {
-        let path = match self.find(spec).await {
+        let (validation, matched) = self.search(spec).await;
+        let path = match validation {
             Validation::Usable(path) => path,
             Validation::Quarantined(path) => {
                 return Err(DiscoveryError::Quarantined {
@@ -466,8 +475,14 @@ impl RuntimeDiscovery {
                 });
             }
         };
+        let directories: Vec<&Path> = matched
+            .as_deref()
+            .and_then(Path::parent)
+            .into_iter()
+            .chain(path.parent())
+            .collect();
         Ok(RuntimeLaunch {
-            environment: self.launch_environment(path.parent()),
+            environment: self.launch_environment(&directories),
             executable: path,
         })
     }
@@ -489,19 +504,25 @@ impl RuntimeDiscovery {
 
     /// The environment a runtime launches with.
     ///
-    /// The matched binary's own directory goes first, then the preferred install
+    /// The directories the binary was found through go first — where it was
+    /// matched, then where its links resolve to — then the preferred install
     /// roots, then whatever the process inherited. Empty entries are dropped,
     /// because an empty `PATH` component means the current directory — which
     /// would let a file in the working directory shadow a real command.
-    pub fn launch_environment(&self, search_directory: Option<&Path>) -> BTreeMap<String, String> {
-        build_launch_environment(&self.environment, search_directory)
+    pub fn launch_environment(&self, search_directories: &[&Path]) -> BTreeMap<String, String> {
+        build_launch_environment(&self.environment, search_directories)
     }
 }
 
 /// The `PATH` a launched runtime sees.
+///
+/// The matched directory must come before the resolved one. nvm's
+/// `bin/codex` is a link to `lib/node_modules/@openai/codex/bin/codex.js`,
+/// whose `#!/usr/bin/env node` finds `node` only in that `bin/`; the resolved
+/// folder has none, so leading with it failed every nvm launch.
 pub fn build_launch_environment(
     base: &BTreeMap<String, String>,
-    search_directory: Option<&Path>,
+    search_directories: &[&Path],
 ) -> BTreeMap<String, String> {
     let inherited = base
         .get("PATH")
@@ -509,10 +530,10 @@ pub fn build_launch_environment(
         .filter(|path| !path.trim().is_empty())
         .unwrap_or(FALLBACK_PATH);
 
-    let mut candidates: Vec<String> = Vec::new();
-    if let Some(directory) = search_directory {
-        candidates.push(directory.to_string_lossy().into_owned());
-    }
+    let mut candidates: Vec<String> = search_directories
+        .iter()
+        .map(|directory| directory.to_string_lossy().into_owned())
+        .collect();
     for directory in PREFERRED_SEARCH_DIRECTORIES {
         candidates.push(expand_home(directory));
     }
@@ -720,20 +741,31 @@ impl FileIdentity {
 #[cfg(target_os = "macos")]
 const ENOATTR: i32 = 93;
 
-/// Expand one `*` in a search pattern.
+/// Expand the first component of a search pattern that holds a `*`.
 ///
-/// Only a trailing `*` on the last component is supported, which is all the
-/// specs use. Anything else is returned unchanged rather than guessed at.
+/// That component may sit anywhere, as in nvm's
+/// `~/.nvm/versions/node/*/bin/codex`; whatever follows it is appended to each
+/// match as written. Anything without a `*` expands to nothing, rather than
+/// being guessed at.
 pub fn expand_glob(pattern: &str) -> Vec<PathBuf> {
-    let path = Path::new(pattern);
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+    let components: Vec<_> = Path::new(pattern).components().collect();
+    let Some(star) = components
+        .iter()
+        .position(|component| component.as_os_str().to_string_lossy().contains('*'))
+    else {
         return Vec::new();
     };
-    if !name.contains('*') {
+    let Some(name) = components[star].as_os_str().to_str() else {
         return Vec::new();
-    }
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let Ok(entries) = std::fs::read_dir(parent) else {
+    };
+    let parent: PathBuf = components[..star].iter().collect();
+    let rest: PathBuf = components[star + 1..].iter().collect();
+    let parent = if parent.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        parent
+    };
+    let Ok(entries) = std::fs::read_dir(&parent) else {
         return Vec::new();
     };
 
@@ -748,15 +780,51 @@ pub fn expand_glob(pattern: &str) -> Vec<PathBuf> {
                 && file_name.ends_with(suffix)
                 && file_name.len() >= prefix.len() + suffix.len()
             {
-                Some(entry.path())
+                Some(entry.path().join(&rest))
             } else {
                 None
             }
         })
         .collect();
     // Newest first, so a versioned install beats an older one.
-    matched.sort_by(|a, b| b.cmp(a));
+    matched.sort_by(|a, b| compare_versions(&b.to_string_lossy(), &a.to_string_lossy()));
     matched
+}
+
+/// Compare two names, reading each run of digits as one number.
+///
+/// Plain string order ranks `v9.0.0` above `v22.1.0`, so "newest first" picked
+/// the older node of the two an nvm user had installed.
+fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    let digits = |text: &[u8]| text.iter().take_while(|byte| byte.is_ascii_digit()).count();
+    let (mut a, mut b) = (a.as_bytes(), b.as_bytes());
+    loop {
+        match (a.first(), b.first()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(x), Some(y)) if x.is_ascii_digit() && y.is_ascii_digit() => {
+                let (run_a, run_b) = (digits(a), digits(b));
+                let number = |run: &[u8]| {
+                    let zeros = run.iter().take_while(|byte| **byte == b'0').count();
+                    run[zeros..].to_vec()
+                };
+                let (number_a, number_b) = (number(&a[..run_a]), number(&b[..run_b]));
+                let order = number_a
+                    .len()
+                    .cmp(&number_b.len())
+                    .then_with(|| number_a.cmp(&number_b));
+                if order != Ordering::Equal {
+                    return order;
+                }
+                (a, b) = (&a[run_a..], &b[run_b..]);
+            }
+            (Some(x), Some(y)) if x != y => return x.cmp(y),
+            _ => (a, b) = (&a[1..], &b[1..]),
+        }
+    }
 }
 
 /// Ask the shell where a binary is, on a blocking thread.
@@ -790,19 +858,51 @@ fn shell_which(name: &str) -> Option<String> {
     (!path.is_empty()).then_some(path)
 }
 
+/// Search paths with a leading `$HOME` expanded.
+fn home_paths(paths: &[&str]) -> Vec<String> {
+    paths.iter().map(|path| expand_home(path)).collect()
+}
+
 /// The runtimes FlowX knows about.
+///
+/// The paths are the Swift app's, in its order, plus `~/.npm/bin` for Codex,
+/// which installs through npm just as Claude Code does. Each goes through the
+/// same validation as any other candidate, so a quarantined copy is still only
+/// run once it is approved or notarized.
 pub fn codex_spec() -> BinarySpec {
-    BinarySpec::new("codex", "Codex", vec!["/opt/homebrew/bin/codex".into()])
-        .version_args(vec!["--version".into()])
-        .shell_fallback("codex")
-        .install_hint("Install it with `npm install -g @openai/codex`, or see codex.com.")
+    BinarySpec::new(
+        "codex",
+        "Codex",
+        home_paths(&[
+            // The signed runtime the desktop apps bundle, so FlowX sees the
+            // same native tasks they do.
+            "$HOME/Applications/ChatGPT.app/Contents/Resources/codex",
+            "/Applications/ChatGPT.app/Contents/Resources/codex",
+            "$HOME/Applications/Codex.app/Contents/Resources/codex",
+            "/Applications/Codex.app/Contents/Resources/codex",
+            "/opt/homebrew/bin/codex",
+            "/usr/local/bin/codex",
+            "$HOME/.local/bin/codex",
+            "$HOME/.npm/bin/codex",
+            "$HOME/.nvm/versions/node/*/bin/codex",
+        ]),
+    )
+    .version_args(vec!["--version".into()])
+    .shell_fallback("codex")
+    .install_hint("Install it with `npm install -g @openai/codex`, or see codex.com.")
 }
 
 pub fn claude_spec() -> BinarySpec {
     BinarySpec::new(
         "claude",
         "Claude Code",
-        vec!["/opt/homebrew/bin/claude".into()],
+        home_paths(&[
+            "$HOME/.local/bin/claude",
+            "/opt/homebrew/bin/claude",
+            "/usr/local/bin/claude",
+            "$HOME/.npm/bin/claude",
+            "$HOME/.nvm/versions/node/*/bin/claude",
+        ]),
     )
     .version_args(vec!["--version".into()])
     .shell_fallback("claude")
@@ -837,15 +937,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_binary_directory_comes_first_in_a_launch_path() {
+    async fn the_binary_directories_come_first_in_a_launch_path_in_order() {
         // A provider must be able to invoke the interpreter its own script names,
-        // which lives beside the script in an npm install.
+        // which lives beside the link it was found through in an npm install.
         let path = build_launch_environment(
             &environment(&[("PATH", "/usr/bin")]),
-            Some(Path::new("/opt/tools/node/bin")),
+            &[
+                Path::new("/opt/tools/node/bin"),
+                Path::new("/opt/tools/node/lib/node_modules/tool"),
+            ],
         );
         let entries: Vec<&str> = path["PATH"].split(':').collect();
-        assert_eq!(entries[0], "/opt/tools/node/bin");
+        assert_eq!(
+            entries[..2],
+            [
+                "/opt/tools/node/bin",
+                "/opt/tools/node/lib/node_modules/tool"
+            ]
+        );
         assert!(entries.contains(&"/usr/bin".to_string().as_str()));
     }
 
@@ -853,19 +962,19 @@ mod tests {
     async fn an_empty_path_component_is_dropped() {
         // An empty component means the working directory, which would let a file
         // there shadow a real command.
-        let path = build_launch_environment(&environment(&[("PATH", "")]), None);
+        let path = build_launch_environment(&environment(&[("PATH", "")]), &[]);
         assert!(!path["PATH"].split(':').any(str::is_empty));
     }
 
     #[tokio::test]
     async fn a_blank_path_falls_back_to_the_system_default() {
-        let path = build_launch_environment(&environment(&[("PATH", "   ")]), None);
+        let path = build_launch_environment(&environment(&[("PATH", "   ")]), &[]);
         assert!(path["PATH"].contains("/usr/bin"));
     }
 
     #[tokio::test]
     async fn the_preferred_directories_are_present() {
-        let path = build_launch_environment(&environment(&[]), None);
+        let path = build_launch_environment(&environment(&[]), &[]);
         for directory in PREFERRED_SEARCH_DIRECTORIES {
             let expanded = expand_home(directory);
             assert!(
@@ -879,7 +988,7 @@ mod tests {
     async fn the_inherited_environment_is_preserved() {
         let path = build_launch_environment(
             &environment(&[("PATH", "/usr/bin"), ("HOME", "/Users/someone")]),
-            None,
+            &[],
         );
         assert_eq!(path["HOME"], "/Users/someone");
     }
@@ -889,7 +998,7 @@ mod tests {
         // Duplicates in an inherited PATH are common and harmless, but they make
         // every lookup slower and can shadow an intended override.
         let path =
-            build_launch_environment(&environment(&[("PATH", "/usr/bin:/usr/bin:/bin")]), None);
+            build_launch_environment(&environment(&[("PATH", "/usr/bin:/usr/bin:/bin")]), &[]);
         let entries: Vec<&str> = path["PATH"].split(':').collect();
         let mut unique = entries.clone();
         unique.sort_unstable();
@@ -1145,15 +1254,184 @@ mod tests {
             .expect("a launch");
         let resolved = std::fs::canonicalize(&binary).unwrap();
         assert_eq!(launch.executable, resolved);
-        // The *resolved* binary's directory, not the matched one: npm keeps
-        // `node` beside the resolved script's directory, and it is the resolved
-        // one the provider actually execs.
+        // The folder the binary was *found* in comes first, before links are
+        // resolved: npm and nvm keep `node` beside the `bin/` link, not beside
+        // the script it points at. The resolved folder follows. On macOS the
+        // temp directory is itself behind a link (`/var` → `/private/var`), so
+        // the two differ here.
+        let matched = temp.path().to_string_lossy().into_owned();
         let directory = resolved.parent().unwrap().to_string_lossy().into_owned();
+        let entries: Vec<&str> = launch.environment["PATH"].split(':').collect();
+        assert_eq!(entries[0], matched, "{entries:?}");
         assert!(
-            launch.environment["PATH"].starts_with(&directory),
-            "the binary's own directory is missing: {}",
-            launch.environment["PATH"]
+            entries[..2].contains(&directory.as_str()),
+            "the resolved directory is missing: {entries:?}"
         );
+    }
+
+    /// An nvm install of one version: `bin/<name>` links to an npm package's
+    /// script, whose `#!/usr/bin/env node` resolves only with `bin/` on `PATH`.
+    /// The `node` here is a stand-in that reports which version ran what.
+    fn nvm_version(versions: &Path, version: &str, name: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let root = versions.join(version);
+        let bin = root.join("bin");
+        tests_support::write_script(
+            &bin.join("node"),
+            &format!("printf 'node-{version}:%s:%s' \"$(basename \"$1\")\" \"$2\"\n"),
+        );
+        let script = root.join("lib/node_modules/tool/cli.js");
+        std::fs::create_dir_all(script.parent().unwrap()).unwrap();
+        std::fs::write(
+            &script,
+            "#!/usr/bin/env node\nnot JavaScript; only the stand-in may run it\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink("../lib/node_modules/tool/cli.js", bin.join(name)).unwrap();
+        bin
+    }
+
+    #[tokio::test]
+    async fn an_nvm_install_launches_with_the_node_beside_its_link_from_the_newest_version() {
+        // Leading PATH with the resolved folder failed every nvm launch with
+        // "env: node: No such file or directory". String order also picked v9
+        // over v22 as the newest.
+        let temp = tempfile::tempdir().unwrap();
+        let versions = temp.path().join("versions/node");
+        nvm_version(&versions, "v9.0.0", "tool");
+        let newest = nvm_version(&versions, "v22.1.0", "tool");
+        let spec = BinarySpec::new(
+            "tool",
+            "Tool",
+            vec![versions.join("*/bin/tool").to_string_lossy().into_owned()],
+        );
+        let discovery =
+            hermetic().with_environment(environment(&[("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")]));
+
+        let launch = discovery.launch(&spec).await.expect("a launch");
+        let script = std::fs::canonicalize(newest.join("tool")).unwrap();
+        assert_eq!(launch.executable, script);
+        let entries: Vec<&str> = launch.environment["PATH"].split(':').collect();
+        assert_eq!(entries[0], newest.to_string_lossy());
+        assert_eq!(entries[1], script.parent().unwrap().to_string_lossy());
+
+        let result = discovery
+            .run(
+                &spec,
+                &["--help".into()],
+                None,
+                std::time::Duration::from_secs(10),
+            )
+            .await
+            .expect("the command ran");
+        assert_eq!(result.stdout, "node-v22.1.0:cli.js:--help", "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn a_quarantined_newest_version_is_skipped_for_an_approved_older_one() {
+        // A glob match goes through the same validation as any other path.
+        let temp = tempfile::tempdir().unwrap();
+        let versions = temp.path().join("versions/node");
+        let older = nvm_version(&versions, "v18.0.0", "tool");
+        nvm_version(&versions, "v22.1.0", "tool");
+        let spec = BinarySpec::new(
+            "tool",
+            "Tool",
+            vec![versions.join("*/bin/tool").to_string_lossy().into_owned()],
+        );
+        let discovery = hermetic()
+            .with_quarantine_probe(|path| Some(path.to_string_lossy().contains("v22.1.0")))
+            .with_quarantine_assessor(|_| false);
+        assert_eq!(
+            discovery.find(&spec).await,
+            Validation::Usable(std::fs::canonicalize(older.join("tool")).unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_specs_own_paths_are_searched_before_the_extra_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let named = temp.path().join("named/tool");
+        let extra = temp.path().join("extra");
+        executable_at(&named);
+        executable_at(&extra.join("tool"));
+        let spec = BinarySpec::new("tool", "Tool", vec![named.to_string_lossy().into_owned()]);
+
+        let mut discovery = hermetic().with_quarantine_probe(|_| Some(false));
+        discovery.extra_directories = vec![extra.to_string_lossy().into_owned()];
+        assert_eq!(
+            discovery.find(&spec).await,
+            Validation::Usable(std::fs::canonicalize(&named).unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn the_known_specs_search_everywhere_the_swift_app_did() {
+        let home = |path: &str| expand_home(path);
+        let codex = codex_spec();
+        for expected in [
+            home("$HOME/Applications/ChatGPT.app/Contents/Resources/codex"),
+            "/Applications/ChatGPT.app/Contents/Resources/codex".into(),
+            home("$HOME/Applications/Codex.app/Contents/Resources/codex"),
+            "/Applications/Codex.app/Contents/Resources/codex".into(),
+            home("$HOME/.npm/bin/codex"),
+            home("$HOME/.nvm/versions/node/*/bin/codex"),
+        ] {
+            assert!(
+                codex.search_paths().contains(&expected),
+                "codex: {expected}"
+            );
+        }
+        let claude = claude_spec();
+        for expected in [
+            home("$HOME/.local/bin/claude"),
+            home("$HOME/.npm/bin/claude"),
+            home("$HOME/.nvm/versions/node/*/bin/claude"),
+        ] {
+            assert!(
+                claude.search_paths().contains(&expected),
+                "claude: {expected}"
+            );
+        }
+        for spec in [codex, claude] {
+            assert!(
+                spec.search_paths()
+                    .iter()
+                    .all(|path| !path.contains("$HOME")),
+                "{}: an unexpanded home directory",
+                spec.id
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_glob_star_can_name_a_directory_in_the_middle_of_the_path() {
+        let temp = tempfile::tempdir().unwrap();
+        for version in ["v18.0.0", "v22.1.0"] {
+            executable_at(&temp.path().join(version).join("bin/codex"));
+        }
+        std::fs::create_dir_all(temp.path().join("v20.0.0")).unwrap();
+
+        let matched = expand_glob(&temp.path().join("*/bin/codex").to_string_lossy());
+        assert_eq!(
+            matched,
+            ["v22.1.0", "v20.0.0", "v18.0.0"]
+                .map(|version| temp.path().join(version).join("bin/codex"))
+        );
+    }
+
+    #[test]
+    fn versions_compare_by_number_rather_than_by_character() {
+        use std::cmp::Ordering;
+        assert_eq!(compare_versions("v22.1.0", "v9.0.0"), Ordering::Greater);
+        assert_eq!(compare_versions("v18.20.4", "v18.3.0"), Ordering::Greater);
+        assert_eq!(
+            compare_versions("codex-1.0", "codex-1.0-beta"),
+            Ordering::Less
+        );
+        assert_eq!(compare_versions("v010", "v10"), Ordering::Equal);
+        assert_eq!(compare_versions("a", "b"), Ordering::Less);
     }
 
     #[tokio::test]

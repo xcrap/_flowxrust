@@ -16,6 +16,8 @@
 //!   policy could act on. Re-deciding it here would only give a second, weaker
 //!   place for the same rule to be wrong.
 
+use std::ops::Range;
+
 use crate::models::{ConversationMessage, MessageContent};
 
 /// The tool the model calls to put a question to the user.
@@ -48,31 +50,48 @@ pub struct TranscriptActivityGroupingPolicy;
 impl TranscriptActivityGroupingPolicy {
     /// Split a turn into runs, each labelled by how it should render.
     pub fn segments(messages: &[ConversationMessage]) -> Vec<TranscriptActivitySegment<'_>> {
-        let mut segments = Vec::new();
+        Self::runs(messages)
+            .into_iter()
+            .map(|(range, is_activity)| Self::segment(&messages[range], is_activity))
+            .collect()
+    }
+
+    /// The same partition as [`Self::segments`], as `(range, is_activity)`
+    /// pairs over any sequence of borrowed messages.
+    ///
+    /// For a caller that holds references rather than a slice. Copying a turn
+    /// into a slice only to borrow it back would deep-copy every tool output and
+    /// image the turn carries, and a view would pay that on every render.
+    pub fn runs<'a>(
+        messages: impl IntoIterator<Item = &'a ConversationMessage>,
+    ) -> Vec<(Range<usize>, bool)> {
+        let mut runs = Vec::new();
         // The run being accumulated, as a range. A run cannot be closed until
         // the next message's classification is known, which is the only reason
         // this is a buffer rather than a push per message.
         let mut start = 0;
         let mut run_is_activity = false;
+        let mut count = 0;
 
-        for (index, message) in messages.iter().enumerate() {
+        for (index, message) in messages.into_iter().enumerate() {
             let is_activity = Self::is_activity_only(message);
             // Contiguity is the rule, not membership: the same tool traffic
             // either side of a sentence is two groups, because one group
             // spanning both would hide that sentence. It is also what gives the
             // caller one group per burst to drive its active state from.
             if index > start && is_activity != run_is_activity {
-                segments.push(Self::segment(&messages[start..index], run_is_activity));
+                runs.push((start..index, run_is_activity));
                 start = index;
             }
             run_is_activity = is_activity;
+            count = index + 1;
         }
 
-        if !messages.is_empty() {
-            segments.push(Self::segment(&messages[start..], run_is_activity));
+        if count > 0 {
+            runs.push((start..count, run_is_activity));
         }
 
-        segments
+        runs
     }
 
     /// Whether this message is nothing but background tool traffic.
@@ -409,5 +428,38 @@ mod tests {
         );
 
         assert!(TranscriptActivityGroupingPolicy::is_activity_only(&result));
+    }
+
+    #[test]
+    fn borrowed_runs_partition_a_turn_exactly_as_its_segments_do() {
+        // A view holds references into a transcript rather than a slice of it.
+        // The two entry points must agree, or a borrowed caller would group a
+        // turn differently from every test above.
+        let source = [
+            message(
+                MessageRole::Assistant,
+                MessageContent::Text { text: "a".into() },
+            ),
+            tool_use(MessageRole::Assistant, "t1", "Read"),
+            tool_result("t1", "out"),
+            message(
+                MessageRole::Assistant,
+                MessageContent::Text { text: "b".into() },
+            ),
+            tool_use(MessageRole::Assistant, "t2", "Grep"),
+        ];
+        let borrowed: Vec<&ConversationMessage> = source.iter().collect();
+
+        let runs = TranscriptActivityGroupingPolicy::runs(borrowed.iter().copied());
+        let segments = TranscriptActivityGroupingPolicy::segments(&source);
+        assert_eq!(runs.len(), segments.len());
+        for ((range, is_activity), segment) in runs.into_iter().zip(segments) {
+            assert_eq!(&source[range], segment.messages());
+            assert_eq!(
+                is_activity,
+                matches!(segment, TranscriptActivitySegment::Activity { .. })
+            );
+        }
+        assert!(TranscriptActivityGroupingPolicy::runs([]).is_empty());
     }
 }

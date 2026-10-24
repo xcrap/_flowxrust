@@ -7,11 +7,13 @@
 pub mod attachment;
 pub mod button;
 pub mod change_indicator;
+pub mod checkbox;
 pub mod collapsible;
 pub mod context_menu;
 pub mod context_meter;
 pub mod menu;
 pub mod menu_model;
+pub mod palette;
 pub mod provider_status;
 pub mod rich_text;
 pub mod segmented;
@@ -34,12 +36,17 @@ pub use menu::{
     menu_trigger, row_palette,
 };
 pub use menu_model::{MenuItem, MenuItemTone, MenuModel, MenuSection};
+pub use palette::{
+    PaletteRow, PaletteRowPalette, palette_panel, palette_row, palette_row_palette,
+    palette_surface, shortcut_chip,
+};
 
 pub use button::{
     ButtonStyle, ICON_BUTTON_SIZE, IconButtonProps, IconButtonVariant, button, button_palette,
-    button_with_icon, choice_row, compact_action_button, icon_button, icon_button_palette,
-    navigation_button,
+    button_with_icon, choice_row, compact_action_button, compact_action_palette,
+    compact_action_toggle, glyph_button, icon_button, icon_button_palette, navigation_button,
 };
+pub use checkbox::{CheckboxPalette, checkbox, checkbox_palette};
 pub use segmented::{SegmentedOption, segmented_control};
 pub use status::{
     ActivityState, BadgeTone, activity_dot, badge, context_ring_color, context_ring_icon,

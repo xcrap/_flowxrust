@@ -137,6 +137,7 @@ icons! {
     CHEVRON_LEFT => "chevron.left",
     CHEVRON_RIGHT => "chevron.right",
     CHEVRON_DOWN => "chevron.down",
+    CHEVRON_UP => "chevron.up",
     ARROW_UP_LEFT_ARROW_DOWN_RIGHT => "arrow.up.left.and.arrow.down.right",
     ARROW_DOWN_RIGHT_ARROW_UP_LEFT => "arrow.down.right.and.arrow.up.left",
 
@@ -192,6 +193,7 @@ icons! {
     // Chrome and layout
     GEARSHAPE => "gearshape",
     GLOBE => "globe",
+    KEYBOARD => "keyboard",
     SIDEBAR_LEFT => "sidebar.left",
     SIDEBAR_RIGHT => "sidebar.right",
     RECTANGLE_SPLIT_3X1 => "rectangle.split.3x1",

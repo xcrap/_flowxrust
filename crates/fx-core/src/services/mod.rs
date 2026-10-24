@@ -1,5 +1,6 @@
 //! Services: the parts of the domain that talk to the machine.
 
+pub mod editor;
 pub mod images;
 pub mod runtime;
 

@@ -210,6 +210,11 @@ pub struct ProjectPicker {
     /// the project a second time, and the caller reacts to the first callback,
     /// not the second.
     settled: bool,
+    /// Resolved folders of the projects already in the sidebar.
+    ///
+    /// Choosing one of these focuses that project rather than adding it again,
+    /// and the sheet says so before the reader commits to it.
+    open_roots: Vec<PathBuf>,
     /// Keeps the field observation alive; dropping it stops re-validation.
     _observation: Option<Subscription>,
 }
@@ -242,6 +247,7 @@ impl ProjectPicker {
                 browsing: false,
                 browse_error: None,
                 settled: false,
+                open_roots: Vec::new(),
                 _observation: None,
             };
             picker._observation = Some(cx.observe(
@@ -281,6 +287,16 @@ impl ProjectPicker {
     /// keystroke, and a second copy of it is a second thing to be wrong.
     pub fn can_add(&self) -> bool {
         matches!(self.verdict, Some(Ok(_)))
+    }
+
+    /// Tell the sheet which folders are already open, as resolved paths.
+    pub fn set_open_roots(&mut self, roots: Vec<PathBuf>) {
+        self.open_roots = roots;
+    }
+
+    /// Whether the checked folder is already a project in the sidebar.
+    pub fn is_already_open(&self) -> bool {
+        matches!(&self.verdict, Some(Ok(candidate)) if self.open_roots.contains(&candidate.path))
     }
 
     /// Re-check the field after it changed.
@@ -596,7 +612,11 @@ impl ProjectPicker {
                         },
                     ))
                     .child(button(
-                        "Add project",
+                        if self.is_already_open() {
+                            "Show project"
+                        } else {
+                            "Add project"
+                        },
                         ButtonStyle::Primary,
                         self.can_add(),
                         move |_event, window, cx| {
@@ -617,7 +637,7 @@ impl ProjectPicker {
     /// and a reader who cannot see the difference has not been told anything.
     fn verdict_row(&self, theme: &Theme) -> AnyElement {
         match &self.verdict {
-            Some(Ok(candidate)) => candidate_row(candidate, theme),
+            Some(Ok(candidate)) => candidate_row(candidate, self.is_already_open(), theme),
             Some(Err(error)) => banner(
                 Colors::error_muted(theme),
                 // `fg` rather than `error`: the invariant is that `fg` clears
@@ -656,7 +676,7 @@ impl ProjectPicker {
 /// The resolved path is shown next to the name rather than the text that was
 /// typed, because those two can differ — that is the whole point of resolving
 /// it, and a reader who cannot see the difference has not been told anything.
-fn candidate_row(candidate: &ProjectCandidate, theme: &Theme) -> AnyElement {
+fn candidate_row(candidate: &ProjectCandidate, already_open: bool, theme: &Theme) -> AnyElement {
     let mut row = div()
         .flex()
         .flex_row()
@@ -692,6 +712,14 @@ fn candidate_row(candidate: &ProjectCandidate, theme: &Theme) -> AnyElement {
         row = row.child(badge(
             SharedString::from("Git repository"),
             BadgeTone::Success,
+            true,
+        ));
+    }
+    // Said before the reader confirms, so "Show project" is not a surprise.
+    if already_open {
+        row = row.child(badge(
+            SharedString::from("Already open"),
+            BadgeTone::Info,
             true,
         ));
     }
@@ -1036,6 +1064,38 @@ mod tests {
 
         assert!(mounted.can_add());
         assert_eq!(mounted.shown_error(), None);
+    }
+
+    #[test]
+    fn a_folder_that_is_already_open_is_recognised_through_a_symlink() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let project = temp.path().join("project");
+        let other = temp.path().join("other");
+        std::fs::create_dir(&project).expect("the project was created");
+        std::fs::create_dir(&other).expect("the other folder was created");
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(&project, &link).expect("the link was created");
+
+        let mut mounted = mount();
+        mounted.test.update(|cx| {
+            mounted.picker.update(cx, |picker, _| {
+                picker.set_open_roots(vec![resolved(&project)])
+            });
+        });
+        mounted.type_into(&link.to_string_lossy());
+        assert!(
+            mounted
+                .test
+                .read(|cx| mounted.picker.read(cx).is_already_open())
+        );
+        // Still a valid choice: confirming it focuses the open project.
+        assert!(mounted.can_add());
+        mounted.type_into(&other.to_string_lossy());
+        assert!(
+            !mounted
+                .test
+                .read(|cx| mounted.picker.read(cx).is_already_open())
+        );
     }
 
     #[test]

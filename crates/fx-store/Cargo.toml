@@ -14,8 +14,9 @@ tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 directories.workspace = true
+# Unique, owner-only temporary files beside the file being replaced.
+tempfile.workspace = true
+# Only for `F_FULLFSYNC`, and the `fsync` it falls back to.
+libc.workspace = true
 
 uuid.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true
