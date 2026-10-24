@@ -1127,6 +1127,12 @@ fn composer_row(
             conversation.as_deref(),
         ))
     };
+    if chrome
+        .context_usage
+        .is_some_and(|usage| usage.fraction().is_none())
+    {
+        state.update(cx, |state, cx| state.probe_context_if_unknown(agent.id, cx));
+    }
     {
         let state = state.read(cx);
         chrome.attachments_enabled = accepts_images(state, &agent);

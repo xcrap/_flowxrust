@@ -28,21 +28,18 @@ impl ContextUsage {
             .unwrap_or_else(|| "—".into())
     }
 
+    /// The tooltip: what the number is, in words, with the counts behind it.
     pub fn detail(self) -> String {
-        let usage = self
-            .used
-            .map(tokens)
-            .unwrap_or_else(|| "Usage not reported yet".into());
-        let limit = self
-            .limit
-            .filter(|limit| *limit > 0)
-            .map(tokens)
-            .unwrap_or_else(|| "Unknown limit".into());
-        let percent = self
-            .fraction()
-            .map(|_| format!(" · {} used", self.label()))
-            .unwrap_or_default();
-        format!("Context: {usage} / {limit}{percent}")
+        match (self.used, self.limit.filter(|limit| *limit > 0)) {
+            (Some(used), Some(limit)) => format!(
+                "{} of the model's context window used: {} of {}.\nThe provider summarizes older messages when it fills up.",
+                self.label(),
+                tokens(used),
+                tokens(limit)
+            ),
+            (Some(used), None) => format!("Context used: {}. Window size unknown.", tokens(used)),
+            (None, _) => "Context usage not reported yet.".into(),
+        }
     }
 }
 
@@ -211,7 +208,7 @@ mod tests {
         assert_eq!(usage.fraction(), Some(1.0));
         assert_eq!(
             usage.detail(),
-            "Context: 234,567 tokens / 200,000 tokens · 100% used"
+            "100% of the model's context window used: 234,567 tokens of 200,000 tokens.\nThe provider summarizes older messages when it fills up."
         );
         assert_eq!(
             ContextUsage {

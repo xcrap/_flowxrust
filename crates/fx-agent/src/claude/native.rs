@@ -907,7 +907,9 @@ fn prompt_text(value: &Value) -> Option<String> {
     })
 }
 
-fn context_usage(value: &Value) -> Option<u64> {
+/// How large a conversation a reply answered: everything sent, cached or not,
+/// plus the reply itself, which the next turn carries too.
+pub(crate) fn context_usage(value: &Value) -> Option<u64> {
     let mut total = None::<u64>;
     for key in [
         "input_tokens",

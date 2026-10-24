@@ -54,6 +54,9 @@ pub struct ClaudeStreamParser {
     seen_tool_ids: VecDeque<String>,
     /// Set once `result` arrives, so a second one is ignored.
     did_finish: bool,
+    /// How much of the context window the latest reply used, read from its
+    /// `usage`. Reported as it arrives, and again with the window at `result`.
+    context_tokens: Option<u64>,
     /// Set by the first frame that answers the prompt, which is the proof
     /// Claude read it. Thinking, usage and lifecycle frames count even though
     /// none of them is shown, because a prompt Claude has read must not be
@@ -334,6 +337,18 @@ impl ClaudeStreamParser {
             return Vec::new();
         };
         let mut events = Vec::new();
+        // Each reply says how large the conversation it answered was. Without
+        // this, Claude never reported context at all, and its threads' meter
+        // could only ever say it did not know. The window is not known until
+        // `result`; zero says so, and the thread's model fills it in.
+        if let Some(used) = envelope
+            .pointer("/message/usage")
+            .and_then(super::native::context_usage)
+            && self.context_tokens != Some(used)
+        {
+            self.context_tokens = Some(used);
+            events.push(ProviderEvent::ContextUsage { used, window: 0 });
+        }
         for block in blocks {
             match block.get("type").and_then(Value::as_str) {
                 Some("text") if !self.saw_text_delta => {
@@ -412,7 +427,11 @@ impl ClaudeStreamParser {
         }
 
         let usage = usage_of(envelope);
-        vec![
+        let mut events = Vec::new();
+        if let (Some(used), Some(window)) = (self.context_tokens, context_window_of(envelope)) {
+            events.push(ProviderEvent::ContextUsage { used, window });
+        }
+        events.extend([
             ProviderEvent::Usage(usage),
             ProviderEvent::Done {
                 stop_reason: envelope
@@ -421,7 +440,8 @@ impl ClaudeStreamParser {
                     .unwrap_or("end_turn")
                     .to_string(),
             },
-        ]
+        ]);
+        events
     }
 
     /// Whether this turn has reported completion.
@@ -725,6 +745,18 @@ fn usage_of(envelope: &Value) -> Usage {
         total_tokens: usage.input_tokens.saturating_add(usage.output_tokens),
         ..usage
     }
+}
+
+/// The context window `result` reports, from `modelUsage`. The largest, when a
+/// turn used several models: the conversation lives in the main one's.
+fn context_window_of(envelope: &Value) -> Option<u64> {
+    envelope
+        .get("modelUsage")
+        .and_then(Value::as_object)?
+        .values()
+        .map(|model| count(model.get("contextWindow")))
+        .max()
+        .filter(|window| *window > 0)
 }
 
 fn count(value: Option<&Value>) -> u64 {
@@ -1154,6 +1186,66 @@ mod tests {
             ]
         );
         assert!(parser.did_finish());
+    }
+
+    #[test]
+    fn a_reply_reports_how_much_context_it_answered_and_the_result_its_window() {
+        // Claude never reported context, so a Claude thread's meter could only
+        // ever say it did not know.
+        let mut parser = ClaudeStreamParser::new();
+        let reply = |text: &str| {
+            line(json!({
+                "type": "assistant",
+                "message": {
+                    "content": [{ "type": "text", "text": text }],
+                    "usage": {
+                        "input_tokens": 12,
+                        "cache_creation_input_tokens": 3000,
+                        "cache_read_input_tokens": 40000,
+                        "output_tokens": 500
+                    }
+                }
+            }))
+        };
+        let first = parser.events(&reply("Looking."));
+        assert!(
+            first.contains(&ProviderEvent::ContextUsage {
+                used: 43_512,
+                window: 0
+            }),
+            "{first:?}"
+        );
+        // The same reply split across content blocks is reported once.
+        let echo = parser.events(&reply("Found it."));
+        assert!(
+            !echo
+                .iter()
+                .any(|event| matches!(event, ProviderEvent::ContextUsage { .. }))
+        );
+
+        let end = parser.events(&line(json!({
+            "type": "result",
+            "usage": { "input_tokens": 12, "output_tokens": 500 },
+            "modelUsage": {
+                "claude-opus": { "inputTokens": 12, "outputTokens": 500, "contextWindow": 200000 },
+                "claude-haiku": { "inputTokens": 3, "outputTokens": 1, "contextWindow": 200000 }
+            }
+        })));
+        assert_eq!(
+            end[0],
+            ProviderEvent::ContextUsage {
+                used: 43_512,
+                window: 200_000
+            }
+        );
+        // A result with no window leaves the reply's figure standing.
+        let mut quiet = ClaudeStreamParser::new();
+        quiet.events(&reply("Hi."));
+        let end = quiet.events(&line(json!({ "type": "result", "usage": {} })));
+        assert!(
+            !end.iter()
+                .any(|event| matches!(event, ProviderEvent::ContextUsage { .. }))
+        );
     }
 
     #[test]

@@ -758,9 +758,12 @@ fn control_row(
         .items_end()
         .gap(px_len(Spacing::SM))
         .child(controls)
+        // Only a known percentage is shown. A meter that does not know
+        // drew an empty ring and a dash, which read as a stray line.
         .children(
             chrome
                 .context_usage
+                .filter(|usage| usage.fraction().is_some())
                 .map(|usage| context_meter(usage, chrome.provider)),
         )
         .child(primary_action(chrome, can_send))
@@ -1385,6 +1388,38 @@ mod tests {
         window
             .update(&mut test, |_window, _entity, _cx| {})
             .expect("the window is still alive");
+    }
+
+    #[test]
+    fn the_context_meter_appears_only_once_it_has_a_percentage_to_show() {
+        // An unknown meter drew an empty ring and a dash, which read as a
+        // stray line beside the send button.
+        let meter_shown = |usage: ContextUsage| {
+            let mut test = TestAppContext::single();
+            let field = test.update(|cx| cx.new(TextField::new));
+            let chrome = ComposerChrome {
+                context_usage: Some(usage),
+                ..live()
+            };
+            let window = test.add_window(move |_, _| Harness::new(field, chrome, ""));
+            test.refresh().expect("the composer painted");
+            let mut visual = VisualTestContext::from_window(*window.deref(), &test);
+            visual.debug_bounds("composer-context").is_some()
+        };
+        let limit = Some(200_000);
+        assert!(!meter_shown(ContextUsage { used: None, limit }));
+        assert!(!meter_shown(ContextUsage {
+            used: Some(5_000),
+            limit: None
+        }));
+        assert!(meter_shown(ContextUsage {
+            used: Some(5_000),
+            limit
+        }));
+        assert!(meter_shown(ContextUsage {
+            used: Some(0),
+            limit
+        }));
     }
 
     /// An enabled composer wired to a handler that records nothing.

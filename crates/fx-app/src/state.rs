@@ -76,6 +76,9 @@ pub struct AppState {
     retry_drafts: HashMap<Uuid, String>,
     /// The save of a panel toggle, held until the panel has finished moving.
     panel_save: Option<gpui::Task<()>>,
+    /// Claude threads whose context has been asked for this launch, so a
+    /// failed or slow check is not repeated on every frame.
+    context_probed: HashSet<Uuid>,
     /// The revision and draft each transcript was last handed to the writer at,
     /// or read from disk at. A version, never the bytes: the writer compares
     /// content by hash, so nothing here grows with the size of a transcript.
@@ -197,6 +200,7 @@ impl AppState {
             restored_drafts: HashMap::new(),
             retry_drafts: HashMap::new(),
             panel_save: None,
+            context_probed: HashSet::new(),
             saved_conversations: HashMap::new(),
             writer: Default::default(),
             loading: HashSet::new(),
@@ -3293,6 +3297,97 @@ impl AppState {
         self.saved_conversations.remove(&agent_id);
     }
 
+    /// Fill in a Claude thread's context from the CLI when FlowX has none.
+    ///
+    /// A thread saved before Claude's usage was recorded, or one first seen
+    /// through native history, has no window size: Claude only reports it at
+    /// the end of a turn. Asking the CLI once, in the background, shows the
+    /// meter when the thread is opened rather than after the next reply.
+    pub fn probe_context_if_unknown(&mut self, agent_id: Uuid, cx: &mut Context<Self>) {
+        let Some((session, root)) = self.context_probe_target(agent_id) else {
+            return;
+        };
+        self.context_probed.insert(agent_id);
+        let check = cx.background_spawn(async move {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| error.to_string())
+                .and_then(|runtime| {
+                    runtime.block_on(fx_agent::claude::catalog::session_context(
+                        &fx_core::services::runtime::RuntimeDiscovery::default(),
+                        &root,
+                        &session,
+                    ))
+                })
+                .map(|context| (session, context))
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok((session, context)) = check.await else {
+                return;
+            };
+            let _ = this.update(cx, |state, cx| {
+                state.apply_probed_context(agent_id, &session, &context);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The session and folder to ask about, when a thread needs its context
+    /// filled in: a Claude thread, idle, with a session, whose meter has
+    /// nothing to show, and not already asked this launch.
+    fn context_probe_target(&self, agent_id: Uuid) -> Option<(String, String)> {
+        if self.context_probed.contains(&agent_id) || self.is_thread_busy(agent_id) {
+            return None;
+        }
+        let agent = self.thread(agent_id)?;
+        if crate::thread_presentation::provider(self, agent)
+            != fx_design::components::ProviderIdentity::Claude
+        {
+            return None;
+        }
+        let conversation = self.conversations.get(&agent_id)?;
+        let conversation = conversation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let known = crate::thread_presentation::context_usage(self, agent, Some(&conversation))
+            .fraction()
+            .is_some();
+        if known {
+            return None;
+        }
+        let session = conversation.session_id()?.to_owned();
+        Some((session, self.project_root_for(agent_id)?))
+    }
+
+    /// Record a context check, unless the thread has moved on since it was
+    /// asked: a turn that ran meanwhile reported fresher figures itself.
+    fn apply_probed_context(
+        &mut self,
+        agent_id: Uuid,
+        session: &str,
+        context: &fx_agent::claude::catalog::SessionContext,
+    ) {
+        if self.is_thread_busy(agent_id) {
+            return;
+        }
+        let Some(conversation) = self.conversations.get(&agent_id) else {
+            return;
+        };
+        let mut conversation = conversation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if conversation.session_id() == Some(session)
+            && conversation
+                .usage()
+                .reported_context_window
+                .is_none_or(|window| window == 0)
+        {
+            conversation.record_context(context.used, context.window);
+        }
+    }
+
     /// The folder a thread's project lives in.
     pub fn project_root_for(&self, agent_id: Uuid) -> Option<String> {
         let project_id = self.project_for_agent(agent_id)?;
@@ -5365,6 +5460,77 @@ mod persistence_tests {
                         .unwrap()
                         .unsent()
                         .is_none()
+                );
+            })
+        });
+    }
+
+    #[test]
+    fn a_claude_thread_with_no_known_context_is_checked_once_and_filled_in() {
+        // A thread saved before Claude's usage was recorded had no window, so
+        // its meter could show nothing until the next turn's result.
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, project, claude, codex) = test.update(|cx| workspace(cx, &paths));
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                state.snapshot.projects[0].agents[0]
+                    .configuration
+                    .provider_id = Some("claude".into());
+                state.snapshot.projects[0].agents[1]
+                    .configuration
+                    .provider_id = Some("codex".into());
+                for agent in [claude, codex] {
+                    let conversation = state.conversation(project, agent);
+                    let mut conversation = conversation.lock().unwrap();
+                    conversation.append(fx_core::ConversationMessage::text(
+                        fx_core::MessageRole::User,
+                        "Earlier",
+                    ));
+                    conversation.set_session_id("09c18c5c-b6ff-45ca-9603-f5491f51a15d");
+                }
+                let (session, root) = state.context_probe_target(claude).expect("asked");
+                assert_eq!(session, "09c18c5c-b6ff-45ca-9603-f5491f51a15d");
+                assert_eq!(root, state.project_root_for(claude).unwrap());
+                assert!(state.context_probe_target(codex).is_none(), "only Claude");
+
+                // Once per launch, whatever the answer was.
+                state.context_probed.insert(claude);
+                assert!(state.context_probe_target(claude).is_none());
+
+                let report = fx_agent::claude::catalog::SessionContext {
+                    used: 88_443,
+                    window: 1_000_000,
+                    model: Some("claude-opus-5-5[1m]".into()),
+                };
+                // An answer for a session the thread has left is dropped.
+                state.apply_probed_context(claude, "another-session", &report);
+                assert_eq!(
+                    state
+                        .conversation(project, claude)
+                        .lock()
+                        .unwrap()
+                        .usage()
+                        .reported_context_window,
+                    None
+                );
+                state.apply_probed_context(claude, "09c18c5c-b6ff-45ca-9603-f5491f51a15d", &report);
+                let agent = state.thread(claude).unwrap().clone();
+                let conversation = state.conversation(project, claude);
+                let usage = crate::thread_presentation::context_usage(
+                    state,
+                    &agent,
+                    Some(&conversation.lock().unwrap()),
+                );
+                assert_eq!(usage.fraction(), Some(88_443.0 / 1_000_000.0));
+
+                // A window a turn reported meanwhile is fresher; keep it.
+                conversation.lock().unwrap().record_context(5, 200_000);
+                state.apply_probed_context(claude, "09c18c5c-b6ff-45ca-9603-f5491f51a15d", &report);
+                assert_eq!(
+                    conversation.lock().unwrap().usage().reported_context_window,
+                    Some(200_000)
                 );
             })
         });
