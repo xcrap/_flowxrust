@@ -60,6 +60,10 @@ tempfile = "3"
 glob = "0.3"
 # Only for `getxattr`, which has no std equivalent.
 libc = "0.2"
+# Only for the notarization check on a quarantined runtime. Both are already in
+# the tree through GPUI's TLS stack.
+security-framework = "3.7"
+core-foundation = "0.10"
 walkdir = "2"
 
 # Native transcript Markdown parsing and validated link destinations.

@@ -2155,10 +2155,12 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "chrono",
+ "core-foundation 0.10.0",
  "criterion",
  "glob",
  "libc",
  "pretty_assertions",
+ "security-framework",
  "serde",
  "serde_json",
  "sha2 0.10.9",

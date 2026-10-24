@@ -111,6 +111,11 @@ impl BinarySpec {
     pub fn search_paths(&self) -> &[String] {
         &self.search_paths
     }
+
+    /// The file name to look for inside a search directory.
+    pub fn executable_name(&self) -> &str {
+        self.shell_fallback_name.as_deref().unwrap_or(&self.id)
+    }
 }
 
 /// What a spec's health is.
@@ -301,7 +306,7 @@ impl RuntimeDiscovery {
                 .iter()
                 .map(|directory| expand_home(directory))
                 .collect(),
-            assess_quarantine: Arc::new(|_| false),
+            assess_quarantine: Arc::new(passes_notarization),
             quarantine_probe: Arc::new(detect_quarantine),
         }
     }
@@ -337,9 +342,9 @@ impl RuntimeDiscovery {
 
     /// Replace the quarantine policy.
     ///
-    /// The default refuses everything quarantined. A build that trusts properly
-    /// notarized binaries passes an assessor that checks the signature; it never
-    /// removes the attribute.
+    /// The default accepts a quarantined binary only when it is signed with a
+    /// Developer ID and notarized, which is what Gatekeeper itself accepts; see
+    /// [`passes_notarization`]. It never removes the attribute.
     pub fn with_quarantine_assessor(
         mut self,
         assess: impl Fn(&Path) -> bool + Send + Sync + 'static,
@@ -353,7 +358,15 @@ impl RuntimeDiscovery {
         let mut quarantined: Option<PathBuf> = None;
 
         let mut patterns = spec.search_paths().to_vec();
-        patterns.extend(self.extra_directories.iter().cloned());
+        // The extra roots are directories; the candidate is the binary inside.
+        // Validating the directory itself always misses, so a Finder launch
+        // fell through to a login shell that does not read `~/.zshrc`.
+        patterns.extend(self.extra_directories.iter().map(|directory| {
+            Path::new(directory)
+                .join(spec.executable_name())
+                .to_string_lossy()
+                .into_owned()
+        }));
         for pattern in patterns {
             let candidates = if pattern.contains('*') {
                 // Newest first: a versioned install should win over an older one
@@ -568,8 +581,10 @@ pub fn detect_quarantine(path: &Path) -> Option<bool> {
     use std::os::unix::ffi::OsStrExt;
 
     let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
-    // SAFETY: `c_path` is NUL-terminated, and the value buffer is NULL with a
-    // size of zero, so `getxattr` writes nothing and only reports presence.
+    // The value is `flags;timestamp;agent;uuid`, well under this.
+    let mut value = [0u8; 256];
+    // SAFETY: `c_path` is NUL-terminated, and `getxattr` writes at most
+    // `value.len()` bytes into `value`.
     //
     // The attribute name must be a NUL-terminated C string too. Passing
     // `&str::as_ptr()` here reads past the end of the literal while `getxattr`
@@ -579,19 +594,126 @@ pub fn detect_quarantine(path: &Path) -> Option<bool> {
         libc::getxattr(
             c_path.as_ptr(),
             QUARANTINE_ATTRIBUTE.as_ptr(),
-            std::ptr::null_mut(),
-            0,
+            value.as_mut_ptr().cast(),
+            value.len(),
             0,
             0,
         )
     };
-    match result {
-        r if r >= 0 => Some(true),
-        _ => {
-            // ENOATTR is the only result that proves the file is not quarantined.
+    match usize::try_from(result) {
+        Ok(length) => Some(quarantine_blocks(&value[..length])),
+        Err(_) => {
             let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-            if errno == ENOATTR { Some(false) } else { None }
+            match errno {
+                // ENOATTR is the only result that proves the file is not quarantined.
+                ENOATTR => Some(false),
+                // Present but longer than any value macOS writes: fail closed.
+                libc::ERANGE => Some(true),
+                _ => None,
+            }
         }
+    }
+}
+
+/// Whether a quarantine value still blocks the file.
+///
+/// Approving a binary in Finder does not remove the attribute; it sets the
+/// user-approved flag in the value's leading hex field. Treating the attribute's
+/// mere presence as quarantine meant the approval FlowX itself asks for could
+/// never clear it. A value that does not parse fails closed.
+pub fn quarantine_blocks(value: &[u8]) -> bool {
+    const USER_APPROVED: u32 = 0x0040;
+    let flags = value.split(|&byte| byte == b';').next().unwrap_or_default();
+    std::str::from_utf8(flags)
+        .ok()
+        .and_then(|flags| u32::from_str_radix(flags.trim(), 16).ok())
+        .is_none_or(|flags| flags & USER_APPROVED == 0)
+}
+
+/// Whether a quarantined binary is signed with a Developer ID and notarized, or
+/// is Apple's own — what Gatekeeper accepts without asking.
+///
+/// Full validation hashes every page of the executable (about half a second for
+/// the Codex CLI), and providers revalidate before each launch, so an approval is
+/// remembered per file identity. Any rewrite, replacement, or metadata change
+/// (ctime) forces a fresh check. Failures are never remembered, so a later check
+/// can succeed once the notarization ticket is reachable.
+#[cfg(target_os = "macos")]
+pub fn passes_notarization(path: &Path) -> bool {
+    use std::sync::Mutex;
+
+    static APPROVED: Mutex<BTreeMap<PathBuf, FileIdentity>> = Mutex::new(BTreeMap::new());
+    let Some(identity) = FileIdentity::of(path) else {
+        return false;
+    };
+    let approved =
+        |approved: &BTreeMap<PathBuf, FileIdentity>| approved.get(path) == Some(&identity);
+    if approved(&APPROVED.lock().unwrap_or_else(|error| error.into_inner())) {
+        return true;
+    }
+    // Re-read the identity afterwards: a file swapped during the check must not
+    // be remembered under the identity of the one that passed.
+    if !check_notarization(path) || FileIdentity::of(path) != Some(identity) {
+        return false;
+    }
+    APPROVED
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(path.to_path_buf(), identity);
+    true
+}
+
+/// The Swift original's requirement: Apple's own code, or a Developer ID
+/// application certificate that has been notarized.
+#[cfg(target_os = "macos")]
+const NOTARIZED_REQUIREMENT: &str = "anchor apple or (anchor apple generic \
+     and certificate 1[field.1.2.840.113635.100.6.2.6] exists \
+     and certificate leaf[field.1.2.840.113635.100.6.1.13] exists \
+     and notarized)";
+
+#[cfg(target_os = "macos")]
+fn check_notarization(path: &Path) -> bool {
+    use core_foundation::url::CFURL;
+    use security_framework::os::macos::code_signing::{Flags, SecRequirement, SecStaticCode};
+
+    let Some(url) = CFURL::from_path(path, false) else {
+        return false;
+    };
+    let Ok(code) = SecStaticCode::from_path(&url, Flags::NONE) else {
+        return false;
+    };
+    let Ok(requirement) = NOTARIZED_REQUIREMENT.parse::<SecRequirement>() else {
+        return false;
+    };
+    let flags = Flags::STRICT_VALIDATE
+        | Flags::CHECK_ALL_ARCHITECTURES
+        | Flags::CHECK_NESTED_CODE
+        | Flags::RESTRICT_SIDEBAND_DATA;
+    code.check_validity(flags, &requirement).is_ok()
+}
+
+/// What makes a file the same file, for remembering a signature check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+impl FileIdentity {
+    fn of(path: &Path) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = std::fs::metadata(path).ok()?;
+        Some(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            size: metadata.size(),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        })
     }
 }
 
@@ -941,6 +1063,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_default_policy_accepts_a_quarantined_binary_that_is_properly_signed() {
+        // `/bin/ls` is Apple's own, so it passes the same requirement a
+        // notarized Developer ID binary does. The default used to refuse every
+        // quarantined binary, signed or not.
+        let signed = BinarySpec::new("ls", "ls", vec!["/bin/ls".into()]);
+        let discovery = RuntimeDiscovery::new(environment(&[]))
+            .without_extra_directories()
+            .with_quarantine_probe(|_| Some(true));
+        assert!(matches!(
+            discovery.find(&signed).await,
+            Validation::Usable(_)
+        ));
+
+        // An unsigned script stays quarantined under the same default.
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("tool");
+        executable_at(&script);
+        let unsigned = BinarySpec::new("tool", "Tool", vec![script.to_string_lossy().into()]);
+        assert!(matches!(
+            discovery.find(&unsigned).await,
+            Validation::Quarantined(_)
+        ));
+    }
+
+    #[test]
+    fn a_remembered_signature_check_is_dropped_when_the_file_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let copy = temp.path().join("ls");
+        std::fs::copy("/bin/ls", &copy).unwrap();
+        assert!(passes_notarization(&copy));
+        assert!(passes_notarization(&copy), "remembered");
+        // Same path, different bytes: the remembered approval must not apply.
+        executable_at(&copy);
+        assert!(!passes_notarization(&copy));
+    }
+
+    #[test]
+    fn a_quarantine_approved_in_finder_no_longer_blocks() {
+        // Not yet approved: the Homebrew cask `codex` on the machine this was
+        // written on carries exactly this value.
+        assert!(quarantine_blocks(b"0181;6650c3a1;Homebrew Cask;"));
+        assert!(quarantine_blocks(b"0083;5f3b2c1d;Safari;UUID"));
+        // Approved: the user-approved flag (0x40) is set, the attribute stays.
+        assert!(!quarantine_blocks(b"03c1;6650c3a1;Finder;"));
+        assert!(!quarantine_blocks(b"00c1;5f3b2c1d;Safari;UUID"));
+        // Anything unreadable fails closed.
+        assert!(quarantine_blocks(b""));
+        assert!(quarantine_blocks(b"zz;x"));
+        assert!(quarantine_blocks(&[0xff, b';']));
+    }
+
+    #[tokio::test]
     async fn a_launch_reports_why_a_binary_cannot_be_used() {
         let temp = tempfile::tempdir().unwrap();
         let spec = BinarySpec::new(
@@ -1045,6 +1219,31 @@ mod tests {
                 "{expanded} is not searched"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_binary_inside_an_extra_directory_is_found() {
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("fx-probe");
+        executable_at(&binary);
+        let spec = BinarySpec::new("fx-probe", "Probe", Vec::new());
+
+        let mut discovery =
+            RuntimeDiscovery::new(environment(&[])).with_quarantine_probe(|_| Some(false));
+        discovery.extra_directories = vec![temp.path().to_string_lossy().into_owned()];
+        match discovery.find(&spec).await {
+            Validation::Usable(path) => {
+                assert_eq!(path, std::fs::canonicalize(&binary).unwrap())
+            }
+            other => panic!("expected the binary in the directory, got {other:?}"),
+        }
+
+        // The name the shell would be asked for is the name searched for.
+        let renamed = BinarySpec::new("id", "Probe", Vec::new()).shell_fallback("fx-probe");
+        assert!(matches!(
+            discovery.find(&renamed).await,
+            Validation::Usable(_)
+        ));
     }
 
     #[tokio::test]

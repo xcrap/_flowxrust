@@ -805,6 +805,23 @@ impl Colors {
         t.palette().accent_secondary_muted
     }
 
+    /// Provider identity stays consistent when the workspace accent changes.
+    pub fn provider_codex(t: &Theme) -> Rgba {
+        if t.is_dark() {
+            h(0xA99AF5)
+        } else {
+            h(0x6251D8)
+        }
+    }
+
+    pub fn provider_claude(t: &Theme) -> Rgba {
+        if t.is_dark() {
+            h(0x55D6A0)
+        } else {
+            h(0x137C53)
+        }
+    }
+
     // ── Semantic ───────────────────────────────────────────────────────────
 
     pub fn success(t: &Theme) -> Rgba {

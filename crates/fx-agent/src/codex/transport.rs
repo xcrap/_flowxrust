@@ -56,6 +56,12 @@ pub const EVENT_QUEUE_DEPTH: usize = 1024;
 /// only ever read when reporting a failure.
 pub const MAX_STDERR_BYTES: usize = 64 * 1024;
 
+/// How long the watcher waits for stderr to close once stdout has.
+///
+/// A process that exits closes both at once, so this is normally no wait at
+/// all; the bound only matters when a child it spawned still holds stderr.
+const STDERR_DRAIN: Duration = Duration::from_millis(250);
+
 /// Why a request did not produce a result.
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
@@ -370,8 +376,38 @@ impl Transport {
         });
 
         let stderr_shared = shared.clone();
-        let stderr_reader = tokio::spawn(async move {
+        let mut stderr_reader = tokio::spawn(async move {
             read_stderr(stderr, stderr_shared).await;
+        });
+
+        // The exit path: when stdout closes, the failure is broadcast. Started
+        // before the handshake, not after it — a server that dies answering
+        // `initialize` (a bad config, an old CLI without `app-server`) would
+        // otherwise leave the handshake waiting out the full control timeout,
+        // and its stderr, which says why, would never be shown.
+        let watcher_shared = shared.clone();
+        let events_tx = events_tx.clone();
+        tokio::spawn(async move {
+            let _ = reader.await;
+            // The reason a server died is usually the last thing it wrote to
+            // stderr, which can still be in flight when stdout closes.
+            let _ = tokio::time::timeout(STDERR_DRAIN, &mut stderr_reader).await;
+            stderr_reader.abort();
+            record_exit(&watcher_shared, String::new()).await;
+            let exit = watcher_shared
+                .exited
+                .lock()
+                .await
+                .clone()
+                .expect("recorded above");
+            watcher_shared.pending.lock().await.fail_all(&exit.reason());
+            // Awaited: the queue is bounded, so `send` is a future.
+            let _ = events_tx
+                .send(ServerEvent::Notification {
+                    method: "flowx/server-exited".into(),
+                    params: json!({ "stderr": exit.stderr, "code": exit.code }),
+                })
+                .await;
         });
 
         let transport = Self {
@@ -386,41 +422,6 @@ impl Transport {
             .handshake(client_name, client_version, &launch.executable)
             .await?;
 
-        // Keep the reader alive for the transport's lifetime. Its result is the
-        // exit path: when stdout closes, the failure is broadcast.
-        let transport_shared = transport.shared.clone();
-        let events_tx = events_tx.clone();
-        tokio::spawn(async move {
-            let _ = reader.await;
-            stderr_reader.abort();
-            let exit = transport_shared
-                .exited
-                .lock()
-                .await
-                .clone()
-                .unwrap_or_else(|| Exit {
-                    stderr: String::new(),
-                    code: None,
-                });
-            // stdout closed; the reason is whatever stderr managed to say.
-            if transport_shared.exited.lock().await.is_none() {
-                let stderr = transport_shared.stderr.lock().await.trim().to_string();
-                *transport_shared.exited.lock().await = Some(Exit { stderr, code: None });
-            }
-            transport_shared
-                .pending
-                .lock()
-                .await
-                .fail_all(&exit.reason());
-            // Awaited: the queue is bounded, so `send` is a future.
-            let _ = events_tx
-                .send(ServerEvent::Notification {
-                    method: "flowx/server-exited".into(),
-                    params: json!({ "stderr": exit.stderr, "code": exit.code }),
-                })
-                .await;
-        });
-
         Ok(transport)
     }
 
@@ -432,19 +433,28 @@ impl Transport {
     ) -> Result<(), TransportError> {
         // `initialize` is sent with the reserved id, not through the dynamic
         // allocator, so it can never collide with a real request.
-        let initialized = self
+        let initialized = match self
             .await_response(
                 Outgoing::initialize(client_name, client_version),
                 "initialize",
                 INITIALIZE_ID,
             )
             .await
-            .map_err(|error| match error {
-                TransportError::Exited { stderr } if stderr.trim().is_empty() => {
-                    TransportError::Spawn(format!("{executable} did not complete initialization"))
-                }
-                other => other,
-            })?;
+        {
+            // A death with nothing on stderr has no reason to show; naming the
+            // binary is the most useful thing left to say.
+            Err(TransportError::Exited { .. })
+                if self
+                    .exit_reason()
+                    .await
+                    .is_some_and(|exit| exit.stderr.trim().is_empty()) =>
+            {
+                return Err(TransportError::Spawn(format!(
+                    "{executable} exited before completing initialization"
+                )));
+            }
+            other => other?,
+        };
 
         let _ = initialized;
         // Only now. Sending `initialized` earlier is a race the server loses.
@@ -492,7 +502,14 @@ impl Transport {
     ) -> Result<Value, TransportError> {
         let (sender, receiver) = oneshot::channel();
         {
+            // One critical section, as in `request`: a server that dies at once
+            // can be drained by the watcher before the handshake registers.
             let mut pending = self.shared.pending.lock().await;
+            if let Some(reason) = pending.exit_reason() {
+                return Err(TransportError::Exited {
+                    stderr: reason.to_string(),
+                });
+            }
             pending.adopt(id, method.to_string(), sender);
         }
         if self.send(message).is_err() {
@@ -661,11 +678,11 @@ async fn read_stdout(
     }
 
     // stdout closed. A partial final line is still worth parsing: a server
-    // killed mid-write is otherwise completely silent.
+    // killed mid-write is otherwise completely silent. The exit itself is
+    // recorded by the watcher, once stderr has had a chance to finish.
     if let Some(line) = framer.finish() {
         handle_line(&line, &shared, &events).await;
     }
-    record_exit(&shared, String::new()).await;
 }
 
 async fn handle_line(line: &str, shared: &Arc<Shared>, events: &mpsc::Sender<ServerEvent>) {
@@ -918,6 +935,47 @@ mod process {
             other => panic!("expected a request, got {other:?}"),
         }
         transport.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_server_that_dies_during_initialize_fails_at_once_with_its_stderr() {
+        // A bad config or an old CLI without `app-server` exits before
+        // answering. The handshake used to wait out the 30-second control
+        // timeout and then report a timeout, never the reason.
+        let launch = |script: &str| Launch {
+            executable: "/bin/sh".into(),
+            args: vec!["-c".into(), script.into()],
+            working_directory: None,
+            environment: vec![("PATH".into(), "/usr/bin:/bin".into())],
+        };
+        let started = tokio::time::timeout(
+            Duration::from_secs(5),
+            Transport::start(
+                launch("echo \"error: unrecognized subcommand 'app-server'\" >&2; exit 2"),
+                "FlowX",
+                "test",
+            ),
+        )
+        .await
+        .expect("failed promptly, not after the control timeout");
+        match started {
+            Err(TransportError::Exited { stderr }) => {
+                assert!(stderr.contains("unrecognized subcommand"), "{stderr}")
+            }
+            other => panic!("expected an exit with its stderr, got {other:?}"),
+        }
+
+        // Nothing on stderr: the binary is named instead.
+        let quiet = tokio::time::timeout(
+            Duration::from_secs(5),
+            Transport::start(launch("exit 1"), "FlowX", "test"),
+        )
+        .await
+        .expect("failed promptly");
+        assert!(
+            matches!(&quiet, Err(TransportError::Spawn(message)) if message.contains("/bin/sh")),
+            "{quiet:?}"
+        );
     }
 
     #[tokio::test]

@@ -30,6 +30,7 @@ pub mod sidebar;
 pub mod state;
 pub mod text_field;
 mod thread_actions;
+mod thread_presentation;
 mod title_settings;
 pub mod transcript;
 pub mod workspace_ui;
@@ -903,6 +904,15 @@ fn composer_row(
     chrome.busy = busy;
     chrome.queued = queued;
     chrome.enabled = true;
+    chrome.provider = thread_presentation::provider(state.read(cx), &agent);
+    chrome.context_usage = {
+        let conversation = conversation.and_then(|conversation| conversation.lock().ok());
+        Some(thread_presentation::context_usage(
+            state.read(cx),
+            &agent,
+            conversation.as_deref(),
+        ))
+    };
     let mut chrome = chrome.on_action(move |action, _window, cx| match action {
         composer::ComposerAction::Submit => {
             let prompt = for_submit.read(cx).value().trim().to_string();

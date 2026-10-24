@@ -72,7 +72,8 @@ pub struct AppState {
     /// Late worker notifications must never recreate a deleted thread.
     deleted_agents: HashSet<Uuid>,
     restored_drafts: HashMap<Uuid, String>,
-    accepted_drafts: HashMap<Uuid, String>,
+    /// Unacknowledged submissions to restore after startup fails or is cancelled.
+    retry_drafts: HashMap<Uuid, String>,
     saved_conversations: HashMap<Uuid, Vec<u8>>,
     saved_conversation_versions: HashMap<Uuid, (u64, String)>,
     restored_costs: HashMap<Uuid, f64>,
@@ -178,7 +179,7 @@ impl AppState {
             protected_conversations: HashSet::new(),
             deleted_agents: HashSet::new(),
             restored_drafts: HashMap::new(),
-            accepted_drafts: HashMap::new(),
+            retry_drafts: HashMap::new(),
             saved_conversations: HashMap::new(),
             saved_conversation_versions: HashMap::new(),
             restored_costs: HashMap::new(),
@@ -777,7 +778,7 @@ impl AppState {
         self.runners.remove(&agent_id);
         self.protected_conversations.remove(&agent_id);
         self.restored_drafts.remove(&agent_id);
-        self.accepted_drafts.remove(&agent_id);
+        self.retry_drafts.remove(&agent_id);
         self.saved_conversations.remove(&agent_id);
         self.saved_conversation_versions.remove(&agent_id);
         self.restored_costs.remove(&agent_id);
@@ -994,8 +995,9 @@ impl AppState {
         })
     }
 
-    /// Persist the user's prompt before starting a worker. A failed launch keeps it retryable.
-    pub fn prepare_prompt(&mut self, agent_id: Uuid, text: &str, cx: &App) -> bool {
+    /// Move the prompt into the transcript and recovery record before starting
+    /// a worker. The composer is immediately available for the next draft.
+    pub fn prepare_prompt(&mut self, agent_id: Uuid, text: &str, cx: &mut App) -> bool {
         if self.runners.contains_key(&agent_id) || self.protected_conversations.contains(&agent_id)
         {
             return false;
@@ -1037,6 +1039,20 @@ impl AppState {
                 attachment_count: 0,
                 session_id,
             });
+        }
+        self.retry_drafts.remove(&agent_id);
+        // The keyboard callback is deferred. Only clear the submitted text,
+        // preserving any replacement draft written before that callback runs.
+        if let Some(field) = self.drafts.get(&agent_id).cloned() {
+            if field.read(cx).value().trim() == text.trim() {
+                self.clear_draft(agent_id, cx);
+            }
+        } else if self
+            .restored_drafts
+            .get(&agent_id)
+            .is_some_and(|draft| draft.trim() == text.trim())
+        {
+            self.restored_drafts.remove(&agent_id);
         }
         self.capture_drafts(cx);
         self.native_sync.invalidate(project_id);
@@ -1092,20 +1108,22 @@ impl AppState {
     }
 
     pub fn drain_updates_with_context(&mut self, cx: &mut App) {
+        // Lifecycle events may save immediately. Capture newer typing first so
+        // recovery cannot persist an older draft over a follow-up.
+        self.capture_drafts(cx);
         self.drain_updates();
-        for (agent_id, accepted) in std::mem::take(&mut self.accepted_drafts) {
+        for (agent_id, prompt) in std::mem::take(&mut self.retry_drafts) {
             if let Some(field) = self.drafts.get(&agent_id).cloned() {
-                // Edits made during startup are the next draft, not the sent prompt.
-                if field.read(cx).value().trim() == accepted.trim() {
-                    field.update(cx, |field, cx| field.set_value(String::new(), cx));
-                    self.restored_drafts.remove(&agent_id);
+                // Never overwrite a follow-up drafted while startup was pending.
+                if field.read(cx).value().is_empty() {
+                    field.update(cx, |field, cx| field.set_value(prompt, cx));
                 }
             } else if self
                 .restored_drafts
                 .get(&agent_id)
-                .is_some_and(|draft| draft.trim() == accepted.trim())
+                .is_none_or(|draft| draft.is_empty())
             {
-                self.restored_drafts.remove(&agent_id);
+                self.restored_drafts.insert(agent_id, prompt);
             }
         }
         self.capture_drafts(cx);
@@ -1144,17 +1162,14 @@ impl AppState {
                     let mut conversation = conversation
                         .lock()
                         .unwrap_or_else(|error| error.into_inner());
-                    if let Some(prompt) = conversation.unsent() {
-                        self.accepted_drafts.insert(agent_id, prompt.text.clone());
-                    }
                     conversation.clear_unsent();
                 }
                 if let Some(agent_id) = agent_id {
                     self.show_prompt_title(agent_id);
                     self.start_auto_title(agent_id);
                 }
-                // The composer is synchronized before its accepted text is written again.
-                should_save = false;
+                // Acknowledgement only releases the recovery copy. The composer
+                // may already contain the next prompt, even identical text.
             }
             SessionUpdate::Changed => should_save = false,
             SessionUpdate::Interaction { event } => {
@@ -1180,6 +1195,11 @@ impl AppState {
                     self.mark_native_local_turn(agent_id);
                     self.runners.remove(&agent_id);
                     self.pending_interactions.remove(&agent_id);
+                    self.restore_unaccepted_prompt(agent_id);
+                    self.record_execution_state(
+                        agent_id,
+                        crate::thread_presentation::settled_state(&outcome),
+                    );
                 }
                 // A turn that worked clears the previous turn's failure. Leaving
                 // it up would report an error that no longer describes anything.
@@ -1194,6 +1214,8 @@ impl AppState {
                     self.mark_native_local_turn(agent_id);
                     self.runners.remove(&agent_id);
                     self.pending_interactions.remove(&agent_id);
+                    self.restore_unaccepted_prompt(agent_id);
+                    self.record_execution_state(agent_id, fx_core::AgentExecutionState::Failure);
                 }
                 self.last_error = Some(reason);
             }
@@ -1221,6 +1243,35 @@ impl AppState {
             .find_map(|(&id, queue)| queue.front().map(|event| (id, event.clone())))
     }
 
+    /// Save how a thread's turn ended. The sidebar reads this for every row,
+    /// loaded or not, so a status cannot depend on whether a thread was opened.
+    fn record_execution_state(&mut self, agent_id: Uuid, state: fx_core::AgentExecutionState) {
+        let Some(agent) = self
+            .snapshot
+            .projects
+            .iter_mut()
+            .flat_map(|record| record.agents.iter_mut())
+            .find(|agent| agent.id == agent_id)
+        else {
+            return;
+        };
+        if agent.execution_state != state {
+            agent.execution_state = state;
+            self.save();
+        }
+    }
+
+    fn restore_unaccepted_prompt(&mut self, agent_id: Uuid) {
+        if let Some(conversation) = self.conversations.get(&agent_id) {
+            let conversation = conversation
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if let Some(prompt) = conversation.unsent() {
+                self.retry_drafts.insert(agent_id, prompt.text.clone());
+            }
+        }
+    }
+
     pub fn respond_to_interaction(
         &self,
         agent_id: Uuid,
@@ -1241,6 +1292,7 @@ impl AppState {
         if let Some(field) = self.drafts.get(&agent_id).cloned() {
             field.update(cx, |field, cx| field.set_value(String::new(), cx));
         }
+        self.restored_drafts.remove(&agent_id);
     }
 
     /// Whether a turn is running.
@@ -1344,12 +1396,10 @@ impl AppState {
                 .copied()
                 .unwrap_or_default();
             persisted.draft_text = draft;
-            if self
-                .accepted_drafts
-                .get(&agent_id)
-                .is_some_and(|accepted| persisted.draft_text.trim() == accepted.trim())
+            if persisted.draft_text.is_empty()
+                && let Some(prompt) = self.retry_drafts.get(&agent_id)
             {
-                persisted.draft_text.clear();
+                persisted.draft_text.clone_from(prompt);
             }
             let Ok(mut bytes) = serde_json::to_vec(&persisted) else {
                 continue;
@@ -3153,7 +3203,7 @@ mod persistence_tests {
                 std::fs::create_dir_all(&assets).unwrap();
                 std::fs::write(assets.join("attachment.png"), "cached image").unwrap();
                 state.protected_conversations.insert(second);
-                state.accepted_drafts.insert(second, "accepted".into());
+                state.retry_drafts.insert(second, "retry this".into());
                 state.restored_costs.insert(second, 2.0);
                 let request =
                     fx_agent::ProviderEvent::UserInput(fx_agent::provider::UserInputRequest {
@@ -3173,7 +3223,7 @@ mod persistence_tests {
                 assert!(!state.drafts.contains_key(&second));
                 assert!(!state.protected_conversations.contains(&second));
                 assert!(!state.restored_drafts.contains_key(&second));
-                assert!(!state.accepted_drafts.contains_key(&second));
+                assert!(!state.retry_drafts.contains_key(&second));
                 assert!(!state.saved_conversations.contains_key(&second));
                 assert!(!state.restored_costs.contains_key(&second));
                 assert!(state.next_interaction().is_none());
@@ -3346,6 +3396,17 @@ mod persistence_tests {
                 let field = state.draft(agent, cx);
                 field.update(cx, |field, cx| field.set_value("remember this", cx));
                 assert!(state.prepare_prompt(agent, "remember this", cx));
+                assert!(
+                    field.read(cx).value().is_empty(),
+                    "clear before any provider event"
+                );
+                let saved = state
+                    .store
+                    .load_conversation(project, agent)
+                    .unwrap()
+                    .unwrap();
+                assert!(saved.draft_text.is_empty());
+                assert_eq!(saved.unsent_prompt.unwrap().text, "remember this");
                 let conversation = state.conversation(project, agent);
                 let update = state.update_sender_for(agent);
                 update(SessionUpdate::Started {
@@ -3402,12 +3463,15 @@ mod persistence_tests {
             state.update(cx, |state, cx| {
                 let field = state.draft(agent, cx);
                 field.update(cx, |field, cx| field.set_value("do not lose this 🜁", cx));
-                assert!(state.prepare_prompt(agent, field.read(cx).value(), cx));
+                let prompt = field.read(cx).value().to_string();
+                assert!(state.prepare_prompt(agent, &prompt, cx));
+                assert!(field.read(cx).value().is_empty());
                 let update = state.update_sender_for(agent);
                 update(SessionUpdate::Failed {
                     reason: "CLI unavailable".into(),
                 });
                 state.drain_updates_with_context(cx);
+                assert_eq!(field.read(cx).value(), prompt);
                 state.save_all(cx);
             })
         });
@@ -3442,6 +3506,141 @@ mod persistence_tests {
                 state.update_sender_for(agent)(SessionUpdate::Accepted);
                 state.drain_updates_with_context(cx);
                 assert_eq!(field.read(cx).value(), "next draft");
+
+                // Identical wording can be a deliberate new follow-up. Late
+                // acknowledgement must no longer compare and clear its text.
+                assert!(state.prepare_prompt(agent, "next draft", cx));
+                assert!(field.read(cx).value().is_empty());
+                field.update(cx, |field, cx| field.set_value("next draft", cx));
+                state.update_sender_for(agent)(SessionUpdate::Accepted);
+                state.drain_updates_with_context(cx);
+                assert_eq!(field.read(cx).value(), "next draft");
+            })
+        });
+    }
+
+    #[test]
+    fn startup_failure_preserves_a_new_draft_and_restores_only_the_originating_thread() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, project, first, second) = test.update(|cx| workspace(cx, &paths));
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                let first_field = state.draft(first, cx);
+                first_field.update(cx, |field, cx| field.set_value("send this", cx));
+                assert!(state.prepare_prompt(first, "send this", cx));
+                first_field.update(cx, |field, cx| field.set_value("my follow-up", cx));
+                let second_field = state.draft(second, cx);
+                second_field.update(cx, |field, cx| field.set_value("another chat's draft", cx));
+                state.select_agent(second);
+                state.update_sender_for(first)(SessionUpdate::Failed {
+                    reason: "startup failed".into(),
+                });
+                state.drain_updates_with_context(cx);
+                assert_eq!(first_field.read(cx).value(), "my follow-up");
+                assert_eq!(second_field.read(cx).value(), "another chat's draft");
+                let saved = state
+                    .store
+                    .load_conversation(project, first)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(saved.draft_text, "my follow-up");
+                assert_eq!(saved.unsent_prompt.unwrap().text, "send this");
+
+                // With no replacement draft, stopping before acknowledgement makes
+                // the original prompt available to retry, even in a background chat.
+                first_field.update(cx, |field, cx| field.set_value("send this", cx));
+                assert!(state.prepare_prompt(first, "send this", cx));
+                state.update_sender_for(first)(SessionUpdate::Finished {
+                    outcome: fx_agent::codex::TurnOutcome::Cancelled {
+                        thread_id: String::new(),
+                        events: vec![],
+                    },
+                });
+                state.drain_updates_with_context(cx);
+                assert_eq!(first_field.read(cx).value(), "send this");
+                assert_eq!(second_field.read(cx).value(), "another chat's draft");
+            })
+        });
+    }
+
+    #[test]
+    fn a_finished_turn_saves_the_outcome_the_sidebar_shows_for_unloaded_threads() {
+        use fx_core::AgentExecutionState;
+
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, _, first, second) = test.update(|cx| workspace(cx, &paths));
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                state.update_sender_for(first)(SessionUpdate::Finished {
+                    outcome: fx_agent::codex::TurnOutcome::Completed {
+                        thread_id: String::new(),
+                        stop_reason: "end_turn".into(),
+                        events: vec![],
+                    },
+                });
+                state.update_sender_for(second)(SessionUpdate::Failed {
+                    reason: "CLI unavailable".into(),
+                });
+                state.drain_updates_with_context(cx);
+                assert_eq!(
+                    state.thread(first).unwrap().execution_state,
+                    AgentExecutionState::Success
+                );
+                assert_eq!(
+                    state.thread(second).unwrap().execution_state,
+                    AgentExecutionState::Failure
+                );
+            })
+        });
+
+        // After a restart nothing is loaded, and the rows still say the same.
+        let restarted = test.update(|cx| cx.new(|cx| AppState::restore(paths.clone(), cx)));
+        test.update(|cx| {
+            let state = restarted.read(cx);
+            for (agent, expected) in [
+                (first, fx_design::components::ActivityState::Completed),
+                (second, fx_design::components::ActivityState::Error),
+            ] {
+                let saved = state.thread(agent).unwrap().execution_state;
+                assert_eq!(
+                    crate::thread_presentation::activity(None, false, saved).0,
+                    expected
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn a_failure_after_acceptance_does_not_put_the_sent_prompt_back() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, _, agent, _) = test.update(|cx| workspace(cx, &paths));
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                let field = state.draft(agent, cx);
+                field.update(cx, |field, cx| field.set_value("sent prompt", cx));
+                assert!(state.prepare_prompt(agent, "sent prompt", cx));
+                let update = state.update_sender_for(agent);
+                update(SessionUpdate::Accepted);
+                update(SessionUpdate::Failed {
+                    reason: "provider disconnected".into(),
+                });
+                state.drain_updates_with_context(cx);
+                assert!(field.read(cx).value().is_empty());
+                assert!(
+                    state
+                        .conversation_by_agent(agent)
+                        .unwrap()
+                        .lock()
+                        .unwrap()
+                        .unsent()
+                        .is_none()
+                );
             })
         });
     }

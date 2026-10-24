@@ -405,8 +405,20 @@ impl PersistedApp {
     /// not be able to open the inspector off-screen.
     pub fn normalize(&mut self) {
         self.sidebar_width = normalized_sidebar_width(self.sidebar_width);
+        // The bounds come from the same file. `f32::clamp` panics when they are
+        // inverted, which made one bad pair crash every launch: the file parses,
+        // so the backup is never tried.
         let (min, max) = (self.min_right_panel_width, self.max_right_panel_width);
-        self.right_panel_width = self.right_panel_width.clamp(min, max);
+        if !(min.is_finite() && max.is_finite() && 0.0 <= min && min <= max) {
+            self.min_right_panel_width = default_min_panel_width();
+            self.max_right_panel_width = default_max_panel_width();
+        }
+        if !self.right_panel_width.is_finite() {
+            self.right_panel_width = default_panel_width();
+        }
+        self.right_panel_width = self
+            .right_panel_width
+            .clamp(self.min_right_panel_width, self.max_right_panel_width);
         for record in &mut self.projects {
             let agents: std::collections::HashSet<_> =
                 record.agents.iter().map(|agent| agent.id).collect();
@@ -750,6 +762,39 @@ mod tests {
         };
         app.normalize();
         assert_eq!(app.right_panel_width, app.min_right_panel_width);
+    }
+
+    #[test]
+    fn inverted_or_infinite_panel_bounds_are_repaired_instead_of_panicking() {
+        for (min, max, width) in [
+            (700.0, 600.0, 650.0),
+            (f32::INFINITY, f32::INFINITY, 420.0),
+            (-50.0, 600.0, 420.0),
+            (300.0, 600.0, f32::INFINITY),
+        ] {
+            let mut app = PersistedApp {
+                min_right_panel_width: min,
+                max_right_panel_width: max,
+                right_panel_width: width,
+                ..Default::default()
+            };
+            app.normalize();
+            assert!(app.min_right_panel_width <= app.max_right_panel_width);
+            assert!(app.right_panel_width.is_finite(), "{min} {max} {width}");
+            assert!(
+                (app.min_right_panel_width..=app.max_right_panel_width)
+                    .contains(&app.right_panel_width)
+            );
+        }
+
+        // The same pair decoded from a file, as a launch reads it.
+        let mut app: PersistedApp = serde_json::from_str(
+            r#"{"projects":[],"minRightPanelWidth":700,"maxRightPanelWidth":600,"rightPanelWidth":1e39}"#,
+        )
+        .unwrap();
+        app.normalize();
+        assert_eq!(app.min_right_panel_width, default_min_panel_width());
+        assert_eq!(app.max_right_panel_width, default_max_panel_width());
     }
 
     #[test]

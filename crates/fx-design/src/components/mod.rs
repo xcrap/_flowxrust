@@ -9,8 +9,10 @@ pub mod button;
 pub mod change_indicator;
 pub mod collapsible;
 pub mod context_menu;
+pub mod context_meter;
 pub mod menu;
 pub mod menu_model;
+pub mod provider_status;
 pub mod rich_text;
 pub mod segmented;
 pub mod status;
@@ -19,6 +21,8 @@ pub mod tooltip;
 pub mod turn_action;
 
 pub use change_indicator::change_indicator;
+pub use context_meter::{ContextUsage, context_meter};
+pub use provider_status::{ProviderIdentity, provider_status};
 pub use turn_action::{TurnAction, turn_action_button};
 
 pub use collapsible::collapsible;

@@ -946,26 +946,7 @@ fn convert_turns(
                         }],
                         false,
                     )?;
-                    let output = [
-                        "aggregatedOutput",
-                        "output",
-                        "result",
-                        "error",
-                        "contentItems",
-                        "changes",
-                        "results",
-                        "agentsStates",
-                    ]
-                    .iter()
-                    .filter_map(|key| item.get(*key))
-                    .filter(|value| !value.is_null())
-                    .map(value_text)
-                    .find(|text| !text.trim().is_empty());
-                    let is_error = item["status"] == "failed"
-                        || item["status"] == "declined"
-                        || item["success"] == false
-                        || item["exitCode"].as_i64().is_some_and(|code| code != 0)
-                        || !item["error"].is_null();
+                    let (output, is_error) = super::session::tool_outcome(item);
                     if is_error
                         || output
                             .as_deref()
@@ -975,7 +956,8 @@ fn convert_turns(
                             MessageRole::Tool,
                             vec![MessageContent::ToolResult {
                                 id: item_id,
-                                content: output.unwrap_or_else(|| "Tool failed".into()),
+                                content: output
+                                    .unwrap_or_else(|| super::session::TOOL_FAILED.into()),
                                 is_error,
                             }],
                             true,

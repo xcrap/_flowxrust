@@ -82,8 +82,8 @@ use std::rc::Rc;
 
 use fx_agent::conversation::state::VISIBLE_QUEUED_PROMPTS;
 use fx_design::components::{
-    BadgeTone, IconButtonProps, SegmentedOption, TurnAction, badge, icon_button, segmented_control,
-    turn_action_button,
+    BadgeTone, ContextUsage, IconButtonProps, ProviderIdentity, SegmentedOption, TurnAction, badge,
+    context_meter, icon_button, segmented_control, turn_action_button,
 };
 use fx_design::icon::Icon;
 use fx_design::styled::{FxStyled, px_len};
@@ -180,6 +180,9 @@ impl Picker {
 /// What the composer needs to know that it cannot derive from the field.
 #[derive(Clone, Default)]
 pub struct ComposerChrome {
+    /// Compact context gauge, separate from the send/stop action.
+    pub context_usage: Option<ContextUsage>,
+    pub provider: ProviderIdentity,
     /// A turn is running: the send button becomes a stop button.
     pub busy: bool,
     /// Prompts queued behind the running turn, oldest first.
@@ -451,6 +454,11 @@ fn control_row(
         .items_end()
         .gap(px_len(Spacing::SM))
         .child(controls)
+        .children(
+            chrome
+                .context_usage
+                .map(|usage| context_meter(usage, chrome.provider)),
+        )
         .child(primary_action(chrome, can_send))
         .into_any_element()
 }
@@ -1224,6 +1232,10 @@ mod tests {
     /// The widest chrome a caller can produce: every control at once.
     fn widest_chrome() -> ComposerChrome {
         ComposerChrome {
+            context_usage: Some(ContextUsage {
+                used: Some(200_000),
+                limit: Some(200_000),
+            }),
             busy: true,
             queued: vec![
                 "run the suite".into(),

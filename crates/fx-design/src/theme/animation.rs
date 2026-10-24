@@ -76,6 +76,12 @@ impl FxAnimation {
     pub const STATUS_PULSE: Duration = Duration::from_millis(1600);
     /// One full rotation of the activity spinner.
     pub const ACTIVITY_SPIN: Duration = Duration::from_millis(800);
+    /// How often continuous status motion repaints, about 30 Hz.
+    ///
+    /// A spinner or pulse that repaints on every display frame redraws the whole
+    /// window at 60–120 Hz for as long as a turn runs, since the sidebar is drawn
+    /// by the root view. Neither needs more than this to read as motion.
+    pub const ACTIVITY_FRAME: Duration = Duration::from_millis(33);
     /// One step of the three-dot typing indicator.
     pub const TYPING_STEP: Duration = Duration::from_millis(350);
 

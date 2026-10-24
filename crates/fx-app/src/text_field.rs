@@ -58,6 +58,8 @@ const FIELD_PADDING_X: f32 = Spacing::SM;
 const FIELD_PADDING_Y: f32 = Spacing::XXS;
 /// Width of the blinking caret.
 const CARET_WIDTH: f32 = BorderWidth::REGULAR;
+/// Thickness of the underline under text the IME is still composing.
+const MARKED_UNDERLINE: f32 = BorderWidth::REGULAR;
 /// One half of a blink cycle: long enough not to read as a flicker, short
 /// enough that the caret still reads as present.
 const CARET_BLINK_INTERVAL: Duration = Duration::from_millis(530);
@@ -119,6 +121,10 @@ struct FieldSnapshot {
 pub struct TextField {
     value: String,
     selection: Selection,
+    /// The IME's in-progress composition, in bytes of `value`. While it is set
+    /// GPUI routes keys to the input context first, so Return confirms the
+    /// composition instead of submitting or inserting a newline.
+    marked: Option<Range<usize>>,
     placeholder: String,
     focus_handle: FocusHandle,
     on_submit: Option<SubmitHandler>,
@@ -148,6 +154,7 @@ impl TextField {
         Self {
             value: String::new(),
             selection: Selection::collapsed(0),
+            marked: None,
             placeholder: String::new(),
             focus_handle: cx.focus_handle(),
             on_submit: None,
@@ -283,6 +290,9 @@ impl TextField {
         if !self.enabled {
             return;
         }
+        // Any edit ends a composition; `replace_and_mark_text_in_range` marks
+        // its own insertion again afterwards.
+        self.marked = None;
         let range = sanitize_range(&self.value, range);
         let insert = if self.multiline.is_some() {
             insert.to_string()
@@ -301,6 +311,55 @@ impl TextField {
         self.selection = Selection::collapsed(head);
         self.caret_on = true;
         self.dragging = false;
+    }
+
+    /// Where text from the platform lands: the range it names, else the
+    /// composition it replaces, else the selection. A dead key or an IME sends
+    /// its final text with no range, meaning "over what is being composed".
+    fn input_range(&self, range_utf16: Option<Range<usize>>) -> Range<usize> {
+        let range = range_utf16
+            .map(|range| utf16_range(&self.value, range))
+            .or_else(|| self.marked.clone())
+            .unwrap_or_else(|| self.selection.range());
+        sanitize_range(&self.value, range)
+    }
+
+    /// Insert final text from the platform, ending any composition.
+    fn commit_text(&mut self, range_utf16: Option<Range<usize>>, text: &str) {
+        let range = self.input_range(range_utf16);
+        self.edit(range, text);
+    }
+
+    /// Replace the composition with the IME's in-progress text and keep it
+    /// marked, with the selection where the IME puts it inside that text.
+    /// Empty text cancels the composition.
+    fn mark_text(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        text: &str,
+        selected_utf16: Option<Range<usize>>,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let range = self.input_range(range_utf16);
+        self.edit(range.clone(), text);
+        // `edit` may have stripped or truncated the text; the caret is where
+        // what actually went in ends.
+        let marked = range.start..self.selection.head;
+        if marked.is_empty() {
+            return;
+        }
+        if let Some(selected) = selected_utf16 {
+            let composed = &self.value[marked.clone()];
+            self.selection = Selection {
+                anchor: marked.start
+                    + byte_index_for_utf16(composed, selected.start.min(selected.end)),
+                head: marked.start
+                    + byte_index_for_utf16(composed, selected.end.max(selected.start)),
+            };
+        }
+        self.marked = Some(marked);
     }
 
     /// The text the selection covers, or `""` when nothing is selected.
@@ -470,6 +529,7 @@ impl TextField {
             content.size.width,
             self.display_index(self.selection.head),
             color,
+            None,
         );
         self.source_index(layout.index_at(point(at.x - content.origin.x, at.y - content.origin.y)))
     }
@@ -571,6 +631,9 @@ impl TextField {
             },
             _ => Selection::collapsed(index),
         };
+        // Clicking away keeps whatever was composed, as typed text. A marked
+        // range left behind would point at text the caret has already left.
+        self.marked = None;
         // A plain click collapses; shift-click extends from the existing anchor.
         self.selection = if event.modifiers.shift {
             clicked.with_anchor(self.selection.anchor)
@@ -630,6 +693,8 @@ impl Render for TextField {
             visible_width,
             self.display_index(self.selection.head),
             text_color,
+            // A secret field draws bullets, whose offsets are not the value's.
+            self.marked.clone().filter(|_| !self.secret),
         );
         let visible_rows = layout
             .rows
@@ -1259,8 +1324,9 @@ fn build_layout(
     visible_width: Pixels,
     caret: usize,
     color: gpui::Rgba,
+    marked: Option<Range<usize>>,
 ) -> TextLayout {
-    let shaped = shape_value(window, metrics, value, visible_width, color);
+    let shaped = shape_value(window, metrics, value, visible_width, color, marked);
 
     let mut lines: Vec<LogicalLine> = Vec::new();
     match &shaped {
@@ -1338,12 +1404,14 @@ fn shape_value(
     value: &str,
     visible_width: Pixels,
     color: gpui::Rgba,
+    marked: Option<Range<usize>>,
 ) -> ShapedText {
+    let runs = value_runs(value, metrics, color, marked);
     if metrics.wrap && visible_width > px(0.0) {
         match window.text_system().shape_text(
             SharedString::from(value.to_string()),
             metrics.font_size,
-            &[text_run(value, metrics, color)],
+            &runs,
             Some(visible_width),
             None,
         ) {
@@ -1355,12 +1423,12 @@ fn shape_value(
     }
     // `shape_line` debug-asserts on newlines, and a single-line value cannot
     // hold one; the replace keeps that true even if a caller reaches here with
-    // something else.
+    // something else. A space is as long as a newline, so the runs still fit.
     let flattened = value.replace('\n', " ");
     ShapedText::Single(Box::new(window.text_system().shape_line(
-        SharedString::from(flattened.clone()),
+        SharedString::from(flattened),
         metrics.font_size,
-        &[text_run(&flattened, metrics, color)],
+        &runs,
         None,
     )))
 }
@@ -1377,6 +1445,40 @@ fn shape_one_line(
         &[text_run(text, metrics, color)],
         None,
     )
+}
+
+/// The value's runs, with the IME's in-progress composition underlined the way
+/// the system draws marked text.
+fn value_runs(
+    text: &str,
+    metrics: &FieldMetrics,
+    color: gpui::Rgba,
+    marked: Option<Range<usize>>,
+) -> Vec<TextRun> {
+    let base = text_run(text, metrics, color);
+    let Some(marked) = marked.filter(|range| range.start < range.end && range.end <= text.len())
+    else {
+        return vec![base];
+    };
+    let piece = |len, underline| TextRun {
+        len,
+        underline,
+        ..base.clone()
+    };
+    let underline = gpui::UnderlineStyle {
+        thickness: px(MARKED_UNDERLINE),
+        color: Some(color.into()),
+        wavy: false,
+    };
+    let mut runs = Vec::with_capacity(3);
+    if marked.start > 0 {
+        runs.push(piece(marked.start, None));
+    }
+    runs.push(piece(marked.len(), Some(underline)));
+    if marked.end < text.len() {
+        runs.push(piece(text.len() - marked.end, None));
+    }
+    runs
 }
 
 fn text_run(text: &str, metrics: &FieldMetrics, color: gpui::Rgba) -> TextRun {
@@ -1668,7 +1770,7 @@ fn move_vertical(value: &str, selection: Selection, forward: bool, extend: bool)
     } else {
         selection.head
     };
-    let head = selection.head;
+    let head = snap_back(value, selection.head);
     let (line_start, column) = line_and_column(value, head);
     let head = if forward {
         value[head..].find('\n').map_or(head, |offset| {
@@ -1689,10 +1791,13 @@ fn move_vertical(value: &str, selection: Selection, forward: bool, extend: bool)
 /// holding Down through a short line and back up returns to that line's end; a
 /// field that has to hold on to a desired column needs one more piece of state
 /// than this one keeps.
+///
+/// The column counts characters, not bytes. A byte column carried onto another
+/// line lands inside any multibyte character there, and slicing at it panics.
 fn line_and_column(value: &str, at: usize) -> (usize, usize) {
     let at = snap_back(value, at);
     let start = value[..at].rfind('\n').map_or(0, |offset| offset + 1);
-    (start, at - start)
+    (start, value[start..at].chars().count())
 }
 
 fn line_end(value: &str, line_start: usize) -> usize {
@@ -1701,12 +1806,21 @@ fn line_end(value: &str, line_start: usize) -> usize {
         .map_or(value.len(), |offset| line_start + offset)
 }
 
+/// The byte offset `column` characters into the line at `line_start`, or the
+/// line's end when it is shorter.
+fn column_on_line(value: &str, line_start: usize, column: usize) -> usize {
+    let end = line_end(value, line_start);
+    value[line_start..end]
+        .char_indices()
+        .nth(column)
+        .map_or(end, |(offset, _)| line_start + offset)
+}
+
 fn next_line_start(value: &str, from: usize, column: usize) -> usize {
     if from > value.len() {
         return value.len();
     }
-    let end = line_end(value, from);
-    (from + column).min(end)
+    column_on_line(value, from, column)
 }
 
 fn previous_line_start(value: &str, line_start: usize, column: usize) -> usize {
@@ -1714,7 +1828,7 @@ fn previous_line_start(value: &str, line_start: usize, column: usize) -> usize {
     let previous_start = value[..previous_end]
         .rfind('\n')
         .map_or(0, |offset| offset + 1);
-    (previous_start + column).min(previous_end)
+    column_on_line(value, previous_start, column)
 }
 
 /// Home or End, on the caret's line.
@@ -1812,12 +1926,16 @@ impl EntityInputHandler for TextField {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Range<usize>> {
-        // No preedit region: `replace_and_mark_text_in_range` commits straight
-        // away, so there is never a marked range to report.
-        None
+        self.marked.as_ref().map(|range| {
+            utf16_index_for_byte(&self.value, range.start)
+                ..utf16_index_for_byte(&self.value, range.end)
+        })
     }
 
-    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.marked = None;
+        cx.notify();
+    }
 
     fn replace_text_in_range(
         &mut self,
@@ -1826,10 +1944,7 @@ impl EntityInputHandler for TextField {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let range = replacement_range
-            .map(|range| utf16_range(&self.value, range))
-            .unwrap_or_else(|| self.selection.range());
-        self.edit(range, text);
+        self.commit_text(replacement_range, text);
         cx.notify();
     }
 
@@ -1837,14 +1952,12 @@ impl EntityInputHandler for TextField {
         &mut self,
         range_utf16: Option<Range<usize>>,
         new_text: &str,
-        _new_selected_range: Option<Range<usize>>,
-        window: &mut Window,
+        new_selected_range: Option<Range<usize>>,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Treated as a plain replacement: the IME's preedit is never displayed,
-        // so marking one would leave a marked range pointing at text that is
-        // already committed.
-        self.replace_text_in_range(range_utf16, new_text, window, cx);
+        self.mark_text(range_utf16, new_text, new_selected_range);
+        cx.notify();
     }
 
     fn bounds_for_range(
@@ -1866,6 +1979,7 @@ impl EntityInputHandler for TextField {
             content.size.width,
             self.display_index(self.selection.head),
             Colors::fg(&global::current()),
+            None,
         );
         let origin = point(
             content.origin.x - layout.scroll_x,
@@ -2007,6 +2121,49 @@ mod tests {
                         .as_deref(),
                     Some("••")
                 );
+            });
+            Probe { field }
+        });
+        test.refresh().unwrap();
+    }
+
+    #[test]
+    fn ime_composition_replaces_its_marked_text_instead_of_committing_it() {
+        let mut test = gpui::TestAppContext::single();
+        test.add_window(|window, cx| {
+            let field = cx.new(|cx| TextField::new(cx).multiline(4.0));
+            field.update(cx, |field, cx| {
+                field.set_value("🜁", cx);
+                field.selection = Selection::collapsed(field.value.len());
+
+                // Japanese "ka": k, then か, then confirmed with Return.
+                field.replace_and_mark_text_in_range(None, "k", Some(1..1), window, cx);
+                assert_eq!(field.value, "🜁k");
+                // The emoji is two UTF-16 units, so the composition starts at 2.
+                assert_eq!(field.marked_text_range(window, cx), Some(2..3));
+                field.replace_and_mark_text_in_range(None, "か", Some(1..1), window, cx);
+                assert_eq!(field.value, "🜁か", "the preedit replaces itself");
+                assert_eq!(field.selection, Selection::collapsed(field.value.len()));
+                field.replace_text_in_range(None, "か", window, cx);
+                assert_eq!(field.value, "🜁か", "confirming does not insert twice");
+                assert_eq!(field.marked_text_range(window, cx), None);
+
+                // A dead key: Option-E shows ´, then E replaces it with é.
+                field.replace_and_mark_text_in_range(None, "´", Some(1..1), window, cx);
+                field.replace_text_in_range(None, "é", window, cx);
+                assert_eq!(field.value, "🜁かé");
+
+                // Empty preedit text cancels the composition and removes it.
+                field.replace_and_mark_text_in_range(None, "ab", Some(0..1), window, cx);
+                assert_eq!(field.selected_text(), "a", "selection inside the preedit");
+                field.replace_and_mark_text_in_range(None, "", None, window, cx);
+                assert_eq!(field.value, "🜁かé");
+                assert_eq!(field.marked_text_range(window, cx), None);
+
+                // Any other edit ends the composition.
+                field.replace_and_mark_text_in_range(None, "x", None, window, cx);
+                field.set_value("reset", cx);
+                assert_eq!(field.marked_text_range(window, cx), None);
             });
             Probe { field }
         });
@@ -2371,6 +2528,38 @@ mod tests {
         assert_eq!(still.head, 1);
     }
 
+    #[test]
+    fn vertical_movement_counts_characters_across_multibyte_lines() {
+        // Column 3 in bytes is inside the second `é`; slicing there panicked.
+        let value = "éé\nabc";
+        let up = move_vertical(value, Selection::collapsed(value.len()), false, false);
+        assert_eq!(up.head, "éé".len());
+        let down = move_vertical(value, up, true, false);
+        assert_eq!(down.head, "éé\nab".len());
+
+        // Column 1 in characters is one `é` in, not one byte in.
+        let value = "a\néé";
+        let down = move_vertical(value, Selection::collapsed(1), true, false);
+        assert_eq!(down.head, "a\né".len());
+        assert_eq!(
+            move_vertical(value, down, false, false).head,
+            1,
+            "back to column 1 on the ASCII line"
+        );
+
+        // Every caret position moves to a character boundary in both directions.
+        let value = "🜁é\nxyz\nñ🜁ö";
+        for at in 0..=value.len() {
+            if !value.is_char_boundary(at) {
+                continue;
+            }
+            for forward in [false, true] {
+                let moved = move_vertical(value, Selection::collapsed(at), forward, false);
+                assert!(value.is_char_boundary(moved.head), "{at} {forward}");
+            }
+        }
+    }
+
     // ── UTF-16, which is the unit the platform speaks ──────────────────────
 
     #[test]
@@ -2492,6 +2681,42 @@ mod tests {
     }
 
     #[test]
+    fn a_field_paints_a_composition_in_either_layout() {
+        for multiline in [false, true] {
+            let mut test = gpui::TestAppContext::single();
+            let field = test.update(|cx| {
+                cx.new(|cx| {
+                    let field = TextField::new(cx);
+                    if multiline {
+                        field.multiline(3.0)
+                    } else {
+                        field
+                    }
+                })
+            });
+            test.update(|cx| {
+                field.update(cx, |field, _| {
+                    field.edit(0..0, "aé\nz");
+                    field.selection = Selection::collapsed(1);
+                    field.mark_text(None, "かな", None);
+                    assert_eq!(field.marked, Some(1..7));
+                    let runs = value_runs(
+                        &field.value,
+                        &field.metrics(&global::current(), false),
+                        Colors::fg(&global::current()),
+                        field.marked.clone(),
+                    );
+                    let lengths: Vec<_> = runs.iter().map(|run| run.len).collect();
+                    // A single-line field has already stripped the newline.
+                    assert_eq!(lengths, [1, 6, field.value.len() - 7]);
+                    assert!(runs[1].underline.is_some() && runs[0].underline.is_none());
+                });
+            });
+            paint(&mut test, field);
+        }
+    }
+
+    #[test]
     fn a_multiline_field_paints_text_long_enough_to_wrap() {
         let mut test = gpui::TestAppContext::single();
         let field = test.update(|cx| cx.new(|cx| TextField::new(cx).multiline(3.0)));
@@ -2524,7 +2749,15 @@ mod tests {
 
             let theme = global::current();
             let metrics = field.read(cx).metrics(&theme, false);
-            let layout = build_layout(window, &metrics, &value, px(width), 0, Colors::fg(&theme));
+            let layout = build_layout(
+                window,
+                &metrics,
+                &value,
+                px(width),
+                0,
+                Colors::fg(&theme),
+                None,
+            );
             check(&layout);
             Probe { field }
         });

@@ -2,9 +2,9 @@
 
 use fx_core::{Agent, Project};
 use fx_design::components::{
-    ActivityState, ButtonStyle, DividerAxis, IconButtonProps, MenuItem, MenuItemTone, MenuModel,
-    MenuSection, activity_dot, button_with_icon, collapsible, context_region, divider_with_axis,
-    empty_state, icon_button,
+    ButtonStyle, DividerAxis, IconButtonProps, MenuItem, MenuItemTone, MenuModel, MenuSection,
+    button_with_icon, collapsible, context_region, divider_with_axis, empty_state, icon_button,
+    provider_status,
 };
 use fx_design::icon::Icon;
 use fx_design::styled::{FxRefinement, FxStyled, px_len};
@@ -427,6 +427,22 @@ fn thread_row(
     let agent_id = agent.id;
     let title = thread_title(&agent);
     let busy = state.read(cx).is_thread_busy(agent_id);
+    let provider = crate::thread_presentation::provider(state.read(cx), &agent);
+    let conversation = state.read(cx).conversation_by_agent(agent_id);
+    let (activity, activity_label) = {
+        let conversation = conversation.as_ref().map(|conversation| {
+            conversation
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+        });
+        crate::thread_presentation::activity(
+            conversation
+                .as_ref()
+                .map(|conversation| conversation.phase()),
+            busy,
+            agent.execution_state,
+        )
+    };
     let menu = thread_menu(false, busy);
     let context_menu = menu.clone();
     let registry = state.read(cx).context_registry.clone();
@@ -465,18 +481,11 @@ fn thread_row(
                 });
             }
         })
-        .child(activity_dot(
-            if busy || selected {
-                Colors::accent(&theme)
-            } else {
-                Colors::fg_tertiary(&theme)
-            },
-            if busy {
-                ActivityState::Running
-            } else {
-                ActivityState::Idle
-            },
-            0.0,
+        .child(provider_status(
+            format!("thread-status:{agent_id}"),
+            provider,
+            activity,
+            activity_label,
         ))
         .child(
             div()

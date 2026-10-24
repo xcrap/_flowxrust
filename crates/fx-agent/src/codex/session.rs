@@ -487,6 +487,51 @@ pub fn is_read_only_command(command: &str) -> bool {
     READ_ONLY.contains(&base)
 }
 
+/// What a failed tool that said nothing is recorded as.
+pub(super) const TOOL_FAILED: &str = "Tool failed";
+
+/// What a completed tool item produced, and whether it failed.
+///
+/// Shared by live items and native history, so a turn reads the same while it
+/// streams as after a restart. The key order is the server's, not a guess:
+/// `aggregatedOutput` is what Codex actually sends, and reading only
+/// `output`/`result` yields an empty result for every real tool call — which
+/// then looks trivial and is dropped, so the transcript silently loses every
+/// tool output.
+///
+/// An explicit `null` is not output. Codex sends `"error": null` on every
+/// successful MCP call; reading the key's presence marked each one failed, and
+/// taking the first present key showed the literal text `null`.
+pub(super) fn tool_outcome(item: &Value) -> (Option<String>, bool) {
+    let output = [
+        "aggregatedOutput",
+        "output",
+        "result",
+        "error",
+        "contentItems",
+        "changes",
+        "results",
+        "agentsStates",
+    ]
+    .iter()
+    .filter_map(|key| item.get(*key))
+    .filter(|value| !value.is_null())
+    .map(|value| {
+        value
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| value.to_string())
+    })
+    .find(|text| !text.trim().is_empty());
+    let is_error = item["status"] == "failed"
+        || item["status"] == "declined"
+        || item["success"] == false
+        || item["is_error"] == true
+        || item["exitCode"].as_i64().is_some_and(|code| code != 0)
+        || !item["error"].is_null();
+    (output, is_error)
+}
+
 /// Preserve the tool arguments shared by live items and native history.
 ///
 /// Command items carry their command at the top level, whereas MCP and dynamic
@@ -603,24 +648,16 @@ pub fn parse_notification(method: &str, params: &Value) -> Vec<ProviderEvent> {
                     }];
                 }
                 // Completed: the output is the result.
-                //
-                // The key list and its order are the server's, not a guess:
-                // `aggregatedOutput` is what Codex actually sends, and reading
-                // only `output`/`result` yields an empty result for every real
-                // tool call — which then looks trivial and is dropped, so the
-                // transcript silently loses every tool output.
-                let content = ["aggregatedOutput", "output", "result", "error", "changes"]
-                    .iter()
-                    .find_map(|key| match item.get(*key) {
-                        Some(Value::String(text)) => Some(text.clone()),
-                        Some(other) => Some(other.to_string()),
-                        None => None,
-                    })
-                    // Defaulting to `Completed` is what lets the conversation's
-                    // trivial-result rule recognise a tool that said nothing.
-                    .unwrap_or_else(|| TRIVIAL_TOOL_RESULT.to_string());
-                let is_error = item.get("error").is_some()
-                    || item.get("is_error").and_then(Value::as_bool) == Some(true);
+                let (output, is_error) = tool_outcome(item);
+                let content = output.unwrap_or_else(|| {
+                    if is_error {
+                        TOOL_FAILED.to_string()
+                    } else {
+                        // Defaulting to `Completed` is what lets the conversation's
+                        // trivial-result rule recognise a tool that said nothing.
+                        TRIVIAL_TOOL_RESULT.to_string()
+                    }
+                });
                 return vec![ProviderEvent::ToolResult {
                     id,
                     content,
@@ -1209,6 +1246,51 @@ mod tests {
             ProviderEvent::ToolResult { is_error, .. } => assert!(is_error),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn explicit_nulls_in_a_completed_tool_item_are_neither_output_nor_failure() {
+        let result =
+            |item: Value| match parse_notification("item/completed", &json!({ "item": item }))
+                .remove(0)
+            {
+                ProviderEvent::ToolResult {
+                    content, is_error, ..
+                } => (content, is_error),
+                other => panic!("{other:?}"),
+            };
+
+        // A successful MCP call: `error` is present and null.
+        let (content, is_error) = result(json!({
+            "type": "mcpToolCall", "id": "m1", "status": "completed",
+            "result": {"content": [{"type": "text", "text": "42"}]}, "error": null
+        }));
+        assert!(!is_error, "a null error is not a failure");
+        assert!(content.contains("42"), "{content}");
+
+        // A failed MCP call: the leading null `result` must not hide the error.
+        let (content, is_error) = result(json!({
+            "type": "mcpToolCall", "id": "m2", "status": "failed",
+            "result": null, "error": {"message": "server unavailable"}
+        }));
+        assert!(is_error);
+        assert!(content.contains("server unavailable"), "{content}");
+
+        // A command that failed by exit code, with nulls ahead of nothing.
+        let (content, is_error) = result(json!({
+            "type": "commandExecution", "id": "c2", "status": "failed",
+            "aggregatedOutput": null, "exitCode": 2
+        }));
+        assert!(is_error);
+        assert_ne!(content, "null");
+
+        // A quiet success stays trivial, so the conversation drops it.
+        let (content, is_error) = result(json!({
+            "type": "commandExecution", "id": "c3", "status": "completed",
+            "aggregatedOutput": null, "exitCode": 0, "error": null
+        }));
+        assert!(!is_error);
+        assert_eq!(content, TRIVIAL_TOOL_RESULT);
     }
 
     #[test]

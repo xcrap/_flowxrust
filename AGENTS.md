@@ -315,6 +315,21 @@ A quarantined binary is skipped, not fatal: if a working one exists later in the
 search it is used. That is a real case — on the machine this was written on, the
 Homebrew cask `codex` is quarantined while a `~/.local/bin` install is not.
 
+What counts as quarantined is narrower than "has the attribute", for two reasons:
+
+- **A notarized binary passes.** The default assessor is Swift's
+  `SecStaticCodeCheckValidity` requirement (Apple, or Developer ID + notarized),
+  remembered per file identity. That same Homebrew `codex` is quarantined and
+  notarized, and is accepted.
+- **An approval keeps the attribute.** Approving a binary in Finder sets the
+  user-approved flag (`0x40`) in the value rather than removing it, so the value
+  is parsed. Checking presence alone meant the approval FlowX asks for could
+  never clear it.
+
+The extra directories are directories: the candidate is `<dir>/<name>`. Checking
+the directory itself always missed, and the search silently fell through to a
+login shell that does not read `~/.zshrc`.
+
 Discovery tests run with `without_extra_directories`. Without it a "not found"
 assertion can be satisfied, or defeated, by whatever happens to be installed on
 the machine running the suite.

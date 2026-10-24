@@ -80,7 +80,7 @@ pub enum SessionUpdate {
     },
     /// Streaming content changed; wake the matching conversation view.
     Changed,
-    /// The provider accepted the submitted prompt; a retained draft may clear.
+    /// The provider accepted the prompt; its retained recovery copy may clear.
     Accepted,
     /// Complete interaction data, preserving the grouping of multiple questions.
     Interaction { event: ProviderEvent },
@@ -576,6 +576,9 @@ impl Job {
         let mut thread_id = resume.unwrap_or_default();
         let mut accepted = false;
         let mut waiting = std::collections::HashSet::new();
+        // Silence is not a failure: thinking and long tools can take minutes,
+        // and the parser intentionally omits non-display frames. Only a result,
+        // a provider/process error, a closed stream, or Stop ends this turn.
         let ending = loop {
             tokio::select! {
                 _ = interrupts.recv() => {
@@ -633,9 +636,6 @@ impl Job {
                         Some(StreamItem::Exited(exit)) => break TurnOutcome::Failed { thread_id, reason: exit.reason(), events: Vec::new() },
                         None => break TurnOutcome::Failed { thread_id, reason: "Claude Code ended before reporting a result.".into(), events: Vec::new() },
                     }
-                }
-                _ = tokio::time::sleep(Duration::from_secs(120)), if waiting.is_empty() => {
-                    break TurnOutcome::Failed { thread_id, reason: "Claude Code stopped sending updates before the turn finished.".into(), events: Vec::new() };
                 }
             }
         };
@@ -1373,7 +1373,7 @@ mod tests {
             let script = dir.path().join("claude.py");
             let log = dir.path().join("received.jsonl");
             std::fs::write(&script, r#"
-import json, sys
+import json, sys, time
 from pathlib import Path
 if sys.argv[1:] == ["agents", "--json"]:
     marker = Path(__file__).with_name("active-session")
@@ -1396,6 +1396,17 @@ for line in sys.stdin:
         prompt=message["message"]["content"][0]["text"]
         send({"type":"system","subtype":"init","session_id":"11111111-2222-4333-8444-555555555555"})
         if prompt=="hang": continue
+        if prompt in ("quiet", "quiet-tool", "quiet-exit"):
+            if prompt=="quiet-tool":
+                send({"type":"assistant","message":{"content":[{"type":"tool_use","id":"long-tool","name":"Bash","input":{"command":"long-running build"}}]}})
+            while not Path("release-quiet-turn").exists(): time.sleep(0.005)
+            if prompt=="quiet-exit":
+                print("fixture process failed", file=sys.stderr, flush=True)
+                sys.exit(7)
+            if prompt=="quiet-tool":
+                send({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"long-tool","content":"Build finished"}]}})
+            finish("finished after quiet work")
+            continue
         if prompt in ("tool", "questions"):
             tool="Bash" if prompt=="tool" else "AskUserQuestion"
             data={"command":"cargo test"} if prompt=="tool" else {"questions":[
@@ -1690,6 +1701,119 @@ for line in sys.stdin:
         );
         assert_eq!(lock(&conversation).phase(), Phase::Idle);
         assert!(lock(&conversation).pending_approvals().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn claude_quiet_work_survives_two_minutes_and_still_completes_cancels_or_reports_exit() {
+        // A real child and pipes, with only Tokio's clock accelerated. The gate
+        // keeps the child quiet until the runner has crossed its old cutoff.
+        for (prompt, cancel) in [
+            ("quiet", false),
+            ("quiet-tool", false),
+            ("quiet", true),
+            ("quiet-exit", false),
+        ] {
+            let Some(server) = ClaudeFixture::new() else {
+                return;
+            };
+            let conversation = conversation();
+            lock(&conversation).set_phase(Phase::Starting);
+            let (interrupt, interrupts) = tokio::sync::mpsc::unbounded_channel();
+            let (response, responses) = tokio::sync::mpsc::unbounded_channel();
+            let (updates, mut received) = tokio::sync::mpsc::unbounded_channel();
+            let job = Job {
+                conversation: conversation.clone(),
+                provider: RuntimeProvider::Claude {
+                    discovery: RuntimeDiscovery::default().without_extra_directories(),
+                    spec: BinarySpec::new(
+                        "claude",
+                        "Claude Code",
+                        vec![FakeServer::python().unwrap()],
+                    )
+                    .with_arguments(vec![server.script.display().to_string()]),
+                },
+                project_root: server.dir.path().display().to_string(),
+                prompt: prompt.into(),
+                approvals: ApprovalPolicy::Ask,
+                access: AgentAccess::FullAccess,
+                model: "fixture-model".into(),
+                effort: None,
+                system_prompt: None,
+                on_update: Arc::new(Mutex::new(Box::new(move |update| {
+                    let _ = updates.send(update);
+                }))),
+                interrupt: interrupt.clone(),
+                responses: response,
+            };
+            let task = tokio::spawn(job.run(interrupts, responses));
+            tokio::time::timeout(TURN_BUDGET, async {
+                while let Some(update) = received.recv().await {
+                    match update {
+                        SessionUpdate::Started { .. } if prompt != "quiet-tool" => break,
+                        SessionUpdate::Changed
+                            if prompt == "quiet-tool"
+                                && lock(&conversation).message_count() > 0 =>
+                        {
+                            break;
+                        }
+                        SessionUpdate::Failed { reason } => {
+                            panic!("fixture failed to start: {reason}")
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .expect("the child reaches its quiet work");
+
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(121)).await;
+            // Poll the runner before releasing the child, so an elapsed timeout
+            // cannot race a result and occasionally escape the regression test.
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::advance(Duration::from_secs(3)).await;
+            tokio::time::resume();
+
+            if cancel {
+                interrupt.send(()).expect("Stop remains connected");
+            } else {
+                std::fs::write(server.dir.path().join("release-quiet-turn"), "continue").unwrap();
+            }
+            tokio::time::timeout(TURN_BUDGET, task)
+                .await
+                .expect("quiet work can settle")
+                .unwrap();
+            let mut ending = None;
+            while let Ok(update) = received.try_recv() {
+                if matches!(
+                    update,
+                    SessionUpdate::Finished { .. } | SessionUpdate::Failed { .. }
+                ) {
+                    ending = Some(update);
+                }
+            }
+            match (prompt, cancel, &ending) {
+                (
+                    _,
+                    true,
+                    Some(SessionUpdate::Finished {
+                        outcome: TurnOutcome::Cancelled { .. },
+                    }),
+                ) => {}
+                ("quiet-exit", false, Some(SessionUpdate::Failed { reason })) => {
+                    assert!(reason.contains("fixture process failed"), "{reason}")
+                }
+                (_, false, Some(SessionUpdate::Finished { outcome })) if outcome.is_completed() => {
+                    assert_eq!(
+                        rows(&conversation).last().map(String::as_str),
+                        Some("text: finished after quiet work")
+                    )
+                }
+                _ => panic!("{prompt}, cancel={cancel}: {ending:?}"),
+            }
+        }
     }
 
     #[test]

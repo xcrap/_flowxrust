@@ -59,6 +59,33 @@ fn white_on_black_is_the_textbook_ratio() {
 }
 
 #[test]
+fn provider_glyphs_clear_non_text_contrast_on_their_sidebar_tiles() {
+    use fx_design::theme::WithAlpha;
+    for (tone, mode) in all_theme_combinations() {
+        let theme = theme_for(tone, mode);
+        for color in [
+            Colors::provider_codex(&theme),
+            Colors::provider_claude(&theme),
+        ] {
+            for surface in [
+                Colors::bg_elevated(&theme),
+                Colors::bg_selected(&theme),
+                Colors::bg_hover(&theme),
+            ] {
+                // The brightest point in the waiting pulse is the hardest case.
+                let surface = composite(surface, Colors::bg_elevated(&theme));
+                let background = composite(color.with_alpha(0.18), surface);
+                assert!(
+                    contrast(color, background) >= 3.0,
+                    "{tone:?} {mode:?}: {}",
+                    contrast(color, background)
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn text_tokens_meet_their_contrast_floors_in_every_tone_and_mode() {
     for (tone, mode) in all_theme_combinations() {
         let t = theme_for(tone, mode);
