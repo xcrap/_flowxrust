@@ -355,9 +355,12 @@ impl TurnInput {
     ///
     /// The empty `session_id` and the null `parent_tool_use_id` are the shape
     /// Claude reads rather than placeholders: a user frame claiming a session
-    /// Claude never handed out is not a frame it will act on.
+    /// Claude never handed out is not a frame it will act on. The `uuid` is
+    /// what Claude reports the message's fate under, as `command_lifecycle`
+    /// frames; a message without one gets none.
     pub fn user_message(
         &mut self,
+        id: uuid::Uuid,
         prompt: &str,
         images: &[impl AsRef<Path>],
     ) -> Result<Value, TransportError> {
@@ -377,6 +380,7 @@ impl TurnInput {
         }
         Ok(json!({
             "type": "user",
+            "uuid": id,
             "session_id": "",
             "message": { "role": "user", "content": content },
             "parent_tool_use_id": Value::Null,
@@ -648,12 +652,24 @@ impl ClaudeTransport {
         prompt: &str,
         images: &[impl AsRef<Path>],
     ) -> Result<(), TransportError> {
+        self.send_message(uuid::Uuid::new_v4(), prompt, images)
+            .await
+    }
+
+    /// Send one user message under the caller's id, which is what Claude
+    /// names it by when it takes it into a turn.
+    pub async fn send_message(
+        &self,
+        id: uuid::Uuid,
+        prompt: &str,
+        images: &[impl AsRef<Path>],
+    ) -> Result<(), TransportError> {
         // The gate stays locked until the write is queued. Checked under the
         // lock and queued after it, a close could land in between: its `Close`
         // went first, the writer stopped there, and the prompt the caller was
         // told had been sent was discarded.
         let mut input = self.inner.input.lock().await;
-        let envelope = input.user_message(prompt, images)?;
+        let envelope = input.user_message(id, prompt, images)?;
         self.write(envelope).await
     }
 
@@ -1431,10 +1447,13 @@ mod tests {
     #[test]
     fn a_user_message_is_shaped_the_way_claude_reads() {
         let mut input = TurnInput::new();
+        let id = uuid::Uuid::from_u128(7);
         let message = input
-            .user_message("hello", &[] as &[&Path])
+            .user_message(id, "hello", &[] as &[&Path])
             .expect("a message");
         assert_eq!(message["type"], "user");
+        // What Claude reports the message's fate under; without it, nothing.
+        assert_eq!(message["uuid"], id.to_string());
         assert_eq!(message["session_id"], "");
         assert_eq!(message["message"]["role"], "user");
         assert!(message["parent_tool_use_id"].is_null());
@@ -1449,7 +1468,7 @@ mod tests {
         // user typed, and dropping it silently would be worse than an empty turn.
         let mut input = TurnInput::new();
         let message = input
-            .user_message("   ", &[] as &[&Path])
+            .user_message(uuid::Uuid::nil(), "   ", &[] as &[&Path])
             .expect("a message");
         assert_eq!(message["message"]["content"][0]["text"], "   ");
     }
@@ -1460,7 +1479,7 @@ mod tests {
         // it, so it is refused here instead.
         let mut input = TurnInput::new();
         let error = input
-            .user_message("", &[] as &[&Path])
+            .user_message(uuid::Uuid::nil(), "", &[] as &[&Path])
             .expect_err("nothing to send");
         assert!(matches!(error, TransportError::NothingToSend), "{error:?}");
         assert!(input.is_open(), "a refused message closed the input");
@@ -1472,7 +1491,9 @@ mod tests {
         let png = dir.path().join("shot.png");
         std::fs::write(&png, b"\x89PNG\r\n\x1a\n").expect("wrote the image");
         let mut input = TurnInput::new();
-        let message = input.user_message("", &[&png]).expect("a message");
+        let message = input
+            .user_message(uuid::Uuid::nil(), "", &[&png])
+            .expect("a message");
         assert_eq!(
             message["message"]["content"].as_array().map(Vec::len),
             Some(1)
@@ -1487,7 +1508,9 @@ mod tests {
         std::fs::write(&png, b"\x89PNG\r\n\x1a\n").expect("wrote the image");
 
         let mut input = TurnInput::new();
-        let message = input.user_message("look", &[&png]).expect("a message");
+        let message = input
+            .user_message(uuid::Uuid::nil(), "look", &[&png])
+            .expect("a message");
         let blocks = message["message"]["content"].as_array().expect("blocks");
         // The prompt first, then the image: Claude reads them in order and the
         // question belongs to the text above it.
@@ -1573,7 +1596,7 @@ mod tests {
         let mut input = TurnInput::new();
         assert!(input.close());
         let error = input
-            .user_message("too late", &[] as &[&Path])
+            .user_message(uuid::Uuid::nil(), "too late", &[] as &[&Path])
             .expect_err("refused");
         assert!(matches!(error, TransportError::InputClosed), "{error:?}");
     }

@@ -40,6 +40,10 @@ pub const MAX_RUNTIME_ACTIVITIES: usize = 200;
 /// The Swift drops it: a tool that succeeded and said only "Completed" would
 /// otherwise add a message per call and bury the prose the user actually reads.
 pub const TRIVIAL_TOOL_RESULT: &str = "Completed";
+
+/// How many ids read before anything was held under them are remembered. One
+/// is each prompt's own, which nothing ever claims.
+const MAX_READ_EARLY: usize = 8;
 /// How many queued follow-ups are shown in the composer.
 pub const VISIBLE_QUEUED_PROMPTS: usize = 3;
 /// Longest preview of a queued prompt.
@@ -353,6 +357,9 @@ pub struct Conversation {
     streaming_segment: u64,
     /// Guidance the provider has taken but not read yet, in the order sent.
     steers: Vec<Arc<ConversationMessage>>,
+    /// Ids the provider said it read before anything was held under them.
+    /// Codex's record of a steer can overtake its answer to the steer.
+    read_early: VecDeque<String>,
     phase: Phase,
     error: Option<String>,
     queued: VecDeque<QueuedPrompt>,
@@ -440,14 +447,20 @@ impl Conversation {
         self.touch();
     }
 
-    /// Hold guidance until the provider reads it.
+    /// Hold guidance until the provider reads it, under the message's id.
     ///
-    /// Claude reads a steer at its next request, not when it is written: one
-    /// sent mid-sentence is read after that sentence and the calls it leads
-    /// to, which is where Claude's own history records it. Placed on arrival
-    /// it split the sentence around it, and the history, which has the
-    /// sentence whole, could never be matched again.
+    /// A provider reads a steer at its next request, not when it accepts it:
+    /// one sent mid-sentence is read after that sentence and the calls it
+    /// leads to, which is where the provider's own history records it. Placed
+    /// on acceptance it split the sentence around it, and the history, which
+    /// has the sentence whole, could never be matched again.
     pub fn hold_steer(&mut self, message: ConversationMessage) {
+        let id = message.id.to_string();
+        if let Some(index) = self.read_early.iter().position(|early| *early == id) {
+            self.read_early.remove(index);
+            self.land(vec![Arc::new(message)]);
+            return;
+        }
         self.steers.push(Arc::new(message));
         self.touch();
     }
@@ -458,15 +471,39 @@ impl Conversation {
         &self.steers
     }
 
-    /// Land held guidance in the transcript, after whatever streamed before
-    /// it. The same messages, not copies, so a view that drew them while they
-    /// waited sees the rows it already measured.
+    /// Land every held steer in the transcript, after whatever streamed
+    /// before it. The same messages, not copies, so a view that drew them
+    /// while they waited sees the rows it already measured.
     pub fn place_steers(&mut self) {
-        if self.steers.is_empty() {
+        let steers = std::mem::take(&mut self.steers);
+        self.land(steers);
+    }
+
+    /// Land the held steer the provider says it took. An id nothing is held
+    /// under is kept a while, in case its steer is still on its way to being
+    /// held; the prompt's own id is one of those, and is never claimed.
+    pub fn place_steer(&mut self, id: &str) {
+        let Some(index) = self
+            .steers
+            .iter()
+            .position(|steer| steer.id.to_string() == id)
+        else {
+            if self.read_early.len() >= MAX_READ_EARLY {
+                self.read_early.pop_front();
+            }
+            self.read_early.push_back(id.to_owned());
+            return;
+        };
+        let steer = self.steers.remove(index);
+        self.land(vec![steer]);
+    }
+
+    fn land(&mut self, steers: Vec<Arc<ConversationMessage>>) {
+        if steers.is_empty() {
             return;
         }
         self.commit_streaming();
-        self.messages.extend(std::mem::take(&mut self.steers));
+        self.messages.extend(steers);
         self.trim();
         self.message_revision += 1;
         self.touch();
@@ -1088,7 +1125,6 @@ impl Conversation {
                             self.set_phase(Phase::Starting);
                         }
                     }
-                    L::Requesting => self.place_steers(),
                 }
             }
             ProviderEvent::TextDelta(delta) => {
@@ -1229,6 +1265,8 @@ impl Conversation {
                 }
             }
             ProviderEvent::Task(update) => self.apply_task(update),
+            ProviderEvent::InputTaken { id: Some(id) } => self.place_steer(&id),
+            ProviderEvent::InputTaken { id: None } => self.place_steers(),
         }
     }
 
@@ -1810,9 +1848,9 @@ mod tests {
         assert_eq!(c.held_steers().len(), 1, "placed before Claude read it");
         let held = c.held_steers()[0].clone();
 
-        c.apply(ProviderEvent::Lifecycle(
-            crate::provider::Lifecycle::Requesting,
-        ));
+        c.apply(ProviderEvent::InputTaken {
+            id: Some(held.id.to_string()),
+        });
         c.apply(ProviderEvent::TextDelta("Switching to staging.".into()));
         c.apply(ProviderEvent::TextEnd);
         assert!(c.held_steers().is_empty());
@@ -1828,6 +1866,21 @@ mod tests {
         assert_eq!(roles_and_text[4].1, "Switching to staging.");
         // The message the view drew while it waited, not a copy of it.
         assert!(Arc::ptr_eq(c.shared_messages().nth(3).unwrap(), &held));
+    }
+
+    #[test]
+    fn a_steer_read_before_it_was_held_lands_as_soon_as_it_is() {
+        // Codex's record of a steer can overtake its answer to the steer.
+        let mut c = Conversation::new(Uuid::nil());
+        c.apply(ProviderEvent::TextDelta("Done with the build.".into()));
+        let steer = user_message("Now run the tests");
+        c.apply(ProviderEvent::InputTaken {
+            id: Some(steer.id.to_string()),
+        });
+        c.hold_steer(steer);
+        assert!(c.held_steers().is_empty(), "a steer already read was held");
+        let texts: Vec<String> = c.messages().map(|message| message.text_content()).collect();
+        assert_eq!(texts, ["Done with the build.", "Now run the tests"]);
     }
 
     #[test]

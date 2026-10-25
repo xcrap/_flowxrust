@@ -7797,9 +7797,10 @@ mod native_sync_tests {
 
     #[test]
     fn a_steer_sent_mid_sentence_matches_the_history_that_has_the_sentence_whole() {
-        // Claude's history keeps the sentence whole and records the steer
-        // after the call it led to. Placed when it was written, the steer split
-        // the live sentence, and the check never passed for that thread again.
+        // The provider's history keeps the sentence whole and records the
+        // steer after the call it led to. Placed when it was accepted, the
+        // steer split the live sentence, and the check never passed for that
+        // thread again.
         use fx_agent::ProviderEvent;
         use fx_agent::provider::Lifecycle;
         let steer = || ConversationMessage::text(MessageRole::User, "Use the staging config");
@@ -7811,11 +7812,13 @@ mod native_sync_tests {
             ));
             conversation.apply(ProviderEvent::Lifecycle(Lifecycle::TurnStarted));
             conversation.apply(ProviderEvent::TextDelta("Let me check th".into()));
+            let sent = steer();
+            let id = sent.id.to_string();
             if hold {
-                conversation.hold_steer(steer());
+                conversation.hold_steer(sent);
             } else {
                 conversation.commit_streaming();
-                conversation.append(steer());
+                conversation.append(sent);
             }
             conversation.apply(ProviderEvent::TextDelta("e config file.".into()));
             conversation.apply(ProviderEvent::TextEnd);
@@ -7829,7 +7832,7 @@ mod native_sync_tests {
                 content: "env = production".into(),
                 is_error: false,
             });
-            conversation.apply(ProviderEvent::Lifecycle(Lifecycle::Requesting));
+            conversation.apply(ProviderEvent::InputTaken { id: Some(id) });
             conversation.apply(ProviderEvent::TextDelta("Switching to staging.".into()));
             conversation.apply(ProviderEvent::Done {
                 stop_reason: "end_turn".into(),

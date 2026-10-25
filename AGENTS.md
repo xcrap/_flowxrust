@@ -576,15 +576,22 @@ strip above it. Five rules, each of which is a bug that was written first:
   first result. It tracks completion for the spinner; that is all — so only
   the result claims it. Claiming the call as it started made every running call
   read as finished.
-- **A steer lands where the provider reads it.** Codex takes one when it
-  accepts it, so its row goes in then. Claude reads one at its next request,
-  reported as `status: requesting`, so the row is held (`hold_steer`), drawn
-  after the live reply, and placed at that frame or when the turn ends.
-  Placed when it was written, a steer sent mid-sentence split the sentence
-  around itself, and Claude's history, which keeps the sentence whole and the
-  steer after the call it led to, never matched that thread again. Both fakes
-  send `requesting` at every turn that asks the model anything, as the CLI
-  does, and never in a zero-turn acknowledgement.
+- **A steer lands where the provider reads it.** Both providers accept a steer
+  at once and read it at their next request, after whatever they were saying
+  or running, which is where their histories record it. So the row is held
+  (`hold_steer`), drawn after the live reply, and placed when the provider
+  names the steer as read: Claude's `command_lifecycle` frame with state
+  `started`, sent only for a message that carries a `uuid`, and Codex's
+  `userMessage` item, whose `clientId` echoes the steer's
+  `clientUserMessageId`. Both were captured from the real CLIs (Claude Code
+  2.1.283, codex-cli 0.164). Placed on acceptance, a steer sent mid-sentence
+  split the sentence around itself and the history never matched that thread
+  again. Placed at the next `requesting` frame instead, a steer written just
+  as a request went out sat a step early. That frame, and a steer item that
+  comes back without an id, are the fallback for a CLI that names nothing; a
+  steer nothing names lands when the turn ends. An id read before its steer
+  is held (Codex's record can overtake its reply to `turn/steer`) places the
+  steer as soon as it is.
 
 Tool output is read from `aggregatedOutput` first, then `output`, `result`,
 `error`, `contentItems`, `changes`, `results`, `agentsStates` — that order is the

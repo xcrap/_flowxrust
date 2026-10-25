@@ -128,6 +128,15 @@ pub enum ProviderEvent {
     /// A background task the turn started — a subagent, or a command run in
     /// the background — started, reported progress, or finished.
     Task(TaskUpdate),
+    /// The provider took input FlowX wrote into the running turn: the message
+    /// FlowX sent under this id, or, from a provider that does not say which,
+    /// everything written so far.
+    ///
+    /// Taken, not accepted. Both providers accept a steer at once and read it
+    /// at their next request, after whatever they are saying or running.
+    InputTaken {
+        id: Option<String>,
+    },
 }
 
 /// One report about a background task.
@@ -192,9 +201,6 @@ pub enum Lifecycle {
     Compacting,
     Compacted,
     Preparing,
-    /// A request to the model is going out, carrying whatever was queued for
-    /// it. Claude reads a steer here, not when it is written.
-    Requesting,
 }
 
 #[derive(Debug, Clone, PartialEq)]

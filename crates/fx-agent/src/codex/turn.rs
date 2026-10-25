@@ -533,7 +533,13 @@ impl TurnSteerer {
     /// Codex rejects a steer aimed at a turn that is not the active one, which
     /// is why the expected id is always sent, and why a reply naming another
     /// turn is a failure rather than a success.
-    pub async fn steer(&self, prompt: &str, image_paths: &[String]) -> Result<(), ProviderError> {
+    /// `id` is what Codex names the steer by when it reads it.
+    pub async fn steer(
+        &self,
+        id: &str,
+        prompt: &str,
+        image_paths: &[String],
+    ) -> Result<(), ProviderError> {
         let Some(turn_id) = self
             .turn
             .lock()
@@ -549,7 +555,13 @@ impl TurnSteerer {
             .requester
             .request(
                 "turn/steer",
-                Some(steer_params(&self.thread_id, &turn_id, prompt, image_paths)),
+                Some(steer_params(
+                    &self.thread_id,
+                    &turn_id,
+                    id,
+                    prompt,
+                    image_paths,
+                )),
             )
             .await
             .map_err(map_error)?;

@@ -921,7 +921,7 @@ impl Job {
                     } else {
                         match attachment_files(&steer.attachments) {
                             Ok(files) => transport
-                                .send_prompt(&steer.text, &files)
+                                .send_message(steer.id, &steer.text, &files)
                                 .await
                                 .map_err(|error| error.to_string()),
                             Err(error) => Err(error),
@@ -1043,7 +1043,7 @@ impl Job {
         steering.pending.insert(id, steer);
         steering.requests.push(Box::pin(async move {
             let result = steerer
-                .steer(&text, &paths)
+                .steer(&id.to_string(), &text, &paths)
                 .await
                 .map_err(|error| error.to_string());
             (id, result)
@@ -1088,23 +1088,20 @@ impl Job {
         }
     }
 
-    /// Land accepted guidance in the transcript, then report the outcome.
+    /// Hold accepted guidance for the transcript, then report the outcome.
     ///
-    /// The row is added here rather than by the UI so it sits where the
-    /// provider took it. Codex takes a steer when it accepts it: after the
-    /// prose streamed so far, before the reply. Claude takes one at its next
-    /// request, so the row waits for that, drawn after the live reply, rather
-    /// than splitting a sentence Claude finishes before reading it.
+    /// Accepted is not read. Both providers accept a steer at once and read
+    /// it at their next request, after whatever they are saying or running,
+    /// and name it by the id it was sent with when they do. The row waits for
+    /// that, drawn after the live reply, so it lands where the provider's own
+    /// history puts it rather than splitting a sentence finished before it.
     fn steer_finished(&self, steer: Steer, result: Result<(), String>) {
         if result.is_ok() {
-            let mut conversation = lock(&self.conversation);
-            let message = crate::attachments::user_message(&steer.text, &steer.attachments);
-            if matches!(self.provider, RuntimeProvider::Claude { .. }) {
-                conversation.hold_steer(message);
-            } else {
-                conversation.commit_streaming();
-                conversation.append(message);
-            }
+            let message = fx_core::ConversationMessage {
+                id: steer.id,
+                ..crate::attachments::user_message(&steer.text, &steer.attachments)
+            };
+            lock(&self.conversation).hold_steer(message);
         }
         emit(
             &self.on_update,
@@ -2486,6 +2483,27 @@ for line in sys.stdin:
             continue
         turn()
         if prompt=="hang": continue
+        if prompt=="late-steer":
+            # The race: a steer written just before a request goes out is not
+            # in that request. Claude Code 2.1.283 names the message it takes
+            # into a turn, so the steer is read where it says, not at the
+            # first request after it was written.
+            send({"type":"command_lifecycle","state":"queued","command_uuid":message.get("uuid")})
+            send({"type":"command_lifecycle","state":"started","command_uuid":message.get("uuid")})
+            send({"type":"assistant","message":{"content":[{"type":"text","text":"Checking."}]}})
+            send({"type":"assistant","message":{"content":[{"type":"tool_use","id":"tool-1","name":"Read","input":{"file_path":"a.toml"}}]}})
+            steer=json.loads(sys.stdin.readline())
+            record(steer)
+            send({"type":"command_lifecycle","state":"queued","command_uuid":steer.get("uuid")})
+            send({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tool-1","content":"first"}]}})
+            send({"type":"system","subtype":"status","status":"requesting","session_id":SESSION})
+            send({"type":"assistant","message":{"content":[{"type":"text","text":"Reading the second file."}]}})
+            send({"type":"assistant","message":{"content":[{"type":"tool_use","id":"tool-2","name":"Read","input":{"file_path":"b.toml"}}]}})
+            send({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tool-2","content":"second"}]}})
+            send({"type":"command_lifecycle","state":"started","command_uuid":steer.get("uuid")})
+            send({"type":"system","subtype":"status","status":"requesting","session_id":SESSION})
+            finish("Using staging.")
+            continue
         if prompt=="mid-sentence":
             # Guidance written while Claude is halfway through a sentence is
             # read at its next request, after the sentence and the call it
@@ -3388,6 +3406,32 @@ def send(obj):
     sys.stdout.write(json.dumps(obj) + "\n")
     sys.stdout.flush()
 
+def wait_for_steer():
+    # Answers the next `turn/steer`, as codex-cli 0.164 does, and returns its
+    # params. The steer is recorded later, when Codex reads it.
+    while True:
+        waiting = sys.stdin.readline()
+        if not waiting:
+            sys.exit(0)
+        if not waiting.strip():
+            continue
+        request = json.loads(waiting)
+        if request.get("method") == "turn/steer":
+            params = request.get("params") or {}
+            with open("THREAD_LOG", "a") as log:
+                log.write(json.dumps({"method": "turn/steer", "params": params}) + "\n")
+            send({"jsonrpc": "2.0", "id": request.get("id"),
+                  "result": {"turnId": params.get("expectedTurnId")}})
+            return params
+
+def record_steer(params):
+    # Codex's record of a steer it has read, under the id it was sent with.
+    item = {"type": "userMessage", "id": "user-2",
+            "clientId": params.get("clientUserMessageId"),
+            "content": params.get("input") or []}
+    send({"jsonrpc": "2.0", "method": "item/started", "params": {"item": item}})
+    send({"jsonrpc": "2.0", "method": "item/completed", "params": {"item": item}})
+
 workflow = "default"
 for line in sys.stdin:
     line = line.strip()
@@ -3455,6 +3499,22 @@ for line in sys.stdin:
             send({"jsonrpc": "2.0", "method": "turn/started", "params": {"turn": {"id": "turn-1"}}})
             send({"jsonrpc": "2.0", "method": "item/agentMessage/delta", "params": {"delta": json.dumps(seen)}})
             send({"jsonrpc": "2.0", "method": "turn/completed", "params": {"turn": {"id": "turn-1", "status": "completed"}}})
+        elif prompt == "steer-mid-sentence":
+            # What codex-cli 0.164 did with a steer written mid-sentence: the
+            # sentence and the command it led to finish, and only then is the
+            # steer recorded, at the next request.
+            send({"jsonrpc": "2.0", "method": "turn/started", "params": {"turn": {"id": "turn-1"}}})
+            send({"jsonrpc": "2.0", "method": "item/started", "params": {"item": {"type": "agentMessage", "id": "msg-1", "text": ""}}})
+            send({"jsonrpc": "2.0", "method": "item/agentMessage/delta", "params": {"itemId": "msg-1", "delta": "Let me check th"}})
+            params = wait_for_steer()
+            send({"jsonrpc": "2.0", "method": "item/agentMessage/delta", "params": {"itemId": "msg-1", "delta": "e config file."}})
+            send({"jsonrpc": "2.0", "method": "item/completed", "params": {"item": {"type": "agentMessage", "id": "msg-1", "text": "Let me check the config file."}}})
+            command = {"type": "commandExecution", "id": "cmd-1", "command": "cat config.toml"}
+            send({"jsonrpc": "2.0", "method": "item/started", "params": {"item": command}})
+            send({"jsonrpc": "2.0", "method": "item/completed", "params": {"item": dict(command, aggregatedOutput="env = production", exitCode=0, status="completed")}})
+            record_steer(params)
+            send({"jsonrpc": "2.0", "method": "item/agentMessage/delta", "params": {"itemId": "msg-2", "delta": "Switching to staging."}})
+            send({"jsonrpc": "2.0", "method": "turn/completed", "params": {"turn": {"id": "turn-1", "status": "completed"}}})
         elif prompt == "wait-for-steer":
             # Starts, then waits for guidance and answers it within the turn.
             send({"jsonrpc": "2.0", "method": "turn/started", "params": {"turn": {"id": "turn-1"}}})
@@ -3471,6 +3531,7 @@ for line in sys.stdin:
                         log.write(json.dumps({"method": "turn/steer", "params": params}) + "\n")
                     send({"jsonrpc": "2.0", "id": request.get("id"),
                           "result": {"turnId": params.get("expectedTurnId")}})
+                    record_steer(params)
                     guidance = ""
                     for item in params.get("input") or []:
                         if item.get("type") == "text":
@@ -3664,6 +3725,53 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn a_steer_written_as_a_request_goes_out_lands_where_claude_took_it() {
+        // Written just before a request, a steer is not in that request but
+        // the one after. Placed at the first request after it was written, it
+        // sat a step early, ahead of prose Claude's history has before it.
+        let Some(server) = ClaudeFixture::new() else {
+            return;
+        };
+        let conversation = conversation();
+        let (runner, recorder) = server.start(&conversation, "late-steer", AgentAccess::FullAccess);
+        wait_until(&recorder, "the first call", || {
+            rows(&conversation).iter().any(|row| row == "call: Read")
+        });
+        let id = Uuid::new_v4();
+        assert!(runner.steer(id, "use staging".into(), Vec::new()));
+        let updates = recorder.wait_for_end(TURN_BUDGET);
+
+        assert!(
+            updates.contains(&SessionUpdate::Steered { id, result: Ok(()) }),
+            "{updates:?}"
+        );
+        assert_eq!(
+            rows(&conversation),
+            [
+                "text: Checking.",
+                "call: Read",
+                "result",
+                "text: Reading the second file.",
+                "call: Read",
+                "result",
+                "text: use staging",
+                "text: Using staging."
+            ],
+            "the guidance must sit where Claude took it"
+        );
+        // Sent under the steer's own id, which is how Claude names it.
+        let sent: Vec<serde_json::Value> = std::fs::read_to_string(&server.log)
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        assert!(
+            sent.iter().any(|message| message["uuid"] == id.to_string()),
+            "{sent:?}"
+        );
+    }
+
+    #[test]
     fn steering_a_running_codex_turn_lands_the_guidance_where_codex_took_it() {
         let Some(server) = FakeServer::new() else {
             return;
@@ -3699,6 +3807,50 @@ for line in sys.stdin:
             .expect("Codex was steered");
         assert_eq!(steer.1["threadId"], "thread-new");
         assert_eq!(steer.1["expectedTurnId"], "turn-1");
+        // The id Codex names the steer by when it records it.
+        assert_eq!(steer.1["clientUserMessageId"], id.to_string());
+    }
+
+    #[test]
+    fn a_steer_codex_takes_mid_sentence_lands_where_codex_recorded_it() {
+        // Codex accepted the steer at once and recorded it at its next
+        // request, after the sentence and the command. Placed on acceptance,
+        // the row split the sentence, and the history never matched.
+        let Some(server) = FakeServer::new() else {
+            return;
+        };
+        let Some(provider) = server.provider() else {
+            return;
+        };
+        let conversation = conversation();
+        let (runner, recorder) = start(
+            &conversation,
+            provider,
+            "steer-mid-sentence",
+            ApprovalPolicy::AllowAll,
+        );
+        wait_until(&recorder, "the sentence to start", || {
+            lock(&conversation).streaming_text() == "Let me check th"
+        });
+        let id = Uuid::new_v4();
+        assert!(runner.steer(id, "use staging".into(), Vec::new()));
+        let updates = recorder.wait_for_end(TURN_BUDGET);
+
+        assert!(
+            updates.contains(&SessionUpdate::Steered { id, result: Ok(()) }),
+            "{updates:?}"
+        );
+        assert_eq!(
+            rows(&conversation),
+            [
+                "text: Let me check the config file.",
+                "call: commandExecution",
+                "result",
+                "text: use staging",
+                "text: Switching to staging."
+            ],
+            "the guidance must sit where Codex recorded it"
+        );
     }
 
     #[test]

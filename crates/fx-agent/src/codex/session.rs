@@ -165,15 +165,20 @@ pub fn turn_params(request: &TurnRequest<'_>) -> Value {
 }
 
 /// Parameters for `turn/steer`.
+///
+/// `clientUserMessageId` comes back as the `clientId` of the user message
+/// Codex records for the steer, at its next request: the moment it reads it.
 pub fn steer_params(
     thread_id: &str,
     expected_turn_id: &str,
+    id: &str,
     prompt: &str,
     image_paths: &[String],
 ) -> Value {
     json!({
         "threadId": thread_id,
         "expectedTurnId": expected_turn_id,
+        "clientUserMessageId": id,
         "input": turn_input(prompt, image_paths),
     })
 }
@@ -733,6 +738,18 @@ pub fn parse_notification(method: &str, params: &Value) -> Vec<ProviderEvent> {
                     .map(|text| ProviderEvent::Text(text.to_string()))
                     .into_iter()
                     .collect(),
+                // A steer Codex has read, under the id FlowX sent it with.
+                // Codex accepts a steer at once and records it at its next
+                // request, after whatever it was saying or running.
+                ItemKind::UserMessage if started => item
+                    .get("clientId")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map(|id| ProviderEvent::InputTaken {
+                        id: Some(id.to_owned()),
+                    })
+                    .into_iter()
+                    .collect(),
                 // The conversation recorded the prompt when it was sent, and
                 // everything else waits for its completion or shows nothing.
                 _ => Vec::new(),
@@ -920,6 +937,11 @@ pub struct TurnNotifications {
     /// A delta arrived with no item id, so the next completed message is the
     /// one it belonged to.
     streamed_without_id: bool,
+    /// The turn's prompt has been recorded. A user message after it is a
+    /// steer, and one that comes back without the id it was sent with is
+    /// from a server that does not echo ids: it is still the moment Codex
+    /// read what had been written.
+    prompt_recorded: bool,
 }
 
 impl TurnNotifications {
@@ -937,6 +959,14 @@ impl TurnNotifications {
                         self.streamed.insert(id.to_owned());
                     }
                     None => self.streamed_without_id = true,
+                }
+            }
+            "item/started"
+                if params.pointer("/item/type").and_then(Value::as_str) == Some("userMessage") =>
+            {
+                let prompt = !std::mem::replace(&mut self.prompt_recorded, true);
+                if events.is_empty() && !prompt {
+                    return vec![ProviderEvent::InputTaken { id: None }];
                 }
             }
             "item/completed"
@@ -1183,10 +1213,46 @@ mod tests {
     #[test]
     fn steering_carries_the_turn_it_expects() {
         // Codex rejects a steer aimed at a turn that has already finished.
-        let params = steer_params("t1", "turn-9", "actually, use zsh", &[]);
+        let params = steer_params("t1", "turn-9", "steer-1", "actually, use zsh", &[]);
         assert_eq!(params["expectedTurnId"], "turn-9");
         assert_eq!(params["threadId"], "t1");
         assert_eq!(params["input"][0]["text"], "actually, use zsh");
+        // Echoed as the `clientId` of the user message Codex records for it.
+        assert_eq!(params["clientUserMessageId"], "steer-1");
+    }
+
+    #[test]
+    fn a_steer_is_taken_when_codex_records_it_under_the_id_it_was_sent_with() {
+        // Captured from codex-cli 0.164: the steer accepted while a command
+        // ran, and its user message recorded after the command finished and
+        // before the next request.
+        let mut notifications = TurnNotifications::new();
+        let user_message = |client_id: Value| {
+            json!({ "item": { "type": "userMessage", "id": "u", "clientId": client_id,
+                              "content": [{ "type": "text", "text": "use zsh" }] } })
+        };
+        assert!(
+            notifications
+                .parse("item/started", &user_message(Value::Null))
+                .is_empty(),
+            "the turn's own prompt is not a steer"
+        );
+        assert_eq!(
+            notifications.parse("item/started", &user_message(json!("steer-1"))),
+            vec![ProviderEvent::InputTaken {
+                id: Some("steer-1".into())
+            }]
+        );
+        assert!(
+            notifications
+                .parse("item/completed", &user_message(json!("steer-1")))
+                .is_empty()
+        );
+        // A server that does not echo the id still records the steer then.
+        assert_eq!(
+            notifications.parse("item/started", &user_message(Value::Null)),
+            vec![ProviderEvent::InputTaken { id: None }]
+        );
     }
 
     #[test]

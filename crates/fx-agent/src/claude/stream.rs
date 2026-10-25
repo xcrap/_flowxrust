@@ -115,6 +115,11 @@ pub struct ClaudeStreamParser {
     /// permission, so the input stays open until it comes: closed at the
     /// `result` before it, the permission's answer could not be written.
     follow_up_owed: bool,
+    /// Whether this CLI reports what happens to each message FlowX sends, as
+    /// `command_lifecycle` frames. Every message carries an id, so the
+    /// prompt's own frames say so before the turn's first request. Kept
+    /// across turns: it is the CLI's, not the turn's.
+    reports_reads: bool,
     /// A notification that is owed an answer arrived while a turn was
     /// running. The turn's next request carries it, and then it is answered
     /// there; if the turn makes none, it is answered as a turn of its own
@@ -271,8 +276,27 @@ impl ClaudeStreamParser {
             "assistant" => self.assistant(&envelope),
             "user" => self.user(&envelope),
             "result" => self.result(&envelope),
+            "command_lifecycle" => self.command_lifecycle(&envelope),
             _ => Vec::new(),
         }
+    }
+
+    /// What happened to a message FlowX sent under its own id.
+    ///
+    /// `queued` when Claude reads it off stdin, `started` when it drains into
+    /// a turn, then how that turn ended. Started is when a steer is read: at
+    /// the next request, after the calls running when it was written, which
+    /// is where Claude's history records it. Claude Code 2.1.283 sends these
+    /// only for a message that carries a `uuid`.
+    fn command_lifecycle(&mut self, envelope: &Value) -> Vec<ProviderEvent> {
+        self.reports_reads = true;
+        if envelope.get("state").and_then(Value::as_str) != Some("started") {
+            return Vec::new();
+        }
+        non_empty(envelope.get("command_uuid"))
+            .map(|id| ProviderEvent::InputTaken { id: Some(id) })
+            .into_iter()
+            .collect()
     }
 
     /// A control request: a tool Claude wants to run, or a question it asks.
@@ -393,12 +417,18 @@ impl ClaudeStreamParser {
             // A request is going out. Claude gathers what it has queued just
             // before, so a notification that arrived earlier in the turn goes
             // with it and is answered in this turn, and a steer written since
-            // the last request is read here.
+            // the last request is read here. A CLI that names each message it
+            // takes says which; for one that does not, this is the best there
+            // is.
             Some("status")
                 if envelope.get("status").and_then(Value::as_str) == Some("requesting") =>
             {
                 self.notified_in_turn = false;
-                vec![ProviderEvent::Lifecycle(Lifecycle::Requesting)]
+                if self.reports_reads {
+                    Vec::new()
+                } else {
+                    vec![ProviderEvent::InputTaken { id: None }]
+                }
             }
             Some("compact_boundary") => vec![ProviderEvent::Lifecycle(Lifecycle::Compacted)],
             Some("task_started") => self.task_started(envelope),
@@ -2376,17 +2406,56 @@ mod tests {
     }
 
     #[test]
-    fn a_request_going_out_is_reported_as_one() {
-        // The point where Claude reads what was queued for it, steers
-        // included, so the conversation can put them there.
+    fn a_steer_is_taken_when_its_own_message_starts() {
+        // Captured from Claude Code 2.1.283 with a steer written while a
+        // `Bash` call ran: `queued` when written, `started` after the call's
+        // result and before the next request, which is where Claude read it.
+        let mut parser = ClaudeStreamParser::new();
+        let lifecycle = |id: &str, state: &str| {
+            json!({"type": "command_lifecycle", "state": state, "command_uuid": id,
+                   "uuid": "11111111-0000-4000-8000-000000000000", "session_id": "s1"})
+        };
+        let mut taken = Vec::new();
+        for frame in [
+            lifecycle("prompt-1", "queued"),
+            lifecycle("prompt-1", "started"),
+            json!({"type": "system", "subtype": "init"}),
+            json!({"type": "system", "subtype": "status", "status": "requesting"}),
+            lifecycle("steer-1", "queued"),
+            json!({"type": "user", "message": {"content": [{"type": "tool_result",
+                   "tool_use_id": "t1", "content": "done"}]}}),
+            lifecycle("steer-1", "started"),
+            json!({"type": "system", "subtype": "status", "status": "requesting"}),
+            lifecycle("steer-1", "completed"),
+        ] {
+            taken.extend(
+                parser
+                    .events(&line(frame))
+                    .into_iter()
+                    .filter(|event| matches!(event, ProviderEvent::InputTaken { .. })),
+            );
+        }
+        assert_eq!(
+            taken,
+            vec![
+                ProviderEvent::InputTaken {
+                    id: Some("prompt-1".into())
+                },
+                ProviderEvent::InputTaken {
+                    id: Some("steer-1".into())
+                },
+            ],
+            "a request said it took input the CLI names for itself"
+        );
+    }
+
+    #[test]
+    fn a_cli_that_names_nothing_is_taken_to_read_everything_at_its_next_request() {
         let mut parser = ClaudeStreamParser::new();
         let events = parser.events(&line(
             json!({"type": "system", "subtype": "status", "status": "requesting"}),
         ));
-        assert_eq!(
-            events,
-            vec![ProviderEvent::Lifecycle(Lifecycle::Requesting)]
-        );
+        assert_eq!(events, vec![ProviderEvent::InputTaken { id: None }]);
     }
 
     #[test]
