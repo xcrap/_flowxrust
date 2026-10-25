@@ -70,6 +70,10 @@ walkdir = "2"
 pulldown-cmark = { version = "0.13", default-features = false }
 url = "2.5"
 
+# Grapheme clusters, so an arrow or Backspace in a text field steps over a
+# flag, a skin tone or an accent whole rather than one code point of it.
+unicode-segmentation = "1.12"
+
 # Time.
 # `now` is separate from `clock` as of chrono 0.4.45; both are needed for `DateTime::now()`.
 chrono = { version = "0.4", default-features = false, features = ["clock", "now", "std", "serde"] }

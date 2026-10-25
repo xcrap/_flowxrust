@@ -630,6 +630,32 @@ Two decisions there are load-bearing:
   composition rather than submitting. Text with no replacement range replaces
   the marked range. Undo groups never split a composition.
 
+Five more, each of which was a bug first:
+
+- **A character is a grapheme cluster.** Arrows, Backspace, Delete, word
+  movement and the column a vertical move keeps all step by
+  `unicode-segmentation` clusters. By code point they stopped inside a flag, a
+  skin tone, a ZWJ family or a letter with a combining accent, and deleting
+  left half of one behind. Offsets are still UTF-8 bytes inside the field and
+  UTF-16 at the `InputHandler`; only the stepping changed.
+- **Line breaks are normalised in `edit`.** GPUI shapes lines only at `\n`, so a
+  kept `\r` is an invisible character that costs a keypress and a Backspace
+  with no visible effect. A multi-line field turns `\r\n` and `\r` into `\n`; a
+  single-line one turns each break inside the text into a space and drops breaks
+  at either end, so a path copied with its newline still opens.
+- **A paste the cap cuts short says so.** `edit` returns how many characters
+  `max_len` left out, `paste` emits `TextFieldEvent::PasteTruncated`, and the
+  composer's draft shows it as its notice. Typing at the cap stays quiet.
+- **Hit-testing adds back the scroll that was painted.** Paint subtracts the
+  scroll, so `index_at` adds back the offset prepaint recorded in
+  `FieldGeometry::painted_scroll` — not the scroll of the layout it rebuilds
+  for the click, which follows the caret as it is now rather than as drawn. The
+  caret row scrolls into view by its bottom, not its top.
+- **GPUI's wrapped hit-test adds the row's start column itself.**
+  `WrappedLine::closest_index_for_position` takes x relative to the visual row;
+  adding the column too put every click on a later row at its end. It also
+  truncates `y / line_height`, so ask for a row at its middle.
+
 ### Running a turn
 
 The runner owns a `CodexSession` for a turn's lifetime and writes events into

@@ -23,6 +23,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 tempfile.workspace = true
 pulldown-cmark.workspace = true
 url.workspace = true
+unicode-segmentation.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

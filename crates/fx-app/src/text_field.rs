@@ -15,8 +15,8 @@
 //! Conversions exist so no method has to hold two of them at once, and every
 //! mutation — typed, pasted, deleted, or assigned through
 //! [`TextField::set_value`] — goes through [`TextField::edit`]. That is what
-//! makes `max_len` and the single-line newline rule true regardless of where
-//! the text came from.
+//! makes `max_len` and the line-break rules true regardless of where the text
+//! came from.
 //!
 //! # Which keys this field claims
 //!
@@ -53,11 +53,12 @@ use gpui::prelude::*;
 use gpui::{
     AnyElement, App, Background, Bounds, ClipboardItem, ContentMask, Context, CursorStyle,
     DispatchPhase, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler,
-    FocusHandle, Font, FontFeatures, FontStyle, GlobalElementId, InspectorElementId, IntoElement,
-    KeyDownEvent, LayoutId, LineLayout, Modifiers, MouseButton, MouseMoveEvent, MouseUpEvent,
-    Pixels, Point, Render, ShapedLine, SharedString, Task, TextAlign, TextRun, Timer,
+    EventEmitter, FocusHandle, Font, FontFeatures, FontStyle, GlobalElementId, InspectorElementId,
+    IntoElement, KeyDownEvent, LayoutId, LineLayout, Modifiers, MouseButton, MouseMoveEvent,
+    MouseUpEvent, Pixels, Point, Render, ShapedLine, SharedString, Task, TextAlign, TextRun, Timer,
     UTF16Selection, Window, WrappedLine, div, fill, point, px, size,
 };
+use unicode_segmentation::{GraphemeCursor, UnicodeSegmentation};
 
 gpui::actions!(
     text_field,
@@ -95,6 +96,12 @@ const MARKED_UNDERLINE: f32 = BorderWidth::REGULAR;
 /// One half of a blink cycle: long enough not to read as a flicker, short
 /// enough that the caret still reads as present.
 const CARET_BLINK_INTERVAL: Duration = Duration::from_millis(530);
+/// How far the caret's row may run past the bottom of the field before it
+/// scrolls. Layout rounds the field to device pixels, which can leave it up to
+/// a pixel short of its whole rows, and scrolling for that would nudge every
+/// row by the fraction each time the caret reached the last one. A point is
+/// inside a row's leading, so leaving it clipped clips no glyph.
+const ROW_OVERSHOOT_TOLERANCE: f32 = 1.0;
 
 /// Everything about a field's own geometry and type, resolved from the theme.
 #[derive(Clone)]
@@ -118,6 +125,57 @@ struct FieldMetrics {
 /// bare `dyn Fn` would make every one of them larger than the state it guards.
 type SubmitHandler = Box<dyn Fn(String, &mut Context<TextField>)>;
 
+/// What a field tells its owner about an edit it could not make as asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextFieldEvent {
+    /// A paste held more than `max_len` left room for, so only its start went
+    /// in. Reported because a prompt cut short silently reaches the agent
+    /// looking whole: a 45,000-character log in a 32,000-character composer
+    /// lost its last third with nothing on screen to say so.
+    PasteTruncated {
+        /// Characters of the paste left out, counted after its line breaks
+        /// were normalised.
+        dropped: usize,
+        /// The cap that left them out.
+        max_len: usize,
+    },
+}
+
+impl TextFieldEvent {
+    /// What the owner should say about it, as one sentence.
+    pub fn notice(&self) -> String {
+        match *self {
+            Self::PasteTruncated { dropped, max_len } => {
+                let (characters, were) = if dropped == 1 {
+                    ("character", "was")
+                } else {
+                    ("characters", "were")
+                };
+                format!(
+                    "The paste was cut short: {} {characters} past the {}-character limit {were} left out.",
+                    grouped(dropped),
+                    grouped(max_len),
+                )
+            }
+        }
+    }
+}
+
+impl EventEmitter<TextFieldEvent> for TextField {}
+
+/// A count with its thousands grouped, so a limit reads as 32,000.
+fn grouped(count: usize) -> String {
+    let digits = count.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
+}
+
 /// What only the paint phase can know.
 ///
 /// The wrapper element writes these while it draws, and the platform's input
@@ -131,6 +189,13 @@ struct FieldGeometry {
     /// The measured width of the text area. The next render needs it to wrap and
     /// scroll correctly, because this render is what produces the measurement.
     content_width: f32,
+    /// The scroll the text was last painted at.
+    ///
+    /// A click lands on what is on screen, so hit-testing adds this back rather
+    /// than the scroll of a layout rebuilt for the click: that one scrolls to
+    /// the caret as it is *now*, which during a drag is already ahead of the
+    /// frame the pointer is over.
+    painted_scroll: Point<Pixels>,
     #[cfg(test)]
     first_painted_text_origin: Option<Point<Pixels>>,
 }
@@ -321,33 +386,31 @@ impl TextField {
     /// The one place the value changes.
     ///
     /// Every rule that constrains what may live in a field lives here rather
-    /// than in each caller, so a single-line field can never gain a newline and
-    /// `max_len` can never split a character, whatever the source.
-    fn edit(&mut self, range: Range<usize>, insert: &str) {
+    /// than in each caller, so a single-line field can never gain a newline, a
+    /// '\r' never reaches the value, and `max_len` can never split a
+    /// character, whatever the source.
+    ///
+    /// Returns how many characters of `insert` the cap left out, so a caller
+    /// that can tell the user does.
+    fn edit(&mut self, range: Range<usize>, insert: &str) -> usize {
         if !self.enabled {
-            return;
+            return 0;
         }
         // Any edit ends a composition; `replace_and_mark_text_in_range` marks
         // its own insertion again afterwards.
         self.marked = None;
         let range = sanitize_range(&self.value, range);
-        let insert = if self.multiline.is_some() {
-            insert.to_string()
-        } else {
-            // Stripping rather than rejecting keeps a paste with a trailing
-            // newline useful, and a lone Return does nothing at all.
-            insert
-                .chars()
-                .filter(|c| *c != '\n' && *c != '\r')
-                .collect()
-        };
-        let insert = truncate_to_max_len(&self.value, &range, &insert, self.max_len);
+        let insert = normalise_line_breaks(insert, self.multiline.is_some());
+        let kept = truncate_to_max_len(&self.value, &range, &insert, self.max_len);
+        // What is kept is always a prefix, so the rest is what was dropped.
+        let dropped = insert[kept.len()..].chars().count();
 
-        let head = range.start + insert.len();
-        self.value.replace_range(range, &insert);
+        let head = range.start + kept.len();
+        self.value.replace_range(range, &kept);
         self.selection = Selection::collapsed(head);
         self.caret_on = true;
         self.dragging = false;
+        dropped
     }
 
     /// An edit the user made, recorded for undo.
@@ -356,9 +419,11 @@ impl TextField {
     /// stays the primitive so that assigning a value is not mistaken for one.
     /// An edit that changes nothing records nothing, so Backspace at the start
     /// of the field does not leave an empty step to undo.
-    fn user_edit(&mut self, kind: EditKind, range: Range<usize>, insert: &str) {
+    ///
+    /// Returns what [`Self::edit`] does: the characters the cap left out.
+    fn user_edit(&mut self, kind: EditKind, range: Range<usize>, insert: &str) -> usize {
         if !self.enabled {
-            return;
+            return 0;
         }
         // Read before `edit` clears it: the input method's own next step in a
         // composition belongs to the group its first marked text opened. A cut
@@ -366,14 +431,16 @@ impl TextField {
         // its own; joined, Undo took the paste back along with the composition.
         let composing = self.marked.is_some() && kind != EditKind::Clipboard;
         let before = self.snapshot();
-        self.edit(range, insert);
+        let dropped = self.edit(range, insert);
+        // A paste into a full field changes nothing, and still left text out.
         if self.value == before.value {
-            return;
+            return dropped;
         }
         if !composing {
             self.history.will_edit(kind, before);
         }
         self.history.did_edit(kind, self.selection);
+        dropped
     }
 
     fn snapshot(&self) -> Snapshot {
@@ -452,6 +519,8 @@ impl TextField {
     /// Insert final text from the platform, ending any composition.
     fn commit_text(&mut self, range_utf16: Option<Range<usize>>, text: &str) {
         let range = self.input_range(range_utf16);
+        // Typing at the cap stops, as any capped field does: one refused
+        // keystroke is visible where a refused half of a paste is not.
         self.user_edit(EditKind::Typing, range, text);
     }
 
@@ -684,9 +753,20 @@ impl TextField {
         }
     }
 
+    /// Paste the clipboard's text, and say so when the cap cut it short.
+    ///
+    /// The Paste action and its unbound key fallback both arrive here, and
+    /// GPUI sends the Edit menu's Paste as that action, so this is where a
+    /// paste can be told apart from typing.
     fn paste(&mut self, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            self.user_edit(EditKind::Clipboard, self.selection.range(), &text);
+            let dropped = self.user_edit(EditKind::Clipboard, self.selection.range(), &text);
+            if dropped > 0 {
+                cx.emit(TextFieldEvent::PasteTruncated {
+                    dropped,
+                    max_len: self.max_len,
+                });
+            }
         }
     }
 
@@ -720,8 +800,18 @@ impl TextField {
     /// Degrades rather than failing: a point outside the text clamps to the
     /// nearest row and column, because a click in the padding is still a click
     /// on the field.
+    ///
+    /// The point is in window coordinates, and the text under it is the text
+    /// as painted, scroll included: paint subtracts the scroll, so this adds it
+    /// back. Without it a click in a scrolled field landed on whatever the
+    /// unscrolled text had there, such as the start of a long path or the
+    /// composer's first rows.
     fn index_at(&self, at: Point<Pixels>, window: &Window) -> usize {
-        let Some(bounds) = self.geometry.borrow().bounds else {
+        let (bounds, scroll) = {
+            let geometry = self.geometry.borrow();
+            (geometry.bounds, geometry.painted_scroll)
+        };
+        let Some(bounds) = bounds else {
             return 0;
         };
         let theme = global::current();
@@ -744,7 +834,10 @@ impl TextField {
             color,
             None,
         );
-        self.source_index(layout.index_at(point(at.x - content.origin.x, at.y - content.origin.y)))
+        self.source_index(layout.index_at(point(
+            at.x - content.origin.x + scroll.x,
+            at.y - content.origin.y + scroll.y,
+        )))
     }
 
     fn metrics(&self, theme: &Theme, focused: bool) -> FieldMetrics {
@@ -1099,6 +1192,8 @@ impl Element for TextFieldElement {
             // Handed to the next render so wrapping and scrolling have a real
             // width to work against instead of this frame's guess.
             geometry.content_width = f32::from(content.size.width);
+            // Final from here on: paint draws at exactly this offset.
+            geometry.painted_scroll = point(self.layout.scroll_x, self.layout.scroll_y);
         }
         self.child.prepaint(window, cx);
     }
@@ -1378,8 +1473,13 @@ impl LineShape {
     fn index_in_row(&self, row: usize, x: Pixels, row_height: Pixels) -> usize {
         match self.wrapped() {
             Some(wrapped) => {
-                let within_row = x + self.row_origin_x(row);
-                let at = point(within_row, row_height * row as f32);
+                // `x` goes in relative to the row: GPUI adds the row's start
+                // column itself. Adding it here too measured every row after
+                // the first from twice its offset, so a click anywhere on one
+                // landed at its end. The row's middle rather than its top,
+                // because GPUI truncates `y / row_height`, and in f32
+                // `row_height * k / row_height` can come out a hair under `k`.
+                let at = point(x, row_height * (row as f32 + 0.5));
                 match wrapped.closest_index_for_position(at, row_height) {
                     Ok(index) | Err(index) => index.min(self.len()),
                 }
@@ -1464,7 +1564,7 @@ impl TextLayout {
                     text_width,
                     visible_width,
                 ),
-                Self::vertical_scroll(row.top, text_height, visible_height),
+                Self::vertical_scroll(row.top, row.height, text_height, visible_height),
             ),
             None => (px(0.0), px(0.0)),
         };
@@ -1540,14 +1640,26 @@ impl TextLayout {
         scroll.clamp(px(0.0), max_scroll)
     }
 
-    /// The vertical equivalent of [`TextLayout::horizontal_scroll`].
-    fn vertical_scroll(caret_top: Pixels, text_height: Pixels, visible_height: Pixels) -> Pixels {
+    /// The vertical equivalent of [`TextLayout::horizontal_scroll`]: the
+    /// offset that keeps the caret's row, `caret_top` down and `row_height`
+    /// tall, inside `visible_height`.
+    ///
+    /// Measured to the row's bottom. A row whose top is inside the viewport is
+    /// not therefore visible, and comparing the top kept the row being typed on
+    /// just below the field once it overflowed.
+    fn vertical_scroll(
+        caret_top: Pixels,
+        row_height: Pixels,
+        text_height: Pixels,
+        visible_height: Pixels,
+    ) -> Pixels {
         let max_scroll = (text_height - visible_height).max(px(0.0));
         if max_scroll <= px(0.0) {
             return px(0.0);
         }
-        let scroll = if caret_top > visible_height {
-            caret_top - visible_height
+        let caret_bottom = caret_top + row_height;
+        let scroll = if caret_bottom > visible_height + px(ROW_OVERSHOOT_TOLERANCE) {
+            caret_bottom - visible_height
         } else {
             px(0.0)
         };
@@ -1976,18 +2088,58 @@ fn snap_forward(value: &str, index: usize) -> usize {
     index
 }
 
+/// Where Left lands and what Backspace deletes back to: the start of the
+/// grapheme cluster before `index`.
+///
+/// A cluster rather than a code point, because what reads as one character is
+/// often several: a flag is two regional indicators, 👍🏽 a hand and a skin
+/// tone, 👨‍👩‍👧 five code points joined by ZWJs, and "é" can be "e" with a
+/// combining accent. Stepping by code point stopped inside them, and deleting
+/// left half of one behind, drawn as some other character.
 fn prev_boundary(value: &str, index: usize) -> usize {
-    if index == 0 {
-        return 0;
+    let index = snap_back(value, index);
+    match GraphemeCursor::new(index, value.len(), true).prev_boundary(value, 0) {
+        Ok(boundary) => boundary.unwrap_or(0),
+        // Only a chunk that is not the whole text can be incomplete.
+        Err(_) => snap_back(value, index.saturating_sub(1)),
     }
-    snap_back(value, index - 1)
 }
 
+/// Where Right lands and what Delete deletes up to: the end of the grapheme
+/// cluster after `index`.
 fn next_boundary(value: &str, index: usize) -> usize {
-    if index >= value.len() {
-        return value.len();
+    let index = snap_back(value, index);
+    match GraphemeCursor::new(index, value.len(), true).next_boundary(value, 0) {
+        Ok(boundary) => boundary.unwrap_or(value.len()),
+        Err(_) => snap_forward(value, index + 1),
     }
-    snap_forward(value, index + 1)
+}
+
+/// Line breaks as this field can hold them.
+///
+/// GPUI's shaper breaks lines only at '\n', so a '\r' kept from a Windows or
+/// old Mac paste is an invisible character: one more Right press, an End that
+/// stops past it, a Backspace that joins two lines with nothing seen to go. A
+/// multi-line field turns `\r\n` and a lone `\r` into '\n'.
+///
+/// A single-line field cannot break a line, so each break inside the text
+/// becomes one space ("a\r\nb" is "a b", not "ab"), and breaks at either end
+/// are dropped: a copied path keeps no trailing space, and a lone Return
+/// inserts nothing.
+fn normalise_line_breaks(insert: &str, multiline: bool) -> Cow<'_, str> {
+    let is_break = |c: char| c == '\r' || c == '\n';
+    if !insert.contains(is_break) {
+        return Cow::Borrowed(insert);
+    }
+    if multiline {
+        return Cow::Owned(insert.replace("\r\n", "\n").replace('\r', "\n"));
+    }
+    Cow::Owned(
+        insert
+            .trim_matches(is_break)
+            .replace("\r\n", " ")
+            .replace(is_break, " "),
+    )
 }
 
 /// What a replacement may be, once `max_len` has had its say.
@@ -2023,28 +2175,36 @@ fn class_of(c: char) -> CharClass {
     }
 }
 
+/// A grapheme cluster's class is its first code point's. Classed by code point,
+/// the combining accent of a decomposed "é" is punctuation, and a word ended
+/// between the letter and its accent.
+fn grapheme_class(grapheme: &str) -> CharClass {
+    grapheme
+        .chars()
+        .next()
+        .map_or(CharClass::Whitespace, class_of)
+}
+
 /// The word around `at`, for double-click selection.
 pub(crate) fn word_range(value: &str, at: usize) -> Range<usize> {
     let at = snap_back(value, at);
-    let Some(first) = value[at..].chars().next() else {
+    let graphemes: Vec<(usize, &str)> = value.grapheme_indices(true).collect();
+    let Some(hit) = graphemes
+        .iter()
+        .position(|(index, grapheme)| at < index + grapheme.len())
+    else {
         return at..at;
     };
-    let class = class_of(first);
-    let mut start = at;
-    while let Some(previous) = value[..start].chars().next_back() {
-        if class_of(previous) != class {
-            break;
-        }
-        start -= previous.len_utf8();
-    }
-    let mut end = at + first.len_utf8();
-    while let Some(next) = value[end..].chars().next() {
-        if class_of(next) != class {
-            break;
-        }
-        end += next.len_utf8();
-    }
-    start..end
+    let class = grapheme_class(graphemes[hit].1);
+    let first = graphemes[..hit]
+        .iter()
+        .rposition(|(_, grapheme)| grapheme_class(grapheme) != class)
+        .map_or(0, |index| index + 1);
+    let end = graphemes[hit..]
+        .iter()
+        .find(|(_, grapheme)| grapheme_class(grapheme) != class)
+        .map_or(value.len(), |(index, _)| *index);
+    graphemes[first].0..end
 }
 
 /// Where Option-Left lands, and what Option-Backspace deletes back to: the
@@ -2053,34 +2213,37 @@ pub(crate) fn word_range(value: &str, at: usize) -> Range<usize> {
 /// Whitespace is crossed on the way rather than being a stop of its own, as in
 /// AppKit: from "foo bar |" the word is "bar", and from "foo |" it is "foo", so
 /// one press always removes a word and never just the space before it.
+///
+/// Words are runs of grapheme clusters, for the same reason a character is one.
 fn prev_word_boundary(value: &str, at: usize) -> usize {
-    let head = value[..snap_back(value, at)].trim_end();
-    let Some(last) = head.chars().next_back() else {
+    let mut graphemes = value[..snap_back(value, at)]
+        .grapheme_indices(true)
+        .rev()
+        .skip_while(|(_, grapheme)| grapheme_class(grapheme) == CharClass::Whitespace);
+    let Some((_, last)) = graphemes.next() else {
         return 0;
     };
-    let class = class_of(last);
-    // One past the last character of a different class.
-    head.char_indices()
-        .rev()
-        .find(|(_, c)| class_of(*c) != class)
-        .map_or(0, |(index, c)| index + c.len_utf8())
+    let class = grapheme_class(last);
+    // One past the last cluster of a different class.
+    graphemes
+        .find(|(_, grapheme)| grapheme_class(grapheme) != class)
+        .map_or(0, |(index, grapheme)| index + grapheme.len())
 }
 
 /// Where Option-Right lands, and what Option-Delete deletes up to: the end of
 /// the next word, crossing any whitespace before it.
 fn next_word_boundary(value: &str, at: usize) -> usize {
     let at = snap_back(value, at);
-    let tail = &value[at..];
-    let trimmed = tail.trim_start();
-    let start = at + (tail.len() - trimmed.len());
-    let Some(first) = trimmed.chars().next() else {
+    let mut graphemes = value[at..]
+        .grapheme_indices(true)
+        .skip_while(|(_, grapheme)| grapheme_class(grapheme) == CharClass::Whitespace);
+    let Some((_, first)) = graphemes.next() else {
         return value.len();
     };
-    let class = class_of(first);
-    trimmed
-        .char_indices()
-        .find(|(_, c)| class_of(*c) != class)
-        .map_or(value.len(), |(index, _)| start + index)
+    let class = grapheme_class(first);
+    graphemes
+        .find(|(_, grapheme)| grapheme_class(grapheme) != class)
+        .map_or(value.len(), |(index, _)| at + index)
 }
 
 /// Move the caret one character or one word, optionally extending.
@@ -2148,12 +2311,13 @@ fn move_vertical(value: &str, selection: Selection, forward: bool, extend: bool)
 /// field that has to hold on to a desired column needs one more piece of state
 /// than this one keeps.
 ///
-/// The column counts characters, not bytes. A byte column carried onto another
-/// line lands inside any multibyte character there, and slicing at it panics.
+/// The column counts grapheme clusters, not bytes. A byte column carried onto
+/// another line lands inside any multibyte character there, and slicing at it
+/// panics; a code-point column lands between a letter and its accent.
 fn line_and_column(value: &str, at: usize) -> (usize, usize) {
     let at = snap_back(value, at);
     let start = value[..at].rfind('\n').map_or(0, |offset| offset + 1);
-    (start, value[start..at].chars().count())
+    (start, value[start..at].graphemes(true).count())
 }
 
 fn line_end(value: &str, line_start: usize) -> usize {
@@ -2162,12 +2326,12 @@ fn line_end(value: &str, line_start: usize) -> usize {
         .map_or(value.len(), |offset| line_start + offset)
 }
 
-/// The byte offset `column` characters into the line at `line_start`, or the
-/// line's end when it is shorter.
+/// The byte offset `column` grapheme clusters into the line at `line_start`,
+/// or the line's end when it is shorter.
 fn column_on_line(value: &str, line_start: usize, column: usize) -> usize {
     let end = line_end(value, line_start);
     value[line_start..end]
-        .char_indices()
+        .grapheme_indices(true)
         .nth(column)
         .map_or(end, |(offset, _)| line_start + offset)
 }
@@ -2671,6 +2835,69 @@ mod tests {
     }
 
     #[test]
+    fn a_paste_the_cap_cuts_short_says_how_much_it_left_out() {
+        // Cut silently, a long log reached the agent looking whole.
+        let test = gpui::TestAppContext::single();
+        let field = test.update(|cx| cx.new(|cx| TextField::new(cx).multiline(4.0).max_len(10)));
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let seen = events.clone();
+        let _subscription = test.update(|cx| {
+            cx.subscribe(&field, move |_, event: &TextFieldEvent, _| {
+                seen.borrow_mut().push(*event);
+            })
+        });
+        // One update per paste: an event reaches its subscriber only once the
+        // update that emitted it has finished.
+        let paste = |text: &str| {
+            test.update(|cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(text.into()));
+                field.update(cx, |field, cx| field.edit_command(EditCommand::Paste, cx));
+            })
+        };
+
+        paste("abcd");
+        assert!(events.borrow().is_empty(), "a paste that fits says nothing");
+        // Six of the nine fit; the CRLF counts once, as the newline it becomes.
+        paste("ef\r\nghijkl");
+        test.read(|cx| assert_eq!(field.read(cx).value(), "abcdef\nghi"));
+        // A full field takes nothing, and says so all the same.
+        paste("q");
+        test.read(|cx| assert_eq!(field.read(cx).value(), "abcdef\nghi"));
+        assert_eq!(
+            *events.borrow(),
+            [
+                TextFieldEvent::PasteTruncated {
+                    dropped: 3,
+                    max_len: 10
+                },
+                TextFieldEvent::PasteTruncated {
+                    dropped: 1,
+                    max_len: 10
+                },
+            ]
+        );
+        // Typing at the cap stops quietly, as any capped field does.
+        test.update(|cx| field.update(cx, |field, _| field.commit_text(None, "r")));
+        assert_eq!(events.borrow().len(), 2);
+    }
+
+    #[test]
+    fn a_truncated_paste_reads_as_one_sentence_with_grouped_counts() {
+        let notice =
+            |dropped, max_len| TextFieldEvent::PasteTruncated { dropped, max_len }.notice();
+        assert_eq!(
+            notice(13_042, 32_000),
+            "The paste was cut short: 13,042 characters past the 32,000-character limit were left out."
+        );
+        assert_eq!(
+            notice(1, 200),
+            "The paste was cut short: 1 character past the 200-character limit was left out."
+        );
+        assert_eq!(grouped(1_234_567), "1,234,567");
+        assert_eq!(grouped(999), "999");
+    }
+
+    #[test]
     fn a_single_line_field_never_contains_a_newline() {
         let test = gpui::TestAppContext::single();
         test.update(|cx| {
@@ -2684,7 +2911,55 @@ mod tests {
                 let end = field.value().len();
                 field.edit(end..end, "x\r\ny");
             });
-            assert_eq!(field.read(cx).value(), "abxy");
+            assert_eq!(field.read(cx).value(), "a bx y");
+        });
+    }
+
+    #[test]
+    fn a_single_line_field_turns_each_line_break_inside_a_paste_into_a_space() {
+        // Stripped, "a\r\nb" read as the one word "ab". Breaks at either end go
+        // without a space, so a path copied with its newline still opens.
+        let test = gpui::TestAppContext::single();
+        test.update(|cx| {
+            let field = cx.new(TextField::new);
+            for (pasted, held) in [
+                ("a\r\nb", "a b"),
+                ("a\rb", "a b"),
+                ("a\nb", "a b"),
+                ("a\n\nb", "a  b"),
+                ("\r\n/tmp/project\n", "/tmp/project"),
+                ("\r\n", ""),
+            ] {
+                field.update(cx, |field, _| {
+                    let end = field.value.len();
+                    field.edit(0..end, pasted);
+                });
+                assert_eq!(field.read(cx).value(), held, "{pasted:?}");
+            }
+        });
+    }
+
+    #[test]
+    fn a_multiline_field_holds_every_line_break_as_a_newline() {
+        // A '\r' is drawn as nothing, so it cost an extra Right press, End
+        // stopped past it, and Backspace at the next line's start left "a\rb",
+        // which drew as "ab".
+        let test = gpui::TestAppContext::single();
+        test.update(|cx| {
+            let field = cx.new(|cx| TextField::new(cx).multiline(4.0));
+            field.update(cx, |field, _| field.edit(0..0, "a\r\nb\rc\n\r\nd"));
+            assert_eq!(field.read(cx).value(), "a\nb\nc\n\nd");
+            field.update(cx, |field, cx| {
+                field.selection = Selection::collapsed(0);
+                field.handle_edit_key("end", false, Reach::Character, cx);
+                assert_eq!(field.selection, Selection::collapsed(1));
+                field.handle_edit_key("right", false, Reach::Character, cx);
+                field.handle_edit_key("backspace", false, Reach::Character, cx);
+                assert_eq!(field.value(), "ab\nc\n\nd");
+            });
+            // Typed text goes through the same rule.
+            field.update(cx, |field, _| field.commit_text(None, "\r"));
+            assert_eq!(field.read(cx).value(), "a\nb\nc\n\nd");
         });
     }
 
@@ -2697,8 +2972,8 @@ mod tests {
             let field = cx.new(|cx| TextField::new(cx).max_len(3));
             field.update(cx, |field, cx| field.set_value("abcdef", cx));
             assert_eq!(field.read(cx).value(), "abc");
-            field.update(cx, |field, cx| field.set_value("a\nb", cx));
-            assert_eq!(field.read(cx).value(), "ab");
+            field.update(cx, |field, cx| field.set_value("a\r\nbc", cx));
+            assert_eq!(field.read(cx).value(), "a b");
         });
     }
 
@@ -3163,6 +3438,91 @@ mod tests {
         assert_eq!(word_range("", 0), 0..0);
     }
 
+    // ── Grapheme clusters, which is what a reader calls a character ────────
+
+    /// One character to a reader and several code points to Rust: a flag, a
+    /// skin tone, a ZWJ family and a letter with a combining accent.
+    const CLUSTERS: [&str; 4] = ["🇵🇹", "👍🏽", "👨‍👩‍👧", "e\u{301}"];
+
+    #[test]
+    fn an_arrow_steps_over_a_whole_grapheme_cluster() {
+        for cluster in CLUSTERS {
+            let value = format!("a{cluster}b");
+            let after = 1 + cluster.len();
+            let none = Modifiers::none();
+            assert_eq!(
+                press(&value, 1, "right", none, false).1,
+                Selection::collapsed(after),
+                "{cluster:?}"
+            );
+            assert_eq!(
+                press(&value, after, "left", none, false).1,
+                Selection::collapsed(1),
+                "{cluster:?}"
+            );
+            assert_eq!(
+                press(&value, 1, "right", Modifiers::shift(), false).1,
+                Selection {
+                    anchor: 1,
+                    head: after
+                },
+                "{cluster:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn backspace_and_delete_remove_a_whole_grapheme_cluster() {
+        for cluster in CLUSTERS {
+            let value = format!("a{cluster}b");
+            let after = 1 + cluster.len();
+            let expected = ("ab".to_string(), Selection::collapsed(1));
+            let none = Modifiers::none();
+            assert_eq!(
+                press(&value, after, "backspace", none, false),
+                expected,
+                "{cluster:?}"
+            );
+            assert_eq!(
+                press(&value, 1, "delete", none, false),
+                expected,
+                "{cluster:?}"
+            );
+        }
+        // Two flags side by side are two characters, not one run of four
+        // regional indicators.
+        let flags = "🇵🇹🇧🇷";
+        let (after, _) = press(flags, flags.len(), "backspace", Modifiers::none(), false);
+        assert_eq!(after, "🇵🇹");
+    }
+
+    #[test]
+    fn a_word_keeps_its_combining_accents() {
+        // Classed by code point, the accent was punctuation, so Option-arrows
+        // and double-click ended the word between the letter and its accent.
+        let value = "cafe\u{301} bar";
+        let word = "cafe\u{301}".len();
+        assert_eq!(next_word_boundary(value, 0), word);
+        assert_eq!(prev_word_boundary(value, word), 0);
+        assert_eq!(prev_word_boundary(value, value.len()), word + 1);
+        assert_eq!(word_range(value, 1), 0..word);
+        assert_eq!(
+            word_range(value, word - 1),
+            0..word,
+            "a click on the accent"
+        );
+    }
+
+    #[test]
+    fn vertical_movement_never_lands_inside_a_cluster() {
+        // Column 1 counted in code points is between the "e" and its accent.
+        let value = "e\u{301}x\nabc";
+        let below = "e\u{301}x\na".len();
+        let up = move_vertical(value, Selection::collapsed(below), false, false);
+        assert_eq!(up.head, "e\u{301}".len());
+        assert_eq!(move_vertical(value, up, true, false).head, below);
+    }
+
     #[test]
     fn arrows_move_the_caret_and_shift_arrows_extend_from_the_anchor() {
         let moved = move_horizontal("abc", Selection::collapsed(1), true, false, false);
@@ -3330,13 +3690,46 @@ mod tests {
     #[test]
     fn vertical_scroll_appears_only_once_the_text_is_taller_than_the_field() {
         assert_eq!(
-            TextLayout::vertical_scroll(px(0.0), px(40.0), px(80.0)),
+            TextLayout::vertical_scroll(px(0.0), px(20.0), px(40.0), px(80.0)),
             px(0.0)
         );
+        // A row from 120 to 140 is drawn from 60 to 80: the last one showing.
         assert_eq!(
-            TextLayout::vertical_scroll(px(120.0), px(200.0), px(80.0)),
-            px(40.0)
+            TextLayout::vertical_scroll(px(120.0), px(20.0), px(200.0), px(80.0)),
+            px(60.0)
         );
+    }
+
+    #[test]
+    fn the_row_being_typed_on_shows_as_soon_as_the_field_overflows() {
+        // Eight 20-point rows visible, and a ninth begun. Measured from the
+        // row's top, 160 is not past 160, so the ninth row was drawn just
+        // below the field until a tenth pushed it one row up.
+        assert_eq!(
+            TextLayout::vertical_scroll(px(160.0), px(20.0), px(180.0), px(160.0)),
+            px(20.0)
+        );
+        // Eight 20.3-point rows in a field layout rounded 0.4 short of them
+        // are all showing: the last does not nudge the text by 0.4.
+        assert_eq!(
+            TextLayout::vertical_scroll(px(142.1), px(20.3), px(162.4), px(162.0)),
+            px(0.0)
+        );
+        let value = (1..=9)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        with_layout_at(&value, 8.0, 300.0, value.len(), |layout| {
+            assert_eq!(layout.rows.len(), 9);
+            let caret = layout.row_for_byte(value.len()).unwrap();
+            let visible = layout.line_height * 8.0;
+            assert!(caret.top - layout.scroll_y >= px(0.0));
+            assert!(
+                caret.top + caret.height - layout.scroll_y <= visible,
+                "the caret's row ends at {:?} in a {visible:?} field",
+                caret.top + caret.height - layout.scroll_y
+            );
+        });
     }
 
     // ── The tests that need a window ───────────────────────────────────────
@@ -3408,7 +3801,7 @@ mod tests {
                         field.marked.clone(),
                     );
                     let lengths: Vec<_> = runs.iter().map(|run| run.len).collect();
-                    // A single-line field has already stripped the newline.
+                    // A single-line field has already made the newline a space.
                     assert_eq!(lengths, [1, 6, field.value.len() - 7]);
                     assert!(runs[1].underline.is_some() && runs[0].underline.is_none());
                 });
@@ -3442,6 +3835,17 @@ mod tests {
     /// building. Hit testing is the whole of mouse interaction, so it gets a
     /// real measurement rather than a stub.
     fn with_layout(value: &str, max_lines: f32, width: f32, check: impl FnOnce(&TextLayout)) {
+        with_layout_at(value, max_lines, width, 0, check);
+    }
+
+    /// [`with_layout`], scrolled to a caret at byte `caret`.
+    fn with_layout_at(
+        value: &str,
+        max_lines: f32,
+        width: f32,
+        caret: usize,
+        check: impl FnOnce(&TextLayout),
+    ) {
         let value = value.to_string();
         let mut test = gpui::TestAppContext::single();
         let window = test.add_window(move |window, cx| {
@@ -3455,7 +3859,7 @@ mod tests {
                 &metrics,
                 &value,
                 px(width),
-                0,
+                caret,
                 Colors::fg(&theme),
                 None,
             );
@@ -3498,6 +3902,147 @@ mod tests {
             let hit = layout.index_at(point(px(10_000.0), row.top + px(1.0)));
             assert_eq!(hit, end);
         });
+    }
+
+    #[test]
+    fn a_click_inside_a_later_wrapped_row_lands_on_the_character_under_it() {
+        // The row's start column was added twice, once here and once by GPUI,
+        // so a click anywhere on the second row or below landed at its end.
+        // Probing only either edge of a row could not tell.
+        let mut checked = 0;
+        with_layout(WIDE, 3.0, 90.0, |layout| {
+            for row in layout.rows.iter().skip(1) {
+                let shape = &layout.lines[row.line].shape;
+                for byte in row.start + 1..row.end {
+                    let x = row.x_for(byte, shape);
+                    let hit = layout.index_at(point(x, row.top + px(1.0)));
+                    assert_eq!(hit, byte, "row {row:?}");
+                    checked += 1;
+                }
+            }
+        });
+        assert!(checked > 10, "there was nothing to check");
+    }
+
+    #[test]
+    fn a_wrapped_row_is_found_whatever_the_row_height() {
+        // GPUI picks the row as `y / row_height`, truncated, and asking for
+        // row k at `row_height * k` comes out a hair under k in f32 for some
+        // heights: 19.6 points first fails at row 7.
+        let value = WIDE.repeat(3);
+        with_layout(&value, 3.0, 90.0, |layout| {
+            let line = &layout.lines[0].shape;
+            assert!(line.row_count() > 8, "the value should wrap past row 7");
+            for row in 1..line.row_count() {
+                let (start, end) = line.row_bounds(row);
+                // Mid-row: either edge of the row above is also an edge of
+                // this one, so a click there could not tell the rows apart.
+                let middle = (line.x_in_line(end) - line.x_in_line(start)) / 2.0;
+                let hit = line.index_in_row(row, middle, px(19.6));
+                assert!(
+                    start < hit && hit < end,
+                    "row {row} ({start}..{end}) was hit-tested to byte {hit}"
+                );
+            }
+        });
+    }
+
+    /// A field mounted at a fixed width, so a click can be placed on its text.
+    struct SizedProbe {
+        field: Entity<TextField>,
+        width: f32,
+    }
+
+    impl Render for SizedProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().flex().w(px(self.width)).child(self.field.clone())
+        }
+    }
+
+    /// Mounts `field` `width` points wide and paints it until it has settled.
+    ///
+    /// The first frame shapes against no width at all, because it is what
+    /// measures one; the second wraps and scrolls against that measurement.
+    fn mount_at_width(
+        test: &mut gpui::TestAppContext,
+        field: &Entity<TextField>,
+        width: f32,
+    ) -> gpui::WindowHandle<SizedProbe> {
+        let field = field.clone();
+        let window = test.add_window(move |_, _| SizedProbe { field, width });
+        test.update(|cx| cx.refresh_windows());
+        window
+    }
+
+    /// Where a click `offset` from the top-left of the painted text area lands.
+    fn click_at(
+        test: &mut gpui::TestAppContext,
+        window: gpui::WindowHandle<SizedProbe>,
+        field: &Entity<TextField>,
+        offset: Point<Pixels>,
+    ) -> usize {
+        window
+            .update(test, |_, window, cx| {
+                let field = field.read(cx);
+                let bounds = field.geometry.borrow().bounds.expect("the field painted");
+                let metrics = field.metrics(&global::current(), field.focused);
+                let content = content_bounds(&bounds, &metrics);
+                field.index_at(content.origin + offset, window)
+            })
+            .expect("the window is still alive")
+    }
+
+    #[test]
+    fn a_click_in_a_scrolled_single_line_field_lands_on_the_text_drawn_there() {
+        // Paint subtracts the scroll and hit-testing did not add it back, so a
+        // click on the end of a long path landed somewhere in its middle.
+        let mut test = gpui::TestAppContext::single();
+        let path = "/Users/someone/projects/flowx/crates/fx-app/src/text_field.rs";
+        let field = test.update(|cx| {
+            cx.new(|cx| {
+                let mut field = TextField::new(cx);
+                field.set_value(path, cx);
+                field
+            })
+        });
+        let window = mount_at_width(&mut test, &field, 160.0);
+        let (width, scroll) = test.read(|cx| {
+            let geometry = field.read(cx).geometry.borrow();
+            (px(geometry.content_width), geometry.painted_scroll)
+        });
+        assert!(
+            scroll.x > px(0.0),
+            "the path should have scrolled to its end"
+        );
+
+        // The caret moving without a repaint, as it does mid-drag, must not
+        // move the text the click is measured against: the screen has not.
+        test.update(|cx| field.update(cx, |field, _| field.selection = Selection::collapsed(0)));
+        let at_right = click_at(&mut test, window, &field, point(width - px(0.5), px(1.0)));
+        assert_eq!(at_right, path.len());
+        let at_left = click_at(&mut test, window, &field, point(px(0.5), px(1.0)));
+        assert!(
+            at_left > 0,
+            "the left edge shows the path's tail, not its start"
+        );
+    }
+
+    #[test]
+    fn a_click_in_a_scrolled_composer_lands_on_the_row_drawn_there() {
+        let mut test = gpui::TestAppContext::single();
+        let value = "one\ntwo\nthree\nfour\nfive";
+        let field = test.update(|cx| {
+            cx.new(|cx| {
+                let mut field = TextField::new(cx).multiline(2.0);
+                field.set_value(value, cx);
+                field
+            })
+        });
+        let window = mount_at_width(&mut test, &field, 300.0);
+        // Two rows show, "four" and "five", with the caret at the end; the top
+        // one is "four", not the value's first line.
+        let hit = click_at(&mut test, window, &field, point(px(0.5), px(1.0)));
+        assert_eq!(hit, "one\ntwo\nthree\n".len());
     }
 
     #[test]

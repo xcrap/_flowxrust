@@ -1224,6 +1224,16 @@ impl AppState {
             field.set_value(initial, cx);
             field
         });
+        // A paste the cap cut short says so: the prompt would otherwise reach
+        // the agent looking whole.
+        cx.subscribe(
+            &field,
+            move |state, _, event: &crate::text_field::TextFieldEvent, cx| {
+                state.set_composer_notice(agent_id, Some(event.notice()));
+                cx.notify();
+            },
+        )
+        .detach();
         self.drafts.insert(agent_id, field.clone());
         field
     }
@@ -5476,6 +5486,26 @@ mod persistence_tests {
                     crate::attachments::MAX_PENDING_ATTACHMENTS - 1
                 );
             })
+        });
+    }
+
+    #[test]
+    fn a_paste_the_draft_cut_short_says_so_in_the_composer() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, _, agent, _) = test.update(|cx| workspace(cx, &paths));
+        let field = test.update(|cx| state.update(cx, |state, cx| state.draft(agent, cx)));
+        let event = crate::text_field::TextFieldEvent::PasteTruncated {
+            dropped: 13_000,
+            max_len: 32_000,
+        };
+        test.update(|cx| field.update(cx, |_, cx| cx.emit(event)));
+        test.read(|cx| {
+            assert_eq!(
+                state.read(cx).composer_notice(agent),
+                Some(event.notice().as_str())
+            );
         });
     }
 
