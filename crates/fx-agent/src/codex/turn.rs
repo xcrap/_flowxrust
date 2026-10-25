@@ -47,19 +47,11 @@ pub enum TurnOutcome {
     Completed {
         thread_id: String,
         stop_reason: String,
-        events: Vec<ProviderEvent>,
     },
     /// The turn was cancelled.
-    Cancelled {
-        thread_id: String,
-        events: Vec<ProviderEvent>,
-    },
+    Cancelled { thread_id: String },
     /// Codex reported a failure.
-    Failed {
-        thread_id: String,
-        reason: String,
-        events: Vec<ProviderEvent>,
-    },
+    Failed { thread_id: String, reason: String },
 }
 
 impl TurnOutcome {
@@ -68,14 +60,6 @@ impl TurnOutcome {
             Self::Completed { thread_id, .. }
             | Self::Cancelled { thread_id, .. }
             | Self::Failed { thread_id, .. } => thread_id,
-        }
-    }
-
-    pub fn events(&self) -> &[ProviderEvent] {
-        match self {
-            Self::Completed { events, .. }
-            | Self::Cancelled { events, .. }
-            | Self::Failed { events, .. } => events,
         }
     }
 
@@ -248,23 +232,33 @@ impl CodexSession {
     /// replace the real outcome. A Stop that arrived while `turn/start` was
     /// still unanswered first waits for that answer: Codex already has the
     /// prompt, and without the turn id there is nothing to interrupt.
+    ///
+    /// Nothing reads the turn's stream once it has been dropped, so both waits
+    /// read and drop what arrives meanwhile. Otherwise a busy turn filled the
+    /// bounded queue, the reader stopped, and the answer behind it was never
+    /// read: Stop sat out the caller's whole timeout.
     pub async fn interrupt(&mut self) -> Result<(), ProviderError> {
         if let Some(mut starting) = self.starting.take() {
             let ack = self
                 .transport
-                .response(&mut starting)
+                .response_discarding_events(&mut starting)
                 .await
                 .map_err(classify_turn_error)?;
             self.active_turn_id = Some(turn_id_of(&ack));
         }
-        let Some(turn_id) = self.active_turn_id.as_deref() else {
+        let Some(turn_id) = self.active_turn_id.clone() else {
             return Ok(());
         };
-        self.transport
-            .request(
+        let mut pending = self
+            .transport
+            .send_request(
                 "turn/interrupt",
                 Some(json!({ "threadId": self.thread_id, "turnId": turn_id })),
             )
+            .await
+            .map_err(map_error)?;
+        self.transport
+            .response_discarding_events(&mut pending)
             .await
             .map(|_| ())
             .map_err(map_error)
@@ -272,8 +266,10 @@ impl CodexSession {
 
     /// Send a prompt and run the turn to completion.
     ///
-    /// Every event is handed to `sink` as it arrives, *and* collected, so a
-    /// caller can drive a live view and still have the transcript afterwards.
+    /// Every event is handed to `sink` as it arrives, and only there. They
+    /// used to be collected as well, then copied into the outcome, for the
+    /// whole length of the turn — every streamed delta held twice more than
+    /// the conversation holds it, for a list nothing read.
     pub async fn run_turn(
         &mut self,
         request: &TurnRequest<'_>,
@@ -323,7 +319,6 @@ impl CodexSession {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(turn_id.clone());
         accepted();
-        let mut events = Vec::new();
         let mut notifications = TurnNotifications::new();
         let mut pending: HashMap<String, PendingRequest> = HashMap::new();
         let mut items: HashMap<String, Value> = HashMap::new();
@@ -367,11 +362,7 @@ impl CodexSession {
                     .await
                     .map(|exit| exit.reason())
                     .unwrap_or_else(|| "the Codex connection closed".into());
-                return Ok(TurnOutcome::Failed {
-                    thread_id,
-                    reason,
-                    events,
-                });
+                return Ok(TurnOutcome::Failed { thread_id, reason });
             };
             match next {
                 ServerEvent::Notification { method, params } => {
@@ -393,11 +384,9 @@ impl CodexSession {
                         }
                     }
                     for event in notifications.parse(&method, &params) {
-                        sink(event.clone());
-                        events.push(event);
-                        if let Some(outcome) =
-                            finish(events.last().expect("just pushed"), &thread_id, &events)
-                        {
+                        let outcome = finish(&event, &thread_id);
+                        sink(event);
+                        if let Some(outcome) = outcome {
                             for id in pending.keys() {
                                 resolved(id.clone());
                             }
@@ -443,8 +432,7 @@ impl CodexSession {
                                 || self.approvals == ApprovalPolicy::Ask);
                         if ask {
                             pending.insert(request_key(&id), request);
-                            sink(event.clone());
-                            events.push(event);
+                            sink(event);
                         } else {
                             let approved = matches!(&event, ProviderEvent::Approval(a) if self.approvals.allows(&a.tool_name, &a.input));
                             if let Some(result) = request.approval_result(approved) {
@@ -452,23 +440,25 @@ impl CodexSession {
                             } else {
                                 request.reject(&self.transport)?;
                             }
-                            if let ProviderEvent::Approval(a) = event {
-                                let event = ProviderEvent::ToolResult {
+                            // A refusal is the call's whole outcome, since it
+                            // never runs, so it is recorded as the call's
+                            // result. An approval is not a result at all: the
+                            // call has not run yet, and an empty result here
+                            // marked it finished while it was still running.
+                            // Codex reports the real one when it is done.
+                            if let ProviderEvent::Approval(a) = event
+                                && !approved
+                            {
+                                sink(ProviderEvent::ToolResult {
                                     id: params
                                         .get("callId")
                                         .or_else(|| params.get("itemId"))
                                         .and_then(Value::as_str)
                                         .unwrap_or(&a.id)
                                         .to_owned(),
-                                    content: if approved {
-                                        String::new()
-                                    } else {
-                                        self.approvals.message(&a.tool_name)
-                                    },
-                                    is_error: !approved,
-                                };
-                                sink(event.clone());
-                                events.push(event);
+                                    content: self.approvals.message(&a.tool_name),
+                                    is_error: true,
+                                });
                             }
                         }
                     } else {
@@ -859,17 +849,15 @@ impl PendingRequest {
 }
 
 /// Finish the turn if this event ends it.
-fn finish(event: &ProviderEvent, thread_id: &str, events: &[ProviderEvent]) -> Option<TurnOutcome> {
+fn finish(event: &ProviderEvent, thread_id: &str) -> Option<TurnOutcome> {
     match event {
         ProviderEvent::Done { stop_reason } => Some(TurnOutcome::Completed {
             thread_id: thread_id.to_string(),
             stop_reason: stop_reason.clone(),
-            events: events.to_vec(),
         }),
         ProviderEvent::Error(reason) => Some(TurnOutcome::Failed {
             thread_id: thread_id.to_string(),
             reason: reason.clone(),
-            events: events.to_vec(),
         }),
         _ => None,
     }
@@ -1095,6 +1083,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stopping_a_busy_turn_is_answered_without_waiting_out_a_timeout() {
+        // Codex keeps reporting while it stops. Nobody reads a dropped turn's
+        // stream, so the queue filled, the reader stopped, and the interrupt's
+        // answer queued behind the backlog was never read.
+        let Some(server) = FakeServer::new() else {
+            return;
+        };
+        std::fs::write(server.file("flood"), "").unwrap();
+        let mut session = session_with(&server, &[]).await;
+        let thread_id = session.thread_id().to_string();
+        let dropped = tokio::time::timeout(
+            Duration::from_millis(100),
+            session.run_turn(&TurnRequest::new(&thread_id, "hang", "/tmp"), |_| {}),
+        )
+        .await;
+        assert!(dropped.is_err(), "the hanging turn ended on its own");
+        tokio::time::timeout(Duration::from_secs(5), session.interrupt())
+            .await
+            .expect("the interrupt's answer was stuck behind the backlog")
+            .expect("interrupted");
+    }
+
+    #[tokio::test]
     async fn a_server_that_dies_mid_turn_fails_the_turn() {
         let Some(server) = FakeServer::new() else {
             return;
@@ -1133,16 +1144,22 @@ mod tests {
         .expect("a session");
         let thread_id = session.thread_id().to_string();
 
+        let mut events = Vec::new();
         let outcome = session
-            .run_turn(&TurnRequest::new(&thread_id, "use-a-tool", "/tmp"), |_| {})
+            .run_turn(
+                &TurnRequest::new(&thread_id, "use-a-tool", "/tmp"),
+                |event| events.push(event),
+            )
             .await
             .expect("the turn ran");
         assert!(outcome.is_completed(), "{outcome:?}");
+        // An approval is not a result: an empty one marked the call finished
+        // before it had run. The call's result is Codex's to report.
         assert!(
-            outcome.events().iter().any(
-                |event| matches!(event, ProviderEvent::ToolResult { content, .. } if content.is_empty())
-            ),
-            "an allowed tool call should not carry a refusal message"
+            !events
+                .iter()
+                .any(|event| matches!(event, ProviderEvent::ToolResult { .. })),
+            "{events:?}"
         );
     }
 
@@ -1165,12 +1182,15 @@ mod tests {
         .expect("a session");
         let thread_id = session.thread_id().to_string();
 
-        let outcome = session
-            .run_turn(&TurnRequest::new(&thread_id, "use-a-tool", "/tmp"), |_| {})
+        let mut events = Vec::new();
+        session
+            .run_turn(
+                &TurnRequest::new(&thread_id, "use-a-tool", "/tmp"),
+                |event| events.push(event),
+            )
             .await
             .expect("the turn ran");
-        let refusal = outcome
-            .events()
+        let refusal = events
             .iter()
             .find_map(|event| match event {
                 ProviderEvent::ToolResult {
@@ -1290,9 +1310,8 @@ mod tests {
         .unwrap()
     }
 
-    fn echoed_response(outcome: &TurnOutcome) -> Value {
-        outcome
-            .events()
+    fn echoed_response(events: &[ProviderEvent]) -> Value {
+        events
             .iter()
             .find_map(|event| match event {
                 ProviderEvent::TextDelta(text) => serde_json::from_str(text).ok(),
@@ -1311,11 +1330,13 @@ mod tests {
         let (sender, mut responses) = mpsc::unbounded_channel();
         let mut resolved = Vec::new();
         let mut accepted = false;
+        let seen = std::cell::RefCell::new(Vec::new());
         let outcome = session
             .run_turn_interactive(
                 &request(&thread, "interactive-approval", "/tmp"),
                 &mut responses,
                 |event| {
+                    seen.borrow_mut().push(event.clone());
                     if let ProviderEvent::Approval(request) = event {
                         assert_eq!(request.input["command"], "cargo test");
                         let sender = sender.clone();
@@ -1337,7 +1358,10 @@ mod tests {
             .unwrap();
         assert!(accepted);
         assert!(outcome.is_completed(), "{outcome:?}");
-        assert_eq!(echoed_response(&outcome)["result"]["decision"], "accept");
+        assert_eq!(
+            echoed_response(&seen.borrow())["result"]["decision"],
+            "accept"
+        );
         assert_eq!(resolved, vec!["codex:\"interactive-1\""]);
     }
 
@@ -1349,11 +1373,13 @@ mod tests {
         let mut session = interactive_session(&server).await;
         let thread = session.thread_id().to_owned();
         let (sender, mut responses) = mpsc::unbounded_channel();
-        let outcome = session
+        let seen = std::cell::RefCell::new(Vec::new());
+        session
             .run_turn_interactive(
                 &request(&thread, "interactive-question", "/tmp"),
                 &mut responses,
                 |event| {
+                    seen.borrow_mut().push(event.clone());
                     if let ProviderEvent::UserInput(request) = event {
                         assert_eq!(request.questions.len(), 2);
                         sender
@@ -1384,7 +1410,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let response = echoed_response(&outcome);
+        let response = echoed_response(&seen.borrow());
         assert_eq!(
             response["result"]["answers"]["database"]["answers"],
             json!(["SQLite"])
@@ -1404,11 +1430,13 @@ mod tests {
         let mut session = interactive_session(&server).await;
         let thread = session.thread_id().to_owned();
         let (_sender, mut responses) = mpsc::unbounded_channel();
-        let outcome = session
+        let seen = std::cell::RefCell::new(Vec::new());
+        session
             .run_turn_interactive(
                 &request(&thread, "foreign-request", "/tmp"),
                 &mut responses,
                 |event| {
+                    seen.borrow_mut().push(event.clone());
                     assert!(!matches!(
                         event,
                         ProviderEvent::Approval(_) | ProviderEvent::UserInput(_)
@@ -1419,7 +1447,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(echoed_response(&outcome)["error"]["code"], -32000);
+        assert_eq!(echoed_response(&seen.borrow())["error"]["code"], -32000);
     }
 
     #[tokio::test]
@@ -1430,11 +1458,13 @@ mod tests {
         let mut session = interactive_session(&server).await;
         let thread = session.thread_id().to_owned();
         let (sender, mut responses) = mpsc::unbounded_channel();
-        let outcome = session
+        let seen = std::cell::RefCell::new(Vec::new());
+        session
             .run_turn_interactive(
                 &request(&thread, "interactive-question", "/tmp"),
                 &mut responses,
                 |event| {
+                    seen.borrow_mut().push(event.clone());
                     if let ProviderEvent::UserInput(request) = event {
                         sender
                             .send(UserResponse::CancelQuestions { id: request.id })
@@ -1446,7 +1476,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(echoed_response(&outcome)["error"]["code"], -32800);
+        assert_eq!(echoed_response(&seen.borrow())["error"]["code"], -32800);
     }
 
     #[test]

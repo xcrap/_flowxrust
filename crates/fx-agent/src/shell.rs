@@ -213,7 +213,7 @@ fn guarded_reads_only(program: &str, arguments: &[&str]) -> bool {
                 || short_option(argument, "o")
         }),
         // `uniq input output` writes its second operand.
-        "uniq" => operands(arguments) <= 1,
+        "uniq" => uniq_operands(arguments) <= 1,
         // `file -C` compiles a magic database to disk.
         "file" => {
             none(&|argument| long_option(argument, &["--compile"]) || short_option(argument, "C"))
@@ -264,18 +264,37 @@ fn short_option(argument: &str, letters: &str) -> bool {
         .is_some_and(|cluster| cluster.chars().any(|letter| letters.contains(letter)))
 }
 
-/// How many operands an argument list has, counting an option's value as one.
-fn operands(arguments: &[&str]) -> usize {
-    let mut count = 0;
-    let mut options_ended = false;
-    for argument in arguments {
-        if options_ended || !argument.starts_with('-') || *argument == "-" {
-            count += 1;
-        } else if *argument == "--" {
-            options_ended = true;
+/// How many operands `uniq` is given, read the way BSD getopt reads them.
+///
+/// Options end at the first operand rather than being collected from
+/// anywhere, so in `uniq names -c` the `-c` is the output file, and macOS
+/// writes it. `-f` and `-s` take a value, attached or as the next argument;
+/// `-D` takes an attached one only.
+fn uniq_operands(arguments: &[&str]) -> usize {
+    let mut rest = arguments.iter();
+    while let Some(argument) = rest.next() {
+        if *argument == "--" {
+            return rest.count();
+        }
+        if !argument.starts_with('-') || *argument == "-" {
+            return 1 + rest.count();
+        }
+        if argument.starts_with("--") {
+            if !argument.contains('=') && long_option(argument, &["--skip-fields", "--skip-chars"])
+            {
+                rest.next();
+            }
+            continue;
+        }
+        let cluster = &argument[1..];
+        if let Some(position) = cluster.find(['f', 's', 'D'])
+            && cluster[position..].starts_with(['f', 's'])
+            && position + 1 == cluster.len()
+        {
+            rest.next();
         }
     }
-    count
+    0
 }
 
 #[cfg(test)]
@@ -306,6 +325,10 @@ mod tests {
             "fd -e rs",
             "sort -u names",
             "uniq names",
+            "uniq -c names",
+            "uniq -f 1 names",
+            "uniq -cf1 names",
+            "uniq --skip-fields 1 names",
             "date +%s",
             "file Cargo.toml",
             "cat 'a file with spaces'",
@@ -352,6 +375,11 @@ mod tests {
             "sort --out=f x",
             "sort --compress-program=sh x",
             "uniq in out",
+            // BSD getopt stops at the first operand: `-c` is the output file.
+            "uniq names -c",
+            "uniq -c names -d",
+            "uniq -- names out",
+            "uniq -f 1 names out",
             "git diff --output=f",
             "git diff --output f",
             "git log --outp=f",

@@ -95,16 +95,25 @@ where
         .unwrap_or_default())
 }
 
-/// A saved access override this build cannot read, read as no override.
+/// A saved access override this build cannot read, read as the narrowest
+/// level it knows.
 ///
 /// Deliberately not the enum's own default: that is `FullAccess`, so a level a
 /// newer build added — most likely a narrower one — would come back as the
-/// widest. Inheriting leaves the thread under the app's or provider's policy.
-fn access_or_inherit<'de, D: serde::Deserializer<'de>>(
+/// widest. Nor *inherit*, which looked safer and was not: a thread with no
+/// provider binding inherits the app default, which is `FullAccess` too. A
+/// level that cannot be read fails closed, to asking first. An explicit `null`
+/// is still no override.
+pub fn access_or_inherit<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<AgentAccess>, D::Error> {
     let value = serde_json::Value::deserialize(deserializer)?;
-    Ok(serde_json::from_value(value).unwrap_or(None))
+    if value.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(
+        serde_json::from_value(value).unwrap_or(AgentAccess::Supervised),
+    ))
 }
 
 /// How much the agent may do without asking.
@@ -383,20 +392,25 @@ mod tests {
     }
 
     #[test]
-    fn a_saved_access_level_this_build_cannot_read_inherits_instead_of_widening() {
+    fn a_saved_access_level_this_build_cannot_read_asks_first_instead_of_widening() {
         for value in [serde_json::json!("readOnly"), serde_json::json!(7)] {
             let c: AgentConfiguration = serde_json::from_value(serde_json::json!({
                 "model_id": "kept-model",
                 "agent_access": value,
             }))
             .unwrap();
-            assert_eq!(c.agent_access, None, "{value}");
+            assert_eq!(c.agent_access, Some(AgentAccess::Supervised), "{value}");
             assert_eq!(c.model_id.as_deref(), Some("kept-model"));
+            // Inheriting was not narrower: the app default is Full Access,
+            // and a thread with no provider binding inherits exactly that.
             assert_eq!(
-                c.resolved_access(AgentAccess::Supervised),
+                c.resolved_access(AgentAccess::default()),
                 AgentAccess::Supervised
             );
         }
+        let unset: AgentConfiguration =
+            serde_json::from_value(serde_json::json!({ "agent_access": null })).unwrap();
+        assert_eq!(unset.agent_access, None, "null is no override");
         for access in AgentAccess::ALL {
             let c = AgentConfiguration {
                 agent_access: Some(access),

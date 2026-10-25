@@ -156,10 +156,11 @@ for line in sys.stdin:
             import time
             time.sleep(1.0)
         elif behaviour == "spawn-and-hang":
-            # A tool Claude started, in Claude's own process group, still
-            # running when the user presses Stop.
+            # A tool Claude started, still running when the user presses
+            # Stop. The real CLI starts each `Bash` call in a session of its
+            # own, so this one is outside Claude's process group.
             import subprocess
-            child = subprocess.Popen(["sleep", "60"])
+            child = subprocess.Popen(["sleep", "60"], start_new_session=True)
             with open(os.path.join(os.path.dirname(RECEIVED), "child.pid"), "w") as handle:
                 handle.write(str(child.pid))
             emit_init()

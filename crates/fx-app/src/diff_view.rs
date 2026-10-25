@@ -314,9 +314,11 @@ fn side_palette(side: SplitSide, theme: &Theme) -> (gpui::Rgba, gpui::Rgba) {
     }
 }
 
+/// The status letter's colour. A conflict's `U` is the letter alone carrying
+/// the state, so it takes `warning_ink`: light-mode `warning` is below 3:1.
 pub(super) fn status_ink(status: &str, theme: &Theme) -> gpui::Rgba {
     if status.contains('U') {
-        Colors::warning(theme)
+        Colors::warning_ink(theme)
     } else if status.contains('D') {
         Colors::error(theme)
     } else if status.contains('A') || status.contains('?') {
@@ -1140,6 +1142,24 @@ mod tests {
         assert_eq!(visible_text("").as_ref(), " ");
         let long = visible_text(&"y".repeat(MAX_DISPLAY_CHARACTERS * 2));
         assert_eq!(long.chars().count(), MAX_DISPLAY_CHARACTERS + 2);
+    }
+
+    #[test]
+    fn a_conflicts_status_letter_clears_three_to_one() {
+        for dark in [false, true] {
+            let theme = Theme {
+                appearance_mode: if dark {
+                    fx_design::theme::AppearanceMode::Dark
+                } else {
+                    fx_design::theme::AppearanceMode::Light
+                },
+                ..Default::default()
+            };
+            for background in [Colors::content_bg(&theme), Colors::bg_elevated(&theme)] {
+                let ratio = fx_design::theme::contrast(status_ink("UU", &theme), background);
+                assert!(ratio >= 3.0, "dark={dark}: {ratio}:1");
+            }
+        }
     }
 
     #[test]

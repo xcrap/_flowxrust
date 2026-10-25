@@ -662,8 +662,10 @@ impl AppState {
 
     /// Show a thread from anywhere — ⌘1…⌘9 or the palette — the way clicking
     /// it in the sidebar does: its project selected and expanded, and its
-    /// transcript read on first selection. Returns whether the thread exists.
-    pub fn open_thread(&mut self, agent_id: Uuid) -> bool {
+    /// transcript read on first selection, in the background. Reading it here
+    /// with `conversation` blocked the UI thread on the file for a ⌘K or ⌘1
+    /// that a click never paid. Returns whether the thread exists.
+    pub fn open_thread(&mut self, agent_id: Uuid, cx: &mut Context<Self>) -> bool {
         let Some(project_id) = self.project_for_agent(agent_id) else {
             return false;
         };
@@ -674,7 +676,7 @@ impl AppState {
             self.select_project(project_id);
         }
         self.select_agent(agent_id);
-        self.conversation(project_id, agent_id);
+        self.request_conversation(project_id, agent_id, cx);
         true
     }
 
@@ -1409,6 +1411,10 @@ impl AppState {
             if !retrying_same_row {
                 conversation.append(crate::attachments::user_message(text, attachments));
             }
+            // A new prompt answers the failure before it. Left up, its row
+            // outlived the next turn, and its Retry then resent the prompt that
+            // turn had just answered.
+            self.release_turn_error(&mut conversation);
             let session_id = conversation.session_id().map(str::to_string);
             conversation.hold_unsent(fx_agent::conversation::UnsentPrompt {
                 text: text.to_string(),
@@ -2659,8 +2665,9 @@ impl AppState {
                         self.native_sync.history_warnings.insert(agent, "The provider's history has not caught up with the latest turn. The local conversation is preserved.".into());
                         return true;
                     }
-                    if !conversation.messages().eq(history.messages.iter()) {
-                        conversation.replace_full_history(history.messages);
+                    let messages = carry_turn_plans(conversation.messages(), history.messages);
+                    if !conversation.messages().eq(messages.iter()) {
+                        conversation.replace_full_history(messages);
                     }
                     if let Some(tokens) = history.current_context_tokens
                         && tokens != conversation.usage().current_context_tokens
@@ -2869,6 +2876,9 @@ pub struct ComposerStore {
     goal_prompts: HashMap<Uuid, String>,
     /// Threads whose turn ended with prompts waiting behind it.
     dispatch: Vec<Uuid>,
+    /// Threads whose next prompt was due while it was open for editing. Each
+    /// is dispatched again when the editor closes.
+    held_queues: std::collections::HashSet<Uuid>,
     /// The queued prompt being edited in place, if any.
     pub editor: Option<QueueEditor>,
 }
@@ -3079,15 +3089,23 @@ impl AppState {
         Ok(())
     }
 
-    /// Remove a queued prompt and the images it carried.
-    pub fn remove_queued(&mut self, agent_id: Uuid, index: usize) {
+    /// Remove a queued prompt and the images it carried, by its id.
+    ///
+    /// By id, never by position: the queue moves on its own as turns end, so
+    /// a position read from the last frame can name the prompt behind the one
+    /// the reader clicked. One that has already been sent is left alone.
+    pub fn remove_queued(&mut self, agent_id: Uuid, id: Uuid) {
         let Some(conversation) = self.conversation_by_agent(agent_id) else {
             return;
         };
-        let removed = conversation
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .remove_queued_at(index);
+        let removed = {
+            let mut conversation = conversation
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            conversation
+                .queued_position(id)
+                .and_then(|index| conversation.remove_queued_at(index))
+        };
         if let Some(removed) = removed {
             self.composer.queued_attachments.remove(&removed.id);
             if self
@@ -3096,22 +3114,24 @@ impl AppState {
                 .as_ref()
                 .is_some_and(|editor| editor.queued_id == removed.id)
             {
-                self.composer.editor = None;
+                self.close_queue_editor();
             }
         }
     }
 
-    /// Open a queued prompt for editing in place.
-    pub fn begin_editing_queued(&mut self, agent_id: Uuid, index: usize, cx: &mut App) {
+    /// Open a queued prompt for editing in place, by its id.
+    pub fn begin_editing_queued(&mut self, agent_id: Uuid, id: Uuid, cx: &mut App) {
         let Some(conversation) = self.conversation_by_agent(agent_id) else {
             return;
         };
-        let Some(queued) = conversation
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .queued_at(index)
-            .cloned()
-        else {
+        let Some(queued) = ({
+            let conversation = conversation
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            conversation
+                .queued_position(id)
+                .and_then(|index| conversation.queued_at(index).cloned())
+        }) else {
             return;
         };
         let field = cx.new(|cx| {
@@ -3134,7 +3154,17 @@ impl AppState {
     }
 
     pub fn cancel_editing_queued(&mut self) {
-        self.composer.editor = None;
+        self.close_queue_editor();
+    }
+
+    /// Close the queued-prompt editor, and let a queue it was holding move.
+    fn close_queue_editor(&mut self) {
+        if let Some(editor) = self.composer.editor.take()
+            && self.composer.held_queues.remove(&editor.agent_id)
+            && !self.composer.dispatch.contains(&editor.agent_id)
+        {
+            self.composer.dispatch.push(editor.agent_id);
+        }
     }
 
     /// Save the open edit. An edit that leaves only whitespace is refused and
@@ -3153,7 +3183,7 @@ impl AppState {
             .unwrap_or_else(|error| error.into_inner())
             .update_queued(editor.queued_id, &text);
         if saved {
-            self.composer.editor = None;
+            self.close_queue_editor();
         }
         saved
     }
@@ -3169,18 +3199,24 @@ impl AppState {
             return None;
         }
         let conversation = self.conversation_by_agent(agent_id)?;
-        let queued = conversation
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .dequeue()?;
-        if self
-            .composer
-            .editor
-            .as_ref()
-            .is_some_and(|editor| editor.queued_id == queued.id)
-        {
-            self.composer.editor = None;
-        }
+        let queued = {
+            let mut conversation = conversation
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            // The prompt the reader is editing waits for the edit. Sent now, it
+            // went with the text from before the edit, and the editor closed
+            // on it; the queue moves again when the editor closes.
+            let next = conversation.queued().next().map(|next| next.id);
+            if next.is_some()
+                && self.composer.editor.as_ref().is_some_and(|editor| {
+                    editor.agent_id == agent_id && Some(editor.queued_id) == next
+                })
+            {
+                self.composer.held_queues.insert(agent_id);
+                return None;
+            }
+            conversation.dequeue()?
+        };
         let attachments = self
             .composer
             .queued_attachments
@@ -3531,6 +3567,77 @@ fn native_binding(
         context_window_size: entry.defaults.context_window_size,
         local_history_pending: false,
     }
+}
+
+/// Put each turn's plan back into a provider's history.
+///
+/// Codex keeps no entry for a plan: the server reports `update_plan` only as
+/// `turn/plan/updated`, which the conversation records as the call. The sync
+/// after a turn took the history as it was, so every checklist vanished the
+/// moment its turn ended. Each local turn's latest plan goes to the end of the
+/// same turn in the history — matched from the end, by its prompt — which is
+/// where the card is drawn anyway. A history that has plans of its own, or a
+/// turn whose prompt does not match, is left as the provider sent it.
+fn carry_turn_plans<'a>(
+    local: impl Iterator<Item = &'a fx_core::ConversationMessage>,
+    mut native: Vec<fx_core::ConversationMessage>,
+) -> Vec<fx_core::ConversationMessage> {
+    fn is_plan(message: &fx_core::ConversationMessage) -> bool {
+        message.role == fx_core::MessageRole::Assistant
+            && !message.content.is_empty()
+            && message.content.iter().all(|block| {
+                matches!(block, fx_core::MessageContent::ToolUse { name, .. }
+                    if fx_core::policy::TurnPlan::is_plan_tool(name))
+            })
+    }
+    fn prompt(message: &fx_core::ConversationMessage) -> String {
+        message
+            .text_content()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+    if native.iter().any(is_plan) {
+        return native;
+    }
+    // Each local turn's prompt and the latest plan in it.
+    let mut turns: Vec<(String, Option<&fx_core::ConversationMessage>)> = Vec::new();
+    for message in local {
+        if message.role == fx_core::MessageRole::User {
+            turns.push((prompt(message), None));
+        } else if is_plan(message)
+            && let Some((_, plan)) = turns.last_mut()
+        {
+            *plan = Some(message);
+        }
+    }
+    if turns.iter().all(|(_, plan)| plan.is_none()) {
+        return native;
+    }
+    let starts: Vec<usize> = native
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| message.role == fx_core::MessageRole::User)
+        .map(|(index, _)| index)
+        .collect();
+    let mut insertions = Vec::new();
+    for (back, (text, plan)) in turns.iter().rev().enumerate() {
+        let Some(turn) = starts.len().checked_sub(back + 1) else {
+            break;
+        };
+        if prompt(&native[starts[turn]]) != *text {
+            break;
+        }
+        if let Some(plan) = plan {
+            let end = starts.get(turn + 1).copied().unwrap_or(native.len());
+            insertions.push((end, (*plan).clone()));
+        }
+    }
+    // Latest turn first, so each insertion leaves the earlier positions alone.
+    for (at, plan) in insertions {
+        native.insert(at, plan);
+    }
+    native
 }
 
 /// Native files may lag a successfully completed pipe turn. Do not exchange a
@@ -4095,7 +4202,6 @@ mod auto_title_tests {
                             SessionUpdate::Finished {
                                 outcome: TurnOutcome::Cancelled {
                                     thread_id: "test".into(),
-                                    events: vec![],
                                 },
                             }
                         } else {
@@ -4122,7 +4228,6 @@ mod auto_title_tests {
                             outcome: TurnOutcome::Completed {
                                 thread_id: "test".into(),
                                 stop_reason: "end_turn".into(),
-                                events: vec![],
                             },
                         },
                     );
@@ -5138,7 +5243,6 @@ mod persistence_tests {
                     outcome: fx_agent::codex::TurnOutcome::Completed {
                         thread_id: "thread".into(),
                         stop_reason: "completed".into(),
-                        events: vec![],
                     },
                 });
                 state.drain_updates_with_context(cx);
@@ -5173,6 +5277,82 @@ mod persistence_tests {
         });
     }
 
+    fn queued_ids(state: &mut AppState, project: Uuid, agent: Uuid) -> Vec<Uuid> {
+        state
+            .conversation(project, agent)
+            .lock()
+            .unwrap()
+            .queued()
+            .map(|prompt| prompt.id)
+            .collect()
+    }
+
+    #[test]
+    fn the_prompt_being_edited_waits_for_its_edit() {
+        // The turn ended while the next prompt was open for editing: the text
+        // from before the edit was sent, and the edit was lost.
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, project, agent, _) = test.update(|cx| workspace(cx, &paths));
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                state.conversation(project, agent);
+                state
+                    .enqueue_prompt(agent, "draft", Vec::new(), cx)
+                    .unwrap();
+                let ids = queued_ids(state, project, agent);
+                state.begin_editing_queued(agent, ids[0], cx);
+                assert_eq!(state.dequeue_prompt(agent), None, "sent mid-edit");
+
+                let editor = state.queue_editor().unwrap().field.clone();
+                editor.update(cx, |field, cx| field.set_value("final", cx));
+                assert!(state.save_queued_edit(cx));
+                assert_eq!(
+                    state.take_ready_queues(),
+                    vec![agent],
+                    "the queue stayed held"
+                );
+                assert_eq!(
+                    state.dequeue_prompt(agent).map(|(text, _)| text).as_deref(),
+                    Some("final")
+                );
+            })
+        });
+    }
+
+    #[test]
+    fn removing_a_queued_prompt_takes_the_one_named_even_after_the_queue_moved() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, project, agent, _) = test.update(|cx| workspace(cx, &paths));
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                state.conversation(project, agent);
+                for text in ["one", "two", "three"] {
+                    state.enqueue_prompt(agent, text, Vec::new(), cx).unwrap();
+                }
+                let ids = queued_ids(state, project, agent);
+                // The reader clicked Remove on "two", the second row; the turn
+                // ended and "one" was sent before the click landed.
+                state.dequeue_prompt(agent).unwrap();
+                state.remove_queued(agent, ids[1]);
+                let left: Vec<String> = state
+                    .conversation(project, agent)
+                    .lock()
+                    .unwrap()
+                    .queued()
+                    .map(|prompt| prompt.text.clone())
+                    .collect();
+                assert_eq!(left, vec!["three"]);
+                // A prompt that has already gone is not a reason to remove another.
+                state.remove_queued(agent, ids[0]);
+                assert_eq!(queued_ids(state, project, agent), vec![ids[2]]);
+            })
+        });
+    }
+
     #[test]
     fn a_queued_prompt_is_edited_in_place_and_an_empty_edit_is_refused() {
         let temp = tempfile::tempdir().unwrap();
@@ -5185,7 +5365,8 @@ mod persistence_tests {
                 for text in ["one", "two"] {
                     state.enqueue_prompt(agent, text, Vec::new(), cx).unwrap();
                 }
-                state.begin_editing_queued(agent, 1, cx);
+                let ids = queued_ids(state, project, agent);
+                state.begin_editing_queued(agent, ids[1], cx);
                 let editor = state.queue_editor().unwrap().field.clone();
                 assert_eq!(editor.read(cx).value(), "two");
                 editor.update(cx, |field, cx| field.set_value("  two, rewritten  ", cx));
@@ -5200,12 +5381,12 @@ mod persistence_tests {
                     .collect();
                 assert_eq!(queued, vec!["one", "two, rewritten"]);
 
-                state.begin_editing_queued(agent, 0, cx);
+                state.begin_editing_queued(agent, ids[0], cx);
                 let editor = state.queue_editor().unwrap().field.clone();
                 editor.update(cx, |field, cx| field.set_value(" \n ", cx));
                 assert!(!state.save_queued_edit(cx));
                 assert!(state.queue_editor().is_some(), "the editor stays open");
-                state.remove_queued(agent, 0);
+                state.remove_queued(agent, ids[0]);
                 assert!(
                     state.queue_editor().is_none(),
                     "removing it closes its editor"
@@ -5301,7 +5482,6 @@ mod persistence_tests {
                     outcome: fx_agent::codex::TurnOutcome::Completed {
                         thread_id: "thread".into(),
                         stop_reason: "control".into(),
-                        events: vec![],
                     },
                 });
                 state.drain_updates_with_context(cx);
@@ -5416,7 +5596,6 @@ mod persistence_tests {
                 state.update_sender_for(first)(SessionUpdate::Finished {
                     outcome: fx_agent::codex::TurnOutcome::Cancelled {
                         thread_id: String::new(),
-                        events: vec![],
                     },
                 });
                 state.drain_updates_with_context(cx);
@@ -5440,7 +5619,6 @@ mod persistence_tests {
                     outcome: fx_agent::codex::TurnOutcome::Completed {
                         thread_id: String::new(),
                         stop_reason: "end_turn".into(),
-                        events: vec![],
                     },
                 });
                 state.update_sender_for(second)(SessionUpdate::Failed {
@@ -5680,6 +5858,66 @@ mod persistence_tests {
                     state.last_error.as_deref(),
                     Some("The workspace could not be saved.")
                 );
+            })
+        });
+    }
+
+    #[test]
+    fn opening_a_thread_from_the_keyboard_reads_it_in_the_background() {
+        // ⌘K and ⌘1…⌘9 read the transcript on the UI thread, where a sidebar
+        // click reads it in the background.
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let mut test = gpui::TestAppContext::single();
+        let (state, project, _, second) = test.update(|cx| workspace(cx, &paths));
+        Store::new(paths.clone())
+            .save_conversation(
+                project,
+                second,
+                &fx_store::PersistedConversation::from_messages(
+                    second,
+                    vec![ConversationMessage::text(MessageRole::User, "Saved")],
+                ),
+            )
+            .unwrap();
+        state.update(&mut test, |state, cx| {
+            assert!(state.open_thread(second, cx));
+            assert!(state.conversation_by_agent(second).is_none(), "read inline");
+            assert!(state.is_loading_conversation(second));
+        });
+        test.run_until_parked();
+        test.read(|cx| {
+            let conversation = state.read(cx).conversation_by_agent(second).unwrap();
+            assert_eq!(
+                conversation.lock().unwrap().last_text().as_deref(),
+                Some("Saved")
+            );
+        });
+    }
+
+    #[test]
+    fn a_new_prompt_clears_the_failure_before_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, project, agent, _) = test.update(|cx| workspace(cx, &paths));
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                let conversation = state.conversation(project, agent);
+                assert!(state.prepare_prompt(agent, "first question", cx));
+                conversation.lock().unwrap().clear_unsent();
+                conversation
+                    .lock()
+                    .unwrap()
+                    .set_error("provider disconnected");
+                state.last_error = Some("provider disconnected".into());
+
+                assert!(state.prepare_prompt(agent, "a different question", cx));
+                assert!(
+                    conversation.lock().unwrap().error().is_none(),
+                    "the failure row outlived the next prompt"
+                );
+                assert!(state.last_error.is_none(), "the shell kept the banner");
             })
         });
     }
@@ -6915,6 +7153,105 @@ mod native_sync_tests {
                 assert!(state.native_status(project).warnings.is_empty());
             })
         });
+    }
+
+    fn plan_call(step: &str) -> ConversationMessage {
+        ConversationMessage::new(
+            MessageRole::Assistant,
+            vec![fx_core::MessageContent::ToolUse {
+                id: format!("plan-{step}"),
+                name: fx_core::policy::turn_plan::PLAN_TOOL_NAME.into(),
+                input: serde_json::json!({
+                    "plan": [{ "step": step, "status": "completed" }]
+                })
+                .to_string(),
+            }],
+        )
+    }
+
+    #[test]
+    fn a_turns_plan_survives_the_history_that_replaces_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_string_lossy().to_string();
+        let test = gpui::TestAppContext::single();
+        let (state, project) =
+            test.update(|cx| setup(cx, AppPaths::at(temp.path().join("store")), &root));
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                let entry = entry(&root, "codex", "planned", "Planned");
+                index(state, project, "codex", vec![entry.clone()], Vec::new());
+                let agent = state.snapshot.active_agent_id.unwrap();
+                let conversation = state.conversation(project, agent);
+                let plan = plan_call("Read the parser");
+                conversation.lock().unwrap().replace_full_history(vec![
+                    ConversationMessage::text(MessageRole::User, "Fix it"),
+                    plan.clone(),
+                    ConversationMessage::text(MessageRole::Assistant, "Fixed."),
+                ]);
+                let ticket = history_ticket(state, project, agent);
+                // Codex's own history: the same turn, no plan in it.
+                history(
+                    state,
+                    ticket,
+                    entry,
+                    vec![
+                        ConversationMessage::text(MessageRole::User, "Fix it"),
+                        ConversationMessage::text(MessageRole::Assistant, "Fixed."),
+                    ],
+                );
+                let messages: Vec<_> = conversation.lock().unwrap().messages().cloned().collect();
+                assert_eq!(messages.len(), 3, "{messages:?}");
+                assert_eq!(messages[2], plan, "the checklist vanished with its turn");
+            })
+        });
+    }
+
+    #[test]
+    fn plans_go_to_their_own_turns_and_only_where_the_prompt_matches() {
+        let local = [
+            ConversationMessage::text(MessageRole::User, "first"),
+            plan_call("one"),
+            plan_call("one, revised"),
+            ConversationMessage::text(MessageRole::Assistant, "done one"),
+            ConversationMessage::text(MessageRole::User, "second"),
+            ConversationMessage::text(MessageRole::Assistant, "done two"),
+            ConversationMessage::text(MessageRole::User, "third"),
+            plan_call("three"),
+        ];
+        let native = vec![
+            ConversationMessage::text(MessageRole::User, "first"),
+            ConversationMessage::text(MessageRole::Assistant, "done one"),
+            ConversationMessage::text(MessageRole::User, "second"),
+            ConversationMessage::text(MessageRole::Assistant, "done two"),
+            ConversationMessage::text(MessageRole::User, "third"),
+            ConversationMessage::text(MessageRole::Assistant, "done three"),
+        ];
+        let merged = carry_turn_plans(local.iter(), native.clone());
+        let ids: Vec<_> = merged
+            .iter()
+            .map(|message| match &message.content[0] {
+                fx_core::MessageContent::ToolUse { id, .. } => id.clone(),
+                _ => message.text_content(),
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "first",
+                "done one",
+                "plan-one, revised",
+                "second",
+                "done two",
+                "third",
+                "done three",
+                "plan-three"
+            ]
+        );
+
+        // A history whose last prompt differs is not this conversation's tail.
+        let mut other = native.clone();
+        other[4] = ConversationMessage::text(MessageRole::User, "something else");
+        assert_eq!(carry_turn_plans(local.iter(), other.clone()), other);
     }
 
     #[test]

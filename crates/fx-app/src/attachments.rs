@@ -549,7 +549,22 @@ pub(crate) fn prepare_pasted(image: &gpui::Image) -> Result<Attachment, String> 
         &format!("Pasted Image.{extension}"),
     )
     .map(|prepared| prepared.attachment)
-    .map_err(|_| "The clipboard does not contain a supported image.".to_string())
+    .map_err(|error| describe_pasted_error(&error))
+}
+
+/// Why a pasted image cannot attach. A paste over the size limit is still an
+/// image; calling it "not an image" sent the reader looking for
+/// the wrong problem.
+fn describe_pasted_error(error: &fx_core::services::images::ImageError) -> String {
+    use fx_core::services::images::ImageError;
+    match error {
+        ImageError::TooLarge { limit, .. } => format!(
+            "The pasted image is larger than {} MB.",
+            limit / (1024 * 1024)
+        ),
+        ImageError::Empty { .. } => "The pasted image is empty.".into(),
+        _ => "The clipboard does not contain a supported image.".into(),
+    }
 }
 
 fn describe_image_error(path: &Path, error: &fx_core::services::images::ImageError) -> String {
@@ -654,6 +669,22 @@ impl RenderOnce for PendingChip {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_paste_over_the_limit_says_it_is_too_large() {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.resize(fx_core::services::images::DEFAULT_MAX_IMAGE_BYTES + 1, 0);
+        let image = gpui::Image::from_bytes(gpui::ImageFormat::Png, bytes);
+        assert_eq!(
+            prepare_pasted(&image).unwrap_err(),
+            "The pasted image is larger than 5 MB."
+        );
+        let text = gpui::Image::from_bytes(gpui::ImageFormat::Png, b"plain words".to_vec());
+        assert_eq!(
+            prepare_pasted(&text).unwrap_err(),
+            "The clipboard does not contain a supported image."
+        );
+    }
     use image::{ImageBuffer, ImageFormat, Rgba};
     use uuid::Uuid;
 

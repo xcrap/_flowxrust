@@ -142,14 +142,18 @@ const MAXIMUM_MEASURED_COLUMNS: usize = 16_400;
 
 /// Parse a multi-file `git diff`.
 ///
-/// Text before the first `diff --git` header belongs to no file and is
-/// dropped. A section that yields no lines at all is dropped too, so a header
-/// with nothing under it never becomes an empty file.
+/// Text before the first file header belongs to no file and is dropped. A
+/// section that yields no lines at all is dropped too, so a header with
+/// nothing under it never becomes an empty file.
+///
+/// A file with a merge conflict is a combined diff, headed `diff --cc` rather
+/// than `diff --git`. Only the latter used to start a section, so a conflicted
+/// file showed no diff at all — exactly when one is most needed.
 pub fn parse_unified_diff(text: &str) -> Vec<DiffSection> {
     let mut sections = Vec::new();
     let mut current: Option<(Option<String>, Vec<&str>)> = None;
     for line in diff_lines(text) {
-        if line.starts_with("diff --git ") {
+        if is_file_header(line) {
             if let Some((path, lines)) = current.take() {
                 sections.extend(parse_section(path, lines));
             }
@@ -183,6 +187,9 @@ pub fn parse_section<'a>(
     let mut remaining_old = 0usize;
     let mut remaining_new = 0usize;
 
+    // In a combined hunk, the lines each parent still expects.
+    let mut combined: Vec<usize> = Vec::new();
+
     let mut push = |kind, text: &str, old, new| {
         lines.push(DiffLine {
             kind,
@@ -193,6 +200,64 @@ pub fn parse_section<'a>(
     };
 
     for raw in raw_lines {
+        if raw.starts_with("@@@") {
+            let hunk = combined_hunk_header(raw);
+            // The first parent's numbers stand for the old side: in a
+            // conflict that is HEAD, what the user had before the merge.
+            old_line = hunk.as_ref().map(|h| h.parents[0].0);
+            new_line = hunk.as_ref().map(|h| h.result.0);
+            combined = hunk.as_ref().map_or_else(
+                || vec![usize::MAX],
+                |h| h.parents.iter().map(|(_, count)| *count as usize).collect(),
+            );
+            remaining_old = 0;
+            remaining_new = hunk.as_ref().map_or(usize::MAX, |h| h.result.1 as usize);
+            push(DiffLineKind::Hunk, raw, None, None);
+            continue;
+        }
+
+        if !combined.is_empty() {
+            if let Some(markers) = combined_markers(raw, combined.len()) {
+                let in_result = !markers.contains(&b'-');
+                let in_parent = |column: u8| column == b'-' || (in_result && column == b' ');
+                for (remaining, column) in combined.iter_mut().zip(&markers) {
+                    if in_parent(*column) {
+                        *remaining = remaining.saturating_sub(1);
+                    }
+                }
+                let in_first = in_parent(markers[0]);
+                let kind = if !in_result {
+                    DiffLineKind::Deletion
+                } else if markers.contains(&b'+') {
+                    DiffLineKind::Addition
+                } else {
+                    DiffLineKind::Context
+                };
+                let old = match kind {
+                    DiffLineKind::Addition => None,
+                    _ => old_line.filter(|_| in_first),
+                };
+                let new = new_line.filter(|_| in_result);
+                push(kind, raw, old, new);
+                if in_first {
+                    old_line = old_line.map(|n| n + 1);
+                }
+                if in_result {
+                    new_line = new_line.map(|n| n + 1);
+                    remaining_new = remaining_new.saturating_sub(1);
+                }
+                if remaining_new == 0 && combined.iter().all(|remaining| *remaining == 0) {
+                    combined.clear();
+                }
+                continue;
+            }
+            if raw.starts_with('\\') {
+                continue;
+            }
+            combined.clear();
+            remaining_new = 0;
+        }
+
         if raw.starts_with("@@") {
             let hunk = hunk_header(raw);
             old_line = hunk.map(|h| h.old_start);
@@ -264,6 +329,60 @@ pub fn parse_section<'a>(
 
     let path = path.filter(|path| !path.is_empty())?;
     (!lines.is_empty()).then(|| DiffSection::from_lines(path, lines))
+}
+
+/// Whether a line opens a file's section: `diff --git`, or the `diff --cc`
+/// and `diff --combined` of a merge.
+fn is_file_header(line: &str) -> bool {
+    ["diff --git ", "diff --cc ", "diff --combined "]
+        .iter()
+        .any(|header| line.starts_with(header))
+}
+
+/// The ranges in a combined `@@@ -a,b -c,d +e,f @@@` header: one per parent,
+/// then the result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CombinedHunkHeader {
+    pub parents: Vec<(u32, u32)>,
+    pub result: (u32, u32),
+}
+
+/// Parse a combined hunk header. A missing count means one line.
+pub fn combined_hunk_header(line: &str) -> Option<CombinedHunkHeader> {
+    let mut parts = line.split(' ');
+    let fence = parts.next()?;
+    let parents = fence.len().checked_sub(1)?;
+    if parents < 2 || fence.bytes().any(|byte| byte != b'@') {
+        return None;
+    }
+    let range = |part: &str, marker: char| -> Option<(u32, u32)> {
+        let part = part.strip_prefix(marker)?;
+        let mut numbers = part.splitn(2, ',');
+        let start = numbers.next()?.parse().ok()?;
+        let count = numbers.next().map_or(Some(1), |count| count.parse().ok())?;
+        Some((start, count))
+    };
+    let parent_ranges = (0..parents)
+        .map(|_| range(parts.next()?, '-'))
+        .collect::<Option<Vec<_>>>()?;
+    let result = range(parts.next()?, '+')?;
+    Some(CombinedHunkHeader {
+        parents: parent_ranges,
+        result,
+    })
+}
+
+/// A combined line's marker columns, one per parent, or `None` when the line
+/// is not hunk content. An empty line is context, as in a unified diff.
+fn combined_markers(raw: &str, parents: usize) -> Option<Vec<u8>> {
+    if raw.is_empty() {
+        return Some(vec![b' '; parents]);
+    }
+    let markers = raw.as_bytes().get(..parents)?;
+    markers
+        .iter()
+        .all(|marker| matches!(marker, b' ' | b'+' | b'-'))
+        .then(|| markers.to_vec())
 }
 
 /// Split on LF and drop a trailing CR, so a CRLF file does not gain a phantom
@@ -382,6 +501,14 @@ pub fn display_columns(text: &str, maximum: usize) -> usize {
 /// sides name the same path the header is exactly `a/P b/P`, which can be split
 /// by length; otherwise the two tokens are read, quoted or not.
 pub fn anchor_path(line: &str) -> Option<String> {
+    // A combined diff names the one path, with no `a/` or `b/`.
+    if let Some(path) = line
+        .strip_prefix("diff --cc ")
+        .or_else(|| line.strip_prefix("diff --combined "))
+    {
+        let path = unquote(path);
+        return (!path.is_empty()).then(|| path.into_owned());
+    }
     let header = line.strip_prefix("diff --git ")?;
     if header.starts_with("a/") && header.len() > 5 && (header.len() - 5) % 2 == 0 {
         let length = (header.len() - 5) / 2;
@@ -502,6 +629,77 @@ mod tests {
             .iter()
             .map(|line| (line.kind, line.text.as_str()))
             .collect()
+    }
+
+    #[test]
+    fn a_conflicted_file_is_read_from_its_combined_diff() {
+        // Captured from `git diff` with `f.txt` in conflict after a merge.
+        let text = "diff --cc f.txt\n\
+index f4c4712,ed8445c..0000000\n\
+--- a/f.txt\n\
++++ b/f.txt\n\
+@@@ -1,3 -1,3 +1,7 @@@\n  one\n++<<<<<<< HEAD\n +MAIN\n++=======\n+ SIDE\n++>>>>>>> side\n  three\n\
+diff --git a/other.txt b/other.txt\n\
+index 1..2 100644\n\
+--- a/other.txt\n\
++++ b/other.txt\n\
+@@ -1 +1 @@\n-keep\n+changed\n";
+        let sections = parse_unified_diff(text);
+        assert_eq!(
+            sections
+                .iter()
+                .map(|section| section.path.as_str())
+                .collect::<Vec<_>>(),
+            ["f.txt", "other.txt"]
+        );
+        let conflict = &sections[0];
+        let kinds: Vec<_> = conflict.lines.iter().map(|line| line.kind).collect();
+        use DiffLineKind::*;
+        assert_eq!(
+            kinds,
+            [
+                Hunk, Context, Addition, Addition, Addition, Addition, Addition, Context
+            ]
+        );
+        assert_eq!(conflict.additions, 5);
+        // The result's numbering runs through every line it contains.
+        let new: Vec<_> = conflict
+            .lines
+            .iter()
+            .filter_map(|line| line.new_line)
+            .collect();
+        assert_eq!(new, [1, 2, 3, 4, 5, 6, 7]);
+        // HEAD's numbering: `one`, `MAIN`, `three`.
+        assert_eq!(conflict.lines[1].old_line, Some(1));
+        assert_eq!(conflict.lines[7].old_line, Some(3));
+        assert_eq!(sections[1].additions, 1);
+        assert_eq!(sections[1].deletions, 1);
+    }
+
+    #[test]
+    fn a_combined_hunk_ends_on_the_parents_counts_too() {
+        // The last line is in the second parent only: the result's count is
+        // spent before it, and it is still content, not metadata.
+        let text = "diff --cc f.txt\n@@@ -1,1 -1,2 +1,1 @@@\n  same\n -only in theirs\n";
+        let section = &parse_unified_diff(text)[0];
+        let kinds: Vec<_> = section.lines.iter().map(|line| line.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                DiffLineKind::Hunk,
+                DiffLineKind::Context,
+                DiffLineKind::Deletion
+            ]
+        );
+        assert_eq!(section.lines[2].old_line, None, "not a line of HEAD's");
+        assert_eq!(
+            combined_hunk_header("@@@ -1,3 -1 +1,7 @@@"),
+            Some(CombinedHunkHeader {
+                parents: vec![(1, 3), (1, 1)],
+                result: (1, 7),
+            })
+        );
+        assert_eq!(combined_hunk_header("@@ -1 +1 @@"), None);
     }
 
     #[test]

@@ -898,6 +898,50 @@ mod tests {
     }
 
     #[test]
+    fn a_write_ends_even_after_a_switch_the_hidden_inspector_never_saw() {
+        // Hidden, the inspector does not sync, so it never hears of the
+        // switch to B and back. The monitor does, and its generation moves.
+        let first = repo();
+        let second = repo();
+        std::fs::write(first.path().join("sample.txt"), "after the edit\n").unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let mut test = gpui::TestAppContext::single();
+        let (inspector, _window) = mount(&mut test, data.path(), Some(first.path()), 360.0);
+        let state = test.read(|cx| inspector.read(cx).state.clone());
+        let monitor = test.read(|cx| inspector.read(cx).monitor.clone());
+        let first_id = state.update(&mut test, |state, _| {
+            state
+                .project_with_root(&first.path().to_string_lossy())
+                .unwrap()
+        });
+        let second_id = state.update(&mut test, |state, _| {
+            state.add_project(&second.path().to_string_lossy())
+        });
+        inspector.update(&mut test, |inspector, cx| {
+            inspector.commit("Ship it".into(), cx);
+            assert_eq!(inspector.composer.running, Some(Operation::Commit));
+        });
+        for project in [second_id, first_id] {
+            state.update(&mut test, |state, _| state.select_project(project));
+            monitor.update(&mut test, |monitor, cx| monitor.sync(cx));
+        }
+        wait_until(&mut test, &inspector, |i| i.composer.running.is_none());
+        test.read(|cx| {
+            assert!(
+                matches!(
+                    &inspector.read(cx).composer.outcome,
+                    Some(Outcome::Succeeded(_))
+                ),
+                "the commit was made here, so it is reported here"
+            );
+        });
+        assert_eq!(
+            git(first.path(), &["log", "-1", "--format=%s"]).trim(),
+            "Ship it"
+        );
+    }
+
+    #[test]
     fn a_failed_push_shows_gits_own_explanation() {
         let root = repo();
         let data = tempfile::tempdir().unwrap();

@@ -154,17 +154,12 @@ pub(super) fn commit_scope(
                 .iter()
                 .filter(|file| chosen.contains(&file.path))
                 .collect();
-            let stage = files
+            let chosen = files.iter().map(|file| file.path.clone()).collect();
+            let sources = files
                 .iter()
-                .filter(|file| file.has_unstaged_changes())
-                .map(|file| file.path.clone())
+                .filter_map(|file| file.original_path.clone())
                 .collect();
-            let mut commit: Vec<String> = Vec::new();
-            for file in &files {
-                commit.push(file.path.clone());
-                commit.extend(file.original_path.clone());
-            }
-            CommitScope::Paths { stage, commit }
+            CommitScope::Paths { chosen, sources }
         }
     }
 }
@@ -193,7 +188,7 @@ impl Inspector {
         if self.composer.running.is_some() {
             return;
         }
-        let Some((root, repository, generation)) = self.repository_target(cx) else {
+        let Some((root, repository, project)) = self.repository_target(cx) else {
             return;
         };
         let scope = commit_scope(self.composer.choice, &self.composer.chosen, &repository);
@@ -205,7 +200,7 @@ impl Inspector {
                 return;
             }
         };
-        self.start(Operation::Commit, generation, cx, move || async move {
+        self.start(Operation::Commit, project, cx, move || async move {
             fx_core::git::operations::commit(&root, &plan).await
         });
     }
@@ -214,31 +209,32 @@ impl Inspector {
         if self.composer.running.is_some() {
             return;
         }
-        let Some((root, _, generation)) = self.repository_target(cx) else {
+        let Some((root, _, project)) = self.repository_target(cx) else {
             return;
         };
-        self.start(Operation::Push, generation, cx, move || async move {
+        self.start(Operation::Push, project, cx, move || async move {
             fx_core::git::operations::push(&root).await
         });
     }
 
+    /// The repository to write to, and the project it belongs to.
     fn repository_target(
         &self,
         cx: &Context<Self>,
-    ) -> Option<(std::path::PathBuf, GitRepositoryInfo, u64)> {
+    ) -> Option<(std::path::PathBuf, GitRepositoryInfo, String)> {
         let monitor = self.monitor.read(cx);
         let snapshot = monitor.snapshot()?;
         Some((
             snapshot.root.clone(),
             snapshot.repository.clone()?,
-            monitor.generation(),
+            monitor.project()?.to_string(),
         ))
     }
 
     fn start<F, Fut>(
         &mut self,
         operation: Operation,
-        generation: u64,
+        project: String,
         cx: &mut Context<Self>,
         job: F,
     ) where
@@ -251,24 +247,33 @@ impl Inspector {
         self.composer.task = Some(cx.spawn(async move |this, cx| {
             let result = repository::finish_git(job).await;
             let _ = this.update(cx, |this, cx| {
-                this.finish_operation(operation, generation, result, cx)
+                this.finish_operation(operation, &project, result, cx)
             });
         }));
         cx.notify();
     }
 
+    /// Record how a write ended.
+    ///
+    /// The running flag is cleared whatever is showing now. Only this task
+    /// could clear it — switching projects drops the task — and it used to
+    /// return early on any change of the monitor's generation. Hidden, the
+    /// inspector never saw a switch from A to B and back, so it kept the task,
+    /// the generation had moved, and "Committing…" stayed up for good. The
+    /// result itself is only shown in the project it was written to.
     pub(super) fn finish_operation(
         &mut self,
         operation: Operation,
-        generation: u64,
+        project: &str,
         result: Result<String, String>,
         cx: &mut Context<Self>,
     ) {
-        if self.monitor.read(cx).generation() != generation {
-            return;
-        }
         self.composer.running = None;
         self.composer.task = None;
+        if self.monitor.read(cx).project() != Some(project) {
+            cx.notify();
+            return;
+        }
         match result {
             Ok(summary) => {
                 if operation == Operation::Commit {
@@ -574,13 +579,8 @@ mod tests {
         assert_eq!(
             commit_scope(CommitChoice::Chosen, &chosen, &repository),
             CommitScope::Paths {
-                stage: vec!["edited.rs".into(), "fresh.rs".into()],
-                commit: vec![
-                    "new.rs".into(),
-                    "old.rs".into(),
-                    "edited.rs".into(),
-                    "fresh.rs".into()
-                ],
+                chosen: vec!["new.rs".into(), "edited.rs".into(), "fresh.rs".into()],
+                sources: vec!["old.rs".into()],
             }
         );
         assert_eq!(

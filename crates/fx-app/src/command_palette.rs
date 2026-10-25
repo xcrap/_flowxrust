@@ -529,7 +529,7 @@ impl CommandPalette {
         match target {
             PaletteTarget::Action(action) => window.dispatch_action(action, cx),
             PaletteTarget::Thread(id) => self.state.update(cx, |state, cx| {
-                state.open_thread(id);
+                state.open_thread(id, cx);
                 cx.notify();
             }),
             PaletteTarget::Project(id) => self.state.update(cx, |state, cx| {

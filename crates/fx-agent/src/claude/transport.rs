@@ -475,6 +475,8 @@ struct Inner {
     /// The process's own group, which the tools it runs inherit. Kept apart
     /// from `child` because the group outlives a reaped leader.
     group: Option<crate::process::Group>,
+    /// The process's place in the list Quit ends, until it closes.
+    running: std::sync::Mutex<Option<crate::process::Running>>,
     /// The parser, shared so an approval can be answered from a task other than
     /// the one reading the stream.
     parser: Mutex<ClaudeStreamParser>,
@@ -571,6 +573,7 @@ impl ClaudeTransport {
         let inner = Arc::new(Inner {
             child: Mutex::new(Some(child)),
             group,
+            running: std::sync::Mutex::new(group.map(crate::process::Running::register)),
             parser: Mutex::new(ClaudeStreamParser::new()),
             input: Mutex::new(TurnInput::new()),
             exited: Mutex::new(None),
@@ -789,6 +792,12 @@ impl ClaudeTransport {
         self.inner.exited.lock().await.clone()
     }
 
+    /// Whether stdin is still open. Settled by the time a `result`'s events
+    /// are read: the reader closes it, when it does, before delivering them.
+    pub async fn input_open(&self) -> bool {
+        self.inner.input.lock().await.is_open()
+    }
+
     /// Close stdin, which is how Claude is told the turn is over.
     pub async fn close_input(&self) {
         close_stdin(&self.inner.input, &self.stdin).await;
@@ -805,36 +814,51 @@ impl ClaudeTransport {
     pub async fn close(&self) {
         self.close_input().await;
         let mut slot = self.inner.child.lock().await;
-        let Some(mut child) = slot.take() else {
-            return;
-        };
-        if tokio::time::timeout(CLOSE_GRACE, child.wait())
-            .await
-            .is_err()
+        if let Some(mut child) = slot.take()
+            && tokio::time::timeout(CLOSE_GRACE, child.wait())
+                .await
+                .is_err()
         {
             crate::process::stop_leader(&mut child, CLOSE_GRACE).await;
         }
+        drop(slot);
+        self.leave_running();
     }
 
     /// Stop the process and everything it started, for Stop or a failed turn.
     ///
     /// The input is closed first, for the reason `close` gives, and the
-    /// process gets the same moment to end on its own. Then the whole process
-    /// group gets SIGTERM, a grace period, and SIGKILL — whether or not Claude
-    /// itself has gone, because a tool it started can outlive it. A caller
-    /// stopping a turn sends [`Self::interrupt`] before this.
+    /// process gets the same moment to end on its own. Then the whole tree
+    /// gets SIGTERM, a grace period, and SIGKILL — whether or not Claude itself
+    /// has gone, because a tool it started can outlive it. The tree is taken
+    /// before any of that: Claude starts each `Bash` call in a session of its
+    /// own, outside its group, and once Claude has exited nothing but that
+    /// record still leads to the tool. A caller stopping a turn sends
+    /// [`Self::interrupt`] before this.
     pub async fn terminate(&self) {
+        let tree = self.inner.group.map(crate::process::Group::tree);
         self.close_input().await;
         let mut slot = self.inner.child.lock().await;
         if let Some(child) = slot.as_mut() {
             let _ = tokio::time::timeout(CLOSE_GRACE, child.wait()).await;
         }
-        match (self.inner.group, slot.as_mut()) {
-            (Some(group), leader) => group.terminate(leader, TERMINATE_GRACE).await,
+        match (tree, slot.as_mut()) {
+            (Some(tree), leader) => tree.terminate(leader, TERMINATE_GRACE).await,
             (None, Some(child)) => crate::process::stop_leader(child, TERMINATE_GRACE).await,
             (None, None) => {}
         }
         slot.take();
+        drop(slot);
+        self.leave_running();
+    }
+
+    /// Leave the list Quit ends: what is left now is not FlowX's to stop.
+    fn leave_running(&self) {
+        self.inner
+            .running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
     }
 
     async fn write(&self, envelope: Value) -> Result<(), TransportError> {
@@ -1107,27 +1131,21 @@ async fn deliver_line(
     }
     let (produced, refusal, finished) = {
         let mut parser = inner.parser.lock().await;
-        // Completion is the parser's flag and nothing else. There is no second
-        // notion of "finished" here to disagree with it. Only the line that
-        // sets it counts, because a follow-up turn's `init` clears it again.
-        let was_finished = parser.did_finish();
         let produced = parser.events(line);
         // A control request this parser cannot serve must be *answered*, not
         // merely recorded. Claude blocks on every one of them, so a refusal that
         // is produced but never written leaves the turn hanging forever with no
         // error and no way for the user to tell.
         let refusal = parser.take_refusal();
-        // A background task still running will be reported as a turn of its
-        // own, and the input is what lets that turn be steered: it stays open
-        // until a `result` arrives with nothing left running.
-        let finished = !was_finished && parser.did_finish() && !parser.has_running_tasks();
+        // Completion is the parser's flag and nothing else. A background task
+        // still running will be reported as a turn of its own, and one that
+        // has ended is still owed an answer: the input is what lets those
+        // turns be steered and their permissions answered, so it stays open
+        // until a `result` leaves nothing outstanding. Closing is idempotent,
+        // so every line after that may ask again.
+        let finished = parser.did_finish() && !parser.holds_input_open();
         (produced, refusal, finished)
     };
-    for event in produced {
-        // Awaited: the queue is bounded, so `send` is a future. Discarding it
-        // compiles and delivers nothing.
-        let _ = events.send(StreamItem::Event(event)).await;
-    }
     if let Some(envelope) = refusal {
         // Encoded inline rather than through the transport's own `write`, which
         // needs `&self`; the reader task only has `Inner`.
@@ -1138,8 +1156,15 @@ async fn deliver_line(
     }
     if finished {
         // Closing here is what lets the process exit: a `-p` run that has
-        // answered still holds this pipe open until it does not.
+        // answered still holds this pipe open until it does not. Closed before
+        // the line's events go out, so a reader handed this `result` already
+        // sees the input as it will stay.
         close_stdin(&inner.input, stdin).await;
+    }
+    for event in produced {
+        // Awaited: the queue is bounded, so `send` is a future. Discarding it
+        // compiles and delivers nothing.
+        let _ = events.send(StreamItem::Event(event)).await;
     }
 }
 

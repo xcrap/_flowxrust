@@ -35,22 +35,34 @@ pub enum CommitScope {
     /// Commit the index exactly as the user built it, for example with
     /// `git add -p`.
     Staged,
-    /// Commit only the chosen paths and leave everything else, staged or not,
-    /// where it is.
+    /// Commit only the chosen paths, as they are in the working tree, and
+    /// leave everything else, staged or not, where it is.
     Paths {
-        /// Paths with work outside the index, which must be staged first.
-        stage: Vec<String>,
-        /// Every path the commit is limited to, including a rename's source,
-        /// whose deletion would otherwise stay behind.
-        commit: Vec<String>,
+        /// The chosen paths.
+        chosen: Vec<String>,
+        /// The sources of chosen renames, committed as removed. Whatever sits
+        /// at that path now is a different file, and it was not chosen.
+        sources: Vec<String>,
     },
 }
 
 /// The git invocations one commit needs, before the shared global options.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitPlan {
+    /// Staging into the user's own index, for a commit of everything.
     pub stage: Option<Vec<String>>,
     pub commit: Vec<String>,
+    /// A chosen-files commit, which is built in an index of FlowX's own.
+    pub chosen: Option<ChosenFiles>,
+}
+
+/// What a chosen-files commit takes, and from where.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChosenFiles {
+    /// Committed as they are in the working tree.
+    pub paths: Vec<String>,
+    /// Committed as removed.
+    pub sources: Vec<String>,
 }
 
 impl CommitPlan {
@@ -60,43 +72,142 @@ impl CommitPlan {
         }
         // `-m` consumes the next argument whole, so a message beginning with a
         // dash is still a message.
-        let mut commit = vec!["commit".to_string(), "-m".into(), message.to_string()];
-        let stage = match scope {
-            CommitScope::All => Some(vec!["add".into(), "-A".into()]),
-            CommitScope::Staged => None,
-            CommitScope::Paths {
-                stage,
-                commit: only,
-            } => {
-                if only.is_empty() {
+        let commit = vec!["commit".to_string(), "-m".into(), message.to_string()];
+        let (stage, chosen) = match scope {
+            CommitScope::All => (Some(vec!["add".into(), "-A".into()]), None),
+            CommitScope::Staged => (None, None),
+            CommitScope::Paths { chosen, sources } => {
+                if chosen.is_empty() {
                     return Err("Choose at least one file to commit.".into());
                 }
-                for path in stage.iter().chain(only) {
+                for path in chosen.iter().chain(sources) {
                     validate_relative_path(path)?;
                 }
-                // `--only` commits these paths' working-tree content and
-                // nothing else from the index.
-                commit.extend(["--only".into(), "--".into()]);
-                commit.extend(only.iter().cloned());
-                (!stage.is_empty()).then(|| {
-                    let mut add = vec!["add".to_string(), "-A".into(), "--".into()];
-                    add.extend(stage.iter().cloned());
-                    add
-                })
+                // A source that was chosen as well is a file of its own now,
+                // and is committed as one.
+                let sources = sources
+                    .iter()
+                    .filter(|source| !chosen.contains(source))
+                    .cloned()
+                    .collect();
+                let chosen = ChosenFiles {
+                    paths: chosen.clone(),
+                    sources,
+                };
+                (None, Some(chosen))
             }
         };
-        Ok(Self { stage, commit })
+        Ok(Self {
+            stage,
+            commit,
+            chosen,
+        })
     }
 }
 
 /// Stage per the plan, then commit. Returns git's summary line, such as
 /// `[main 1a2b3c4] Fix the parser`.
 pub async fn commit(root: &Path, plan: &CommitPlan) -> Result<String, String> {
+    if let Some(chosen) = &plan.chosen {
+        return commit_chosen(root, &plan.commit, chosen).await;
+    }
     if let Some(stage) = &plan.stage {
         write(root, stage, "Staging failed.").await?;
     }
     let output = write(root, &plan.commit, "Commit failed.").await?;
     Ok(first_line(&output).unwrap_or_else(|| "Committed.".into()))
+}
+
+/// Commit chosen files through an index of FlowX's own.
+///
+/// `git commit --only` takes every path it is given from the working tree,
+/// and a rename's source has to be given or its deletion stays behind. After
+/// `git mv old new` and a new, untracked `old`, that committed the untracked
+/// file as `old`'s new content. A temporary index lets each path come from
+/// where it should: a chosen file from the working tree, a rename's source as
+/// removed. The user's own index is then brought up to the commit for those
+/// paths and no others, which is what `--only` leaves behind as well, and a
+/// failed commit leaves it exactly as it was.
+async fn commit_chosen(
+    root: &Path,
+    commit: &[String],
+    chosen: &ChosenFiles,
+) -> Result<String, String> {
+    const PREPARE: &str = "Preparing the commit failed.";
+    let index = TemporaryIndex::beside(root).await.ok_or(PREPARE)?;
+    let index_path = Some(index.0.as_path());
+    let born = read(root, &["rev-parse", "--verify", "--quiet", "HEAD"])
+        .await
+        .is_some();
+    let base: Vec<String> = if born {
+        vec!["read-tree".into(), "HEAD".into()]
+    } else {
+        vec!["read-tree".into(), "--empty".into()]
+    };
+    write_in(root, index_path, &base, PREPARE).await?;
+
+    // A chosen path that is gone from the working tree is a deletion, and
+    // `add` refuses a path that matches nothing at all, as an added file
+    // deleted again does.
+    let (present, missing): (Vec<String>, Vec<String>) = chosen
+        .paths
+        .iter()
+        .cloned()
+        .partition(|path| root.join(path).symlink_metadata().is_ok());
+    if !present.is_empty() {
+        let mut add = vec!["add".to_string(), "-A".into(), "--".into()];
+        add.extend(present);
+        write_in(root, index_path, &add, "Staging failed.").await?;
+    }
+    let removed: Vec<String> = missing
+        .into_iter()
+        .chain(chosen.sources.iter().cloned())
+        .collect();
+    if !removed.is_empty() {
+        let mut remove = vec![
+            "rm".to_string(),
+            "--cached".into(),
+            "--quiet".into(),
+            "--ignore-unmatch".into(),
+            "--".into(),
+        ];
+        remove.extend(removed);
+        write_in(root, index_path, &remove, "Staging failed.").await?;
+    }
+
+    let output = write_in(root, index_path, commit, "Commit failed.").await?;
+    let summary = first_line(&output).unwrap_or_else(|| "Committed.".into());
+    let mut reset = vec!["reset".to_string(), "--quiet".into(), "--".into()];
+    reset.extend(chosen.paths.iter().chain(&chosen.sources).cloned());
+    if let Err(error) = write(root, &reset, "Updating the index failed.").await {
+        return Err(format!(
+            "{summary}\n\nThe commit was made, but the index could not be brought up to it:\n{error}"
+        ));
+    }
+    Ok(summary)
+}
+
+/// An index file beside the repository's own, removed when dropped.
+///
+/// Beside it rather than in the system's temporary directory, so it has the
+/// repository's permissions: an index lists every path in the tree.
+struct TemporaryIndex(std::path::PathBuf);
+
+impl TemporaryIndex {
+    async fn beside(root: &Path) -> Option<Self> {
+        let own = read(root, &["rev-parse", "--git-path", "index"]).await?;
+        let path = root.join(format!("{own}.flowx-{}", uuid::Uuid::new_v4().simple()));
+        Some(Self(path))
+    }
+}
+
+impl Drop for TemporaryIndex {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+        let mut lock = self.0.clone().into_os_string();
+        lock.push(".lock");
+        let _ = std::fs::remove_file(lock);
+    }
 }
 
 /// Everything that decides how to push the current branch.
@@ -203,10 +314,21 @@ fn global_arguments(arguments: &[impl AsRef<str>]) -> Vec<String> {
 }
 
 async fn write(root: &Path, arguments: &[String], fallback: &str) -> Result<String, String> {
+    write_in(root, None, arguments, fallback).await
+}
+
+/// [`write`], against `index` in place of the repository's own when given.
+async fn write_in(
+    root: &Path,
+    index: Option<&Path>,
+    arguments: &[String],
+    fallback: &str,
+) -> Result<String, String> {
     let arguments = global_arguments(arguments);
     let mut spec = CommandSpec::new(&arguments)
         .in_directory(Some(root))
-        .with_timeout(WRITE_TIMEOUT);
+        .with_timeout(WRITE_TIMEOUT)
+        .with_index_file(index);
     spec.include_stderr_in_stdout = true;
     match command::run_lenient(spec).await {
         Ok(output) if output.success() => Ok(output.stdout),
@@ -386,30 +508,33 @@ mod tests {
         assert!(CommitPlan::new("  \n", &CommitScope::All).is_err());
         for path in ["../outside", "/etc/passwd", ""] {
             let scope = CommitScope::Paths {
-                stage: vec![],
-                commit: vec![path.into()],
+                chosen: vec![path.into()],
+                sources: vec![],
+            };
+            assert!(CommitPlan::new("message", &scope).is_err(), "{path:?}");
+            let scope = CommitScope::Paths {
+                chosen: vec!["inside".into()],
+                sources: vec![path.into()],
             };
             assert!(CommitPlan::new("message", &scope).is_err(), "{path:?}");
         }
         let plan = CommitPlan::new(
             "-n starts like an option",
             &CommitScope::Paths {
-                stage: vec!["-f".into()],
-                commit: vec!["-f".into()],
+                chosen: vec!["-f".into(), "new".into()],
+                sources: vec!["old".into(), "new".into()],
             },
         )
         .unwrap();
-        assert_eq!(plan.stage.unwrap(), ["add", "-A", "--", "-f"]);
+        assert_eq!(plan.stage, None, "the user's index is not staged into");
+        assert_eq!(plan.commit, ["commit", "-m", "-n starts like an option"]);
         assert_eq!(
-            plan.commit,
-            [
-                "commit",
-                "-m",
-                "-n starts like an option",
-                "--only",
-                "--",
-                "-f"
-            ]
+            plan.chosen.unwrap(),
+            ChosenFiles {
+                paths: vec!["-f".into(), "new".into()],
+                sources: vec!["old".into()],
+            },
+            "a source that was chosen too is committed as a file"
         );
     }
 
@@ -451,8 +576,8 @@ mod tests {
         let plan = CommitPlan::new(
             "Selected",
             &CommitScope::Paths {
-                stage: vec!["chosen.txt".into()],
-                commit: vec!["renamed.txt".into(), "old.txt".into(), "chosen.txt".into()],
+                chosen: vec!["renamed.txt".into(), "chosen.txt".into()],
+                sources: vec!["old.txt".into()],
             },
         )
         .unwrap();
@@ -466,6 +591,137 @@ mod tests {
         );
         assert!(!committed.contains("tracked.txt"), "{committed}");
         assert_eq!(status(root), "M  tracked.txt\n?? ignored.txt\n");
+        assert_no_temporary_index(root);
+    }
+
+    #[test]
+    fn an_untracked_file_at_a_rename_source_is_not_committed() {
+        // `git commit --only -- new.txt old.txt` took `old.txt` from the
+        // working tree, which after `git mv` and a fresh `old.txt` committed
+        // the new, unchosen file as the old one's content.
+        let temp = repository();
+        let root = temp.path();
+        git(root, &["mv", "old.txt", "new.txt"]);
+        std::fs::write(root.join("old.txt"), "an unrelated new file\n").unwrap();
+        std::fs::write(root.join("tracked.txt"), "staged, not chosen\n").unwrap();
+        git(root, &["add", "tracked.txt"]);
+        let plan = CommitPlan::new(
+            "Rename",
+            &CommitScope::Paths {
+                chosen: vec!["new.txt".into()],
+                sources: vec!["old.txt".into()],
+            },
+        )
+        .unwrap();
+        run(commit(root, &plan)).unwrap();
+        let committed = git(root, &["show", "--name-status", "--format=", "HEAD"]);
+        assert!(
+            committed
+                .lines()
+                .any(|line| line.starts_with('R') && line.ends_with("old.txt\tnew.txt")),
+            "the commit is the rename: {committed}"
+        );
+        assert_eq!(git(root, &["show", "HEAD:new.txt"]), "moving\n");
+        assert!(
+            git(root, &["ls-tree", "--name-only", "HEAD"])
+                .lines()
+                .all(|name| name != "old.txt"),
+            "the untracked file was committed"
+        );
+        assert_eq!(status(root), "M  tracked.txt\n?? old.txt\n");
+        assert_no_temporary_index(root);
+    }
+
+    #[test]
+    fn a_chosen_deletion_and_a_partly_staged_file_commit_their_working_tree() {
+        let temp = repository();
+        let root = temp.path();
+        std::fs::remove_file(root.join("old.txt")).unwrap();
+        std::fs::write(root.join("tracked.txt"), "staged\n").unwrap();
+        git(root, &["add", "tracked.txt"]);
+        std::fs::write(root.join("tracked.txt"), "staged and more\n").unwrap();
+        // Added, then deleted again: nothing to commit, and nothing to fail on.
+        std::fs::write(root.join("brief.txt"), "brief\n").unwrap();
+        git(root, &["add", "brief.txt"]);
+        std::fs::remove_file(root.join("brief.txt")).unwrap();
+        let plan = CommitPlan::new(
+            "Both",
+            &CommitScope::Paths {
+                chosen: vec!["old.txt".into(), "tracked.txt".into(), "brief.txt".into()],
+                sources: vec![],
+            },
+        )
+        .unwrap();
+        run(commit(root, &plan)).unwrap();
+        assert_eq!(
+            git(root, &["show", "HEAD:tracked.txt"]),
+            "staged and more\n"
+        );
+        assert_eq!(
+            git(root, &["show", "--name-status", "--format=", "HEAD"]),
+            "D\told.txt\nM\ttracked.txt\n"
+        );
+        assert_eq!(status(root), "");
+    }
+
+    #[test]
+    fn a_rejected_chosen_commit_leaves_the_index_alone() {
+        let temp = repository();
+        let root = temp.path();
+        let hook = root.join(".git/hooks/pre-commit");
+        std::fs::write(&hook, "#!/bin/sh\necho 'the hook says no' >&2\nexit 1\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(root.join("tracked.txt"), "edited\n").unwrap();
+        std::fs::write(root.join("new.txt"), "new\n").unwrap();
+        let plan = CommitPlan::new(
+            "Refused",
+            &CommitScope::Paths {
+                chosen: vec!["tracked.txt".into(), "new.txt".into()],
+                sources: vec![],
+            },
+        )
+        .unwrap();
+        let error = run(commit(root, &plan)).unwrap_err();
+        assert!(error.contains("the hook says no"), "{error}");
+        assert_eq!(status(root), " M tracked.txt\n?? new.txt\n");
+        assert_no_temporary_index(root);
+    }
+
+    #[test]
+    fn a_chosen_commit_works_on_an_unborn_branch() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        identify(root);
+        std::fs::write(root.join("first.txt"), "first\n").unwrap();
+        std::fs::write(root.join("later.txt"), "later\n").unwrap();
+        let plan = CommitPlan::new(
+            "First",
+            &CommitScope::Paths {
+                chosen: vec!["first.txt".into()],
+                sources: vec![],
+            },
+        )
+        .unwrap();
+        run(commit(root, &plan)).unwrap();
+        assert_eq!(
+            git(root, &["ls-tree", "--name-only", "HEAD"]),
+            "first.txt\n"
+        );
+        assert_eq!(status(root), "?? later.txt\n");
+    }
+
+    fn assert_no_temporary_index(root: &Path) {
+        let left: Vec<_> = std::fs::read_dir(root.join(".git"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("flowx"))
+            .collect();
+        assert!(left.is_empty(), "left behind: {left:?}");
     }
 
     #[test]

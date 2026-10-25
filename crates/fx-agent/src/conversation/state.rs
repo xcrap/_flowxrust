@@ -707,9 +707,15 @@ impl Conversation {
         self.touch();
     }
 
+    /// Record how full the context is. A window of zero means "not said":
+    /// Claude's replies carry the fill but leave the window to `result`, and
+    /// taking the zero replaced the known window, so the meter vanished on
+    /// every reply.
     pub fn record_context(&mut self, used: u64, window: u64) {
         self.usage.current_context_tokens = used;
-        self.usage.reported_context_window = Some(window);
+        if window > 0 {
+            self.usage.reported_context_window = Some(window);
+        }
         self.touch();
     }
 
@@ -1321,6 +1327,22 @@ mod tests {
         c.apply(ProviderEvent::Text(String::new()));
         assert_eq!(texts(&c), ["First.", "Second.", "Third."]);
         assert!(!c.is_streaming());
+    }
+
+    #[test]
+    fn a_reply_that_does_not_say_the_window_keeps_the_known_one() {
+        let mut c = Conversation::new(Uuid::nil());
+        c.apply(ProviderEvent::ContextUsage {
+            used: 1_000,
+            window: 200_000,
+        });
+        c.apply(ProviderEvent::ContextUsage {
+            used: 2_000,
+            window: 0,
+        });
+        assert_eq!(c.usage().current_context_tokens, 2_000);
+        assert_eq!(c.usage().reported_context_window, Some(200_000));
+        assert_eq!(c.usage().context_fraction(), Some(0.01));
     }
 
     #[test]

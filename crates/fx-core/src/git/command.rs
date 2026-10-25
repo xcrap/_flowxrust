@@ -72,6 +72,8 @@ pub struct CommandSpec<'a> {
     pub max_output_bytes: usize,
     /// Suppress the truncation notice, for output the user will never read.
     pub append_truncation_notice: bool,
+    /// An index to use in place of the repository's own (`GIT_INDEX_FILE`).
+    pub index_file: Option<&'a Path>,
 }
 
 impl<'a> CommandSpec<'a> {
@@ -83,6 +85,7 @@ impl<'a> CommandSpec<'a> {
             timeout: DEFAULT_TIMEOUT,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             append_truncation_notice: true,
+            index_file: None,
         }
     }
 
@@ -93,6 +96,11 @@ impl<'a> CommandSpec<'a> {
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    pub fn with_index_file(mut self, index_file: Option<&'a Path>) -> Self {
+        self.index_file = index_file;
         self
     }
 
@@ -161,6 +169,9 @@ async fn spawn(spec: CommandSpec<'_>) -> Result<CommandOutput, GitError> {
 
     if let Some(dir) = spec.directory {
         command.current_dir(dir);
+    }
+    if let Some(index) = spec.index_file {
+        command.env("GIT_INDEX_FILE", index);
     }
 
     let mut child = command.spawn().map_err(GitError::Spawn)?;

@@ -34,6 +34,15 @@ pub fn checkbox_palette(checked: bool, theme: &crate::theme::Theme) -> CheckboxP
     }
 }
 
+/// The label's colour, at rest and under the pointer.
+pub fn checkbox_label_ink(hovered: bool, theme: &crate::theme::Theme) -> gpui::Rgba {
+    if hovered {
+        Colors::fg(theme)
+    } else {
+        Colors::fg_secondary(theme)
+    }
+}
+
 /// A box and its label; the whole row toggles.
 pub fn checkbox(
     id: impl Into<SharedString>,
@@ -47,6 +56,10 @@ pub fn checkbox(
     let edge = Typography::icon(IconSize::Medium, &theme).size;
     let id = id.into();
     let debug = format!("checkbox:{id}");
+    // The label sets its own colour, so a hover on the row could not reach
+    // it: the row's refinement changed an inherited colour nothing inherited.
+    // The label follows the row's hover as a group instead.
+    let group = SharedString::from(format!("checkbox-row:{id}"));
     let mut mark = div()
         .flex()
         .flex_shrink_0()
@@ -60,8 +73,10 @@ pub fn checkbox(
     if checked {
         mark = mark.child(Icon::CHECKMARK.render(IconSize::Micro, palette.check, &theme));
     }
+    let hovered = checkbox_label_ink(true, &theme);
     div()
         .debug_selector(move || debug.clone())
+        .group(group.clone())
         .flex()
         .min_w_0()
         .items_center()
@@ -72,18 +87,17 @@ pub fn checkbox(
                 .min_w_0()
                 .truncate()
                 .fx_role(TextRole::Caption)
-                .text_color(Colors::fg_secondary(&theme))
+                .text_color(checkbox_label_ink(false, &theme))
+                .group_hover(
+                    group,
+                    move |s: StyleRefinement| {
+                        if enabled { s.fx_text_color(hovered) } else { s }
+                    },
+                )
                 .child(label.into()),
         )
         .opacity(if enabled { 1.0 } else { DISABLED_OPACITY })
         .id(id)
-        .hover(move |s: StyleRefinement| {
-            if enabled {
-                s.fx_text_color(Colors::fg(&theme))
-            } else {
-                s
-            }
-        })
         .cursor(if enabled {
             CursorStyle::PointingHand
         } else {
@@ -116,6 +130,11 @@ mod tests {
                     let off = checkbox_palette(false, &theme);
                     assert!(crate::theme::contrast(on.check, on.fill) >= 3.0);
                     assert_ne!(on.fill, off.fill, "checked and unchecked look alike");
+                    assert_ne!(
+                        checkbox_label_ink(true, &theme),
+                        checkbox_label_ink(false, &theme),
+                        "hovering the row changes nothing"
+                    );
                 }
             }
         }

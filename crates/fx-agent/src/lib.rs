@@ -16,6 +16,7 @@ pub mod shell;
 pub mod title;
 
 pub use conversation::{Conversation, DeltaPolicy, Phase};
+pub use process::{QUIT_GRACE, stop_all_now};
 pub use provider::{
     Model, Provider, ProviderError, ProviderEvent, ProviderHealth, StreamSink, TaskStatus,
     TaskUpdate, ThreadIdentity, ThreadSummary,

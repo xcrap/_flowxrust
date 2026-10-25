@@ -117,7 +117,11 @@ pub enum SessionUpdate {
 /// ask for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThreadControl {
-    Compact,
+    /// Compact the context, with what to keep in the summary, if anything.
+    ///
+    /// Claude's `/compact` takes these; dropping them compacted with Claude's
+    /// default summary instead of the one asked for.
+    Compact(String),
     GoalView,
     GoalSet(String),
     GoalStatus(fx_core::models::GoalStatus),
@@ -139,7 +143,7 @@ impl ThreadControl {
             None => (rest, ""),
         };
         match command.to_lowercase().as_str() {
-            "compact" => Some(Self::Compact),
+            "compact" => Some(Self::Compact(argument.to_string())),
             "goal" => Some(match argument.to_lowercase().as_str() {
                 "" => Self::GoalView,
                 "pause" => Self::GoalStatus(fx_core::models::GoalStatus::Paused),
@@ -154,11 +158,31 @@ impl ThreadControl {
     /// Whether the provider can carry this control at all.
     ///
     /// Claude Code compacts through its own `/compact` command, sent as the
-    /// turn's prompt. It has no goals.
+    /// turn's prompt, instructions and all. It has no goals.
     pub fn supported_by(&self, provider: &str) -> bool {
         match provider {
-            "claude" => matches!(self, Self::Compact),
+            "claude" => matches!(self, Self::Compact(_)),
             _ => true,
+        }
+    }
+
+    /// Whether the provider can take this control's instructions as well.
+    ///
+    /// Codex's `thread/compact/start` has nowhere to put them, so a request
+    /// with some is refused rather than carried out without them.
+    pub fn instructions_supported_by(&self, provider: &str) -> bool {
+        match self {
+            Self::Compact(instructions) => provider == "claude" || instructions.is_empty(),
+            _ => true,
+        }
+    }
+
+    /// The prompt that runs this control as Claude Code's own command.
+    pub fn claude_prompt(&self) -> Option<String> {
+        match self {
+            Self::Compact(instructions) if instructions.is_empty() => Some("/compact".into()),
+            Self::Compact(instructions) => Some(format!("/compact {instructions}")),
+            _ => None,
         }
     }
 }
@@ -744,14 +768,7 @@ impl Job {
                     emit(&self.on_update, SessionUpdate::Accepted);
                 }
                 session.terminate().await;
-                // No events here. They reached the conversation through the
-                // sink, and keeping a second copy of every streamed delta for
-                // the length of a turn buys nothing the transcript does not
-                // already have.
-                self.settle(&TurnOutcome::Cancelled {
-                    thread_id,
-                    events: Vec::new(),
-                });
+                self.settle(&TurnOutcome::Cancelled { thread_id });
             }
         }
     }
@@ -861,7 +878,7 @@ impl Job {
                 _ = interrupts.recv() => {
                     lock(&self.conversation).set_phase(Phase::Cancelling);
                     emit(&self.on_update, SessionUpdate::Changed);
-                    break TurnOutcome::Cancelled { thread_id, events: Vec::new() };
+                    break TurnOutcome::Cancelled { thread_id };
                 }
                 // Claude sits idle with tasks running, and has for as long as
                 // its own setting allows: stop waiting, as it would.
@@ -869,7 +886,7 @@ impl Job {
                     self.stop_waiting(background.ceiling.unwrap_or_default());
                     stop_group = true;
                     let stop_reason = background.stop_reason.clone().unwrap_or_default();
-                    break TurnOutcome::Completed { thread_id, stop_reason, events: Vec::new() };
+                    break TurnOutcome::Completed { thread_id, stop_reason };
                 }
                 response = responses.recv(), if responses_open => {
                     let Some(response) = response else { responses_open = false; continue; };
@@ -892,7 +909,7 @@ impl Job {
                         // never get it. Left open, the request kept both of the
                         // panel's buttons disabled with nothing left to clear
                         // them; the turn fails and says why instead.
-                        Err(error) => break TurnOutcome::Failed { thread_id, reason: format!("{ANSWER_FAILED} {error}"), events: Vec::new() },
+                        Err(error) => break TurnOutcome::Failed { thread_id, reason: format!("{ANSWER_FAILED} {error}") },
                     }
                 }
                 // Guidance is one more user message on the live stream-json
@@ -910,6 +927,9 @@ impl Job {
                             Err(error) => Err(error),
                         }
                     };
+                    if result.is_ok() {
+                        background.steered();
+                    }
                     self.steer_finished(steer, result);
                 }
                 next = reader.next_event() => {
@@ -935,7 +955,7 @@ impl Job {
                                 } else { Some(self.approvals.allows_claude_tool(&request.tool_name, &request.input)) };
                                 if let Some(approved) = auto {
                                     if let Err(error) = transport.approve(&request.id, approved).await {
-                                        break TurnOutcome::Failed { thread_id, reason: error.to_string(), events: Vec::new() };
+                                        break TurnOutcome::Failed { thread_id, reason: error.to_string() };
                                     }
                                     continue;
                                 }
@@ -944,10 +964,10 @@ impl Job {
                                 waiting.insert(request.id.clone());
                             }
                             match event {
-                                ProviderEvent::Done { stop_reason } => match background.result(stop_reason.clone()) {
+                                ProviderEvent::Done { stop_reason } => match background.result(stop_reason.clone(), transport.input_open().await) {
                                     AfterResult::End => {
                                         self.apply(ProviderEvent::Done { stop_reason: stop_reason.clone() });
-                                        break TurnOutcome::Completed { thread_id, stop_reason, events: Vec::new() };
+                                        break TurnOutcome::Completed { thread_id, stop_reason };
                                     }
                                     // The prose so far is whole, but the thread is
                                     // still working: what the tasks found comes
@@ -956,7 +976,7 @@ impl Job {
                                 },
                                 ProviderEvent::Error(reason) => {
                                     self.apply(ProviderEvent::Error(reason.clone()));
-                                    break TurnOutcome::Failed { thread_id, reason, events: Vec::new() };
+                                    break TurnOutcome::Failed { thread_id, reason };
                                 }
                                 ProviderEvent::Task(update) => {
                                     background.task(&update);
@@ -973,12 +993,12 @@ impl Job {
                             }
                         }
                         Some(StreamItem::Exited(exit)) => match background.completed_at_exit() {
-                            Some(stop_reason) => break TurnOutcome::Completed { thread_id, stop_reason, events: Vec::new() },
-                            None => break TurnOutcome::Failed { thread_id, reason: exit.reason(), events: Vec::new() },
+                            Some(stop_reason) => break TurnOutcome::Completed { thread_id, stop_reason },
+                            None => break TurnOutcome::Failed { thread_id, reason: exit.reason() },
                         },
                         None => match background.completed_at_exit() {
-                            Some(stop_reason) => break TurnOutcome::Completed { thread_id, stop_reason, events: Vec::new() },
-                            None => break TurnOutcome::Failed { thread_id, reason: "Claude Code ended before reporting a result.".into(), events: Vec::new() },
+                            Some(stop_reason) => break TurnOutcome::Completed { thread_id, stop_reason },
+                            None => break TurnOutcome::Failed { thread_id, reason: "Claude Code ended before reporting a result.".into() },
                         },
                     }
                 }
@@ -1099,13 +1119,12 @@ impl Job {
         interrupts: tokio::sync::mpsc::UnboundedReceiver<()>,
     ) {
         let resume = lock(&self.conversation).session_id().map(str::to_owned);
-        if control == ThreadControl::Compact && resume.is_none() {
+        if matches!(control, ThreadControl::Compact(_)) && resume.is_none() {
             lock(&self.conversation)
                 .record_activity("Nothing to compact: this thread has no session yet.", false);
             return self.settle(&TurnOutcome::Completed {
                 thread_id: String::new(),
                 stop_reason: "skipped".into(),
-                events: Vec::new(),
             });
         }
         match &self.provider {
@@ -1183,13 +1202,9 @@ impl Job {
             Some(Ok(())) => self.settle(&TurnOutcome::Completed {
                 thread_id,
                 stop_reason: "control".into(),
-                events: Vec::new(),
             }),
             Some(Err(error)) => self.fail("FlowX could not run that command.", error.to_string()),
-            None => self.settle(&TurnOutcome::Cancelled {
-                thread_id,
-                events: Vec::new(),
-            }),
+            None => self.settle(&TurnOutcome::Cancelled { thread_id }),
         }
     }
 
@@ -1199,7 +1214,7 @@ impl Job {
         control: &ThreadControl,
     ) -> Result<(), fx_agent::ProviderError> {
         let goal = match control {
-            ThreadControl::Compact => {
+            ThreadControl::Compact(_) => {
                 lock(&self.conversation).set_phase(Phase::Compacting);
                 emit(&self.on_update, SessionUpdate::Changed);
                 return session.compact(|event| self.apply(event)).await;
@@ -1236,10 +1251,7 @@ impl Job {
             .session_id()
             .unwrap_or_default()
             .to_owned();
-        self.settle(&TurnOutcome::Cancelled {
-            thread_id,
-            events: Vec::new(),
-        });
+        self.settle(&TurnOutcome::Cancelled { thread_id });
     }
 
     fn apply(&self, event: ProviderEvent) {
@@ -1294,10 +1306,15 @@ impl Job {
         let mut conversation = lock(&self.conversation);
         let running = conversation.running_task_count();
         conversation.stop_running_tasks(&note);
+        // Nothing running means the wait was for the answer to one that ended.
+        let waited_for = match running {
+            0 => "a finished background task's answer".to_string(),
+            1 => "1 background task".to_string(),
+            _ => format!("{running} background tasks"),
+        };
         conversation.record_activity(
             format!(
-                "Stopped waiting for {running} background {} after {}",
-                if running == 1 { "task" } else { "tasks" },
+                "Stopped waiting for {waited_for} after {}",
                 spoken_duration(ceiling)
             ),
             false,
@@ -1415,11 +1432,19 @@ struct BackgroundWait {
     stop_reason: Option<String>,
     /// No turn is in progress: the last thing Claude said was a `result`.
     between_turns: bool,
-    /// The transport closed stdin at a `result` with nothing running, and
+    /// The transport closed stdin at a `result` with nothing outstanding, and
     /// Claude will exit once it has answered what it still has queued.
     input_closed: bool,
+    /// Guidance went in during this turn. One written near the end may be
+    /// answered after the `result` FlowX is reading, as a turn of its own:
+    /// stopping the process at that `result` killed the answer to a steer
+    /// that had been reported accepted.
+    steered: bool,
+    /// The last `result` left something to wait for: a running task, or the
+    /// answer to one that has ended.
+    waiting: bool,
     ceiling: Option<Duration>,
-    /// When FlowX stops waiting, while Claude sits idle with tasks running.
+    /// When FlowX stops waiting, while Claude sits idle with work outstanding.
     deadline: Option<tokio::time::Instant>,
 }
 
@@ -1443,6 +1468,8 @@ impl BackgroundWait {
             stop_reason: None,
             between_turns: false,
             input_closed: false,
+            steered: false,
+            waiting: false,
             ceiling,
             deadline: None,
         }
@@ -1453,9 +1480,22 @@ impl BackgroundWait {
         if update.status.is_running() {
             self.started_any = true;
             self.running.insert(update.id.clone());
-        } else {
-            self.running.remove(&update.id);
+        } else if self.running.remove(&update.id) && self.between_turns {
+            // Claude answers a task's end as a turn of its own, so the wait
+            // is measured again from here. Left at the last idle `result`, an
+            // answer that began just short of the ceiling was cut off.
+            self.arm();
         }
+    }
+
+    /// Guidance was written to Claude's input.
+    ///
+    /// Its answer is a turn in progress, not idleness, so the ceiling is off
+    /// until that turn's `result`.
+    fn steered(&mut self) {
+        self.steered = true;
+        self.between_turns = false;
+        self.deadline = None;
     }
 
     /// Something a turn says: a follow-up, or a steer's answer, is under way.
@@ -1464,19 +1504,27 @@ impl BackgroundWait {
         self.deadline = None;
     }
 
-    fn result(&mut self, stop_reason: String) -> AfterResult {
+    /// Start the ceiling's clock, as the CLI does each time it goes idle.
+    fn arm(&mut self) {
+        self.deadline = self
+            .ceiling
+            .map(|ceiling| tokio::time::Instant::now() + ceiling);
+    }
+
+    /// What a `result` means, given whether the transport kept Claude's input
+    /// open past it: it does while a task runs or an ended one's answer is
+    /// still owed.
+    fn result(&mut self, stop_reason: String, input_open: bool) -> AfterResult {
         self.stop_reason = Some(stop_reason);
         self.between_turns = true;
-        if !self.running.is_empty() {
-            // Measured from each idle `result`, as the CLI measures from each
-            // time it goes idle: a follow-up is progress.
-            self.deadline = self
-                .ceiling
-                .map(|ceiling| tokio::time::Instant::now() + ceiling);
+        let more = self.started_any || self.steered;
+        self.waiting = !self.running.is_empty() || (more && input_open);
+        if self.waiting {
+            self.arm();
             return AfterResult::Wait;
         }
         self.deadline = None;
-        if self.started_any {
+        if more {
             self.input_closed = true;
             AfterResult::Drain
         } else {
@@ -1495,8 +1543,7 @@ impl BackgroundWait {
     }
 
     fn deadline(&self) -> Option<tokio::time::Instant> {
-        self.deadline
-            .filter(|_| self.between_turns && !self.running.is_empty())
+        self.deadline.filter(|_| self.between_turns && self.waiting)
     }
 }
 
@@ -2346,6 +2393,9 @@ def finish(text, origin=None):
     send(result)
 def init():
     send({"type":"system","subtype":"init","session_id":SESSION})
+# The origin of the turn a permission's answer completes, when it is a
+# follow-up's.
+ANSWER_ORIGIN=[]
 def task_ended():
     send({"type":"system","subtype":"task_progress","task_id":"task-1","tool_use_id":"tool-bg","description":"review the transport","subagent_type":"general-purpose","usage":{"total_tokens":900,"tool_uses":3,"duration_ms":40},"last_tool_name":"Grep"})
     send({"type":"system","subtype":"task_notification","task_id":"task-1","tool_use_id":"tool-bg","status":"completed","output_file":"/tmp/task-1","summary":"Agent \"review the transport\" completed","usage":{"total_tokens":1200,"tool_uses":4,"duration_ms":60}})
@@ -2361,7 +2411,8 @@ def background(prompt):
     send({"type":"system","subtype":"task_started","task_id":"task-1","tool_use_id":"tool-bg","description":"review the transport","subagent_type":"general-purpose","is_backgrounded":True,"task_type":"local_agent"})
     send({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tool-bg","content":"Async agent launched successfully."}]}})
     if prompt=="background-spawn":
-        child=subprocess.Popen(["sleep","60"])
+        # In a session of its own, as the real CLI starts its tools.
+        child=subprocess.Popen(["sleep","60"],start_new_session=True)
         Path("background.pid").write_text(str(child.pid))
     if prompt=="background-quick":
         # The task ends before the turn's own `result`, and its follow-up
@@ -2371,6 +2422,17 @@ def background(prompt):
         def later():
             time.sleep(0.2)
             follow_up()
+        worker=threading.Thread(target=later)
+    elif prompt=="background-permission":
+        # As above, and the follow-up needs a permission, whose answer has to
+        # reach Claude through its input.
+        task_ended()
+        finish("started")
+        def later():
+            time.sleep(0.2)
+            init()
+            ANSWER_ORIGIN.append("task-notification")
+            send({"type":"control_request","request_id":"control-f","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"tool-f","input":{"command":"cargo test"}}})
         worker=threading.Thread(target=later)
     else:
         def later():
@@ -2442,7 +2504,8 @@ for line in sys.stdin:
                 {"header":"Region","question":"Which region?","options":[]}]}
             send({"type":"control_request","request_id":"control-1","request":{"subtype":"can_use_tool","tool_name":tool,"tool_use_id":"tool-1","input":data}})
         else: finish(prompt)
-    elif message.get("type")=="control_response": finish("answered")
+    elif message.get("type")=="control_response":
+        finish("answered", ANSWER_ORIGIN.pop() if ANSWER_ORIGIN else None)
 # A closed input still waits for running tasks, as Claude's print mode does.
 for worker in workers: worker.join()
 "#).ok()?;
@@ -3336,9 +3399,10 @@ for line in sys.stdin:
         send({"jsonrpc": "2.0", "id": mid, "result": {"turn": {"id": "turn-1"}}})
 
         if prompt == "spawn-and-hang":
-            # A tool that is still running when the user presses Stop.
+            # A tool that is still running when the user presses Stop, in a
+            # process group of its own as the real app-server starts one.
             import subprocess
-            child = subprocess.Popen(["sleep", "60"])
+            child = subprocess.Popen(["sleep", "60"], preexec_fn=os.setpgrp)
             with open("THREAD_LOG" + ".child", "w") as pid:
                 pid.write(str(child.pid))
             send({"jsonrpc": "2.0", "method": "turn/started",
@@ -3617,7 +3681,7 @@ for line in sys.stdin:
         let (_runner, recorder) = start_work(
             &conversation,
             provider,
-            Work::control(ThreadControl::Compact),
+            Work::control(ThreadControl::Compact(String::new())),
         );
         let updates = recorder.wait_for_end(TURN_BUDGET);
         assert!(
@@ -3651,7 +3715,7 @@ for line in sys.stdin:
         let (_runner, recorder) = start_work(
             &conversation,
             provider,
-            Work::control(ThreadControl::Compact),
+            Work::control(ThreadControl::Compact(String::new())),
         );
         recorder.wait_for_end(TURN_BUDGET);
         assert!(server.thread_calls().is_empty(), "Codex was started anyway");
@@ -3857,6 +3921,33 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn a_follow_up_can_still_be_given_a_permission_after_the_turns_result() {
+        // The task ended before the turn's `result`, which closed Claude's
+        // input, so the answer to the follow-up's permission request failed
+        // with "input is closed" and the turn with it.
+        let Some(server) = ClaudeFixture::new() else {
+            return;
+        };
+        let conversation = conversation();
+        let (_runner, recorder) = server.start(
+            &conversation,
+            "background-permission",
+            AgentAccess::FullAccess,
+        );
+        let updates = recorder.wait_for_end(TURN_BUDGET);
+        assert!(
+            matches!(updates.last(), Some(SessionUpdate::Finished { outcome }) if outcome.is_completed()),
+            "{updates:?}"
+        );
+        assert_eq!(
+            rows(&conversation).last().map(String::as_str),
+            Some("text: answered"),
+            "{:?}",
+            rows(&conversation)
+        );
+    }
+
+    #[test]
     fn stopping_claude_while_it_waits_on_a_background_task_ends_the_process_group() {
         let Some(server) = ClaudeFixture::new() else {
             return;
@@ -3983,12 +4074,12 @@ for line in sys.stdin:
         };
         // A plain turn ends at its result.
         let mut wait = BackgroundWait::new(Some(Duration::from_secs(1)));
-        assert_eq!(wait.result("end_turn".into()), AfterResult::End);
+        assert_eq!(wait.result("end_turn".into(), false), AfterResult::End);
 
         // A running task holds it, and arms the ceiling while Claude is idle.
         let mut wait = BackgroundWait::new(Some(Duration::from_secs(1)));
         wait.task(&task("a", fx_agent::TaskStatus::Running));
-        assert_eq!(wait.result("end_turn".into()), AfterResult::Wait);
+        assert_eq!(wait.result("end_turn".into(), true), AfterResult::Wait);
         assert!(wait.deadline().is_some());
         assert_eq!(
             wait.completed_at_exit(),
@@ -3999,7 +4090,7 @@ for line in sys.stdin:
         wait.content();
         assert!(wait.deadline().is_none());
         wait.task(&task("a", fx_agent::TaskStatus::Completed));
-        assert_eq!(wait.result("end_turn".into()), AfterResult::Drain);
+        assert_eq!(wait.result("end_turn".into(), false), AfterResult::Drain);
         assert!(wait.deadline().is_none());
         assert_eq!(wait.completed_at_exit().as_deref(), Some("end_turn"));
         // Dying part-way through a follow-up is not a completion.
@@ -4009,8 +4100,82 @@ for line in sys.stdin:
         // No ceiling configured means waiting indefinitely.
         let mut wait = BackgroundWait::new(None);
         wait.task(&task("a", fx_agent::TaskStatus::Running));
-        wait.result("end_turn".into());
+        wait.result("end_turn".into(), true);
         assert!(wait.deadline().is_none());
+    }
+
+    #[test]
+    fn an_ended_tasks_answer_is_still_waited_for_and_still_bounded() {
+        let task = |status| fx_agent::TaskUpdate {
+            id: "a".into(),
+            status,
+            ..Default::default()
+        };
+        let mut wait = BackgroundWait::new(Some(Duration::from_secs(1)));
+        wait.task(&task(fx_agent::TaskStatus::Running));
+        wait.task(&task(fx_agent::TaskStatus::Completed));
+        // The task ended before the `result`, and the transport kept the input
+        // open for its answer: not the end, and not a drain either.
+        assert_eq!(wait.result("end_turn".into(), true), AfterResult::Wait);
+        assert!(!wait.input_closed, "steering is still possible");
+        assert!(
+            wait.deadline().is_some(),
+            "waiting on an answer still has a ceiling"
+        );
+    }
+
+    #[test]
+    fn a_tasks_end_measures_the_ceiling_again() {
+        let task = |id: &str, status| fx_agent::TaskUpdate {
+            id: id.into(),
+            status,
+            ..Default::default()
+        };
+        let mut wait = BackgroundWait::new(Some(Duration::from_secs(60)));
+        wait.task(&task("a", fx_agent::TaskStatus::Running));
+        wait.task(&task("b", fx_agent::TaskStatus::Running));
+        wait.result("end_turn".into(), true);
+        let first = wait.deadline().unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        wait.task(&task("a", fx_agent::TaskStatus::Completed));
+        assert!(
+            wait.deadline().unwrap() > first,
+            "the answer to a task's end was given only what was left of the old wait"
+        );
+        // A task this turn never started moves nothing.
+        let second = wait.deadline().unwrap();
+        wait.task(&task("lost", fx_agent::TaskStatus::Stopped));
+        assert_eq!(wait.deadline(), Some(second));
+    }
+
+    #[test]
+    fn a_steer_is_waited_for_past_the_result_it_raced() {
+        // A steer written just before the `result` is answered after it. The
+        // turn used to end there, and its process was stopped 750 ms later,
+        // in the middle of the answer to a steer reported as accepted.
+        let mut wait = BackgroundWait::new(Some(Duration::from_secs(1)));
+        wait.steered();
+        assert_eq!(wait.result("end_turn".into(), false), AfterResult::Drain);
+        assert!(wait.input_closed);
+        assert_eq!(wait.completed_at_exit().as_deref(), Some("end_turn"));
+
+        // While Claude idles on a task, a steer's answer is a turn in
+        // progress: the ceiling is off until its `result`.
+        let mut wait = BackgroundWait::new(Some(Duration::from_secs(1)));
+        wait.task(&fx_agent::TaskUpdate {
+            id: "a".into(),
+            status: fx_agent::TaskStatus::Running,
+            ..Default::default()
+        });
+        wait.result("end_turn".into(), true);
+        assert!(wait.deadline().is_some());
+        wait.steered();
+        assert!(
+            wait.deadline().is_none(),
+            "the ceiling could cut the answer off"
+        );
+        wait.result("end_turn".into(), true);
+        assert!(wait.deadline().is_some());
     }
 
     #[test]
@@ -4041,12 +4206,31 @@ for line in sys.stdin:
         use fx_core::models::GoalStatus;
         assert_eq!(
             ThreadControl::parse(" /compact "),
-            Some(ThreadControl::Compact)
+            Some(ThreadControl::Compact(String::new()))
         );
         assert_eq!(
             ThreadControl::parse("/Compact"),
-            Some(ThreadControl::Compact)
+            Some(ThreadControl::Compact(String::new()))
         );
+        // What to keep goes with it: Claude's `/compact` takes instructions.
+        let focused = ThreadControl::parse("/compact  keep the API decisions ").unwrap();
+        assert_eq!(
+            focused,
+            ThreadControl::Compact("keep the API decisions".into())
+        );
+        assert_eq!(
+            focused.claude_prompt().as_deref(),
+            Some("/compact keep the API decisions")
+        );
+        assert_eq!(
+            ThreadControl::Compact(String::new())
+                .claude_prompt()
+                .as_deref(),
+            Some("/compact")
+        );
+        assert!(focused.instructions_supported_by("claude"));
+        assert!(!focused.instructions_supported_by("codex"));
+        assert!(ThreadControl::Compact(String::new()).instructions_supported_by("codex"));
         assert_eq!(ThreadControl::parse("/goal"), Some(ThreadControl::GoalView));
         assert_eq!(
             ThreadControl::parse("/goal pause"),
@@ -4068,7 +4252,7 @@ for line in sys.stdin:
         assert_eq!(ThreadControl::parse("/review the diff"), None);
         assert_eq!(ThreadControl::parse("please /compact"), None);
         assert_eq!(ThreadControl::parse("/compactor"), None);
-        assert!(ThreadControl::Compact.supported_by("claude"));
+        assert!(ThreadControl::Compact(String::new()).supported_by("claude"));
         assert!(!ThreadControl::GoalView.supported_by("claude"));
         assert!(ThreadControl::GoalClear.supported_by("codex"));
     }

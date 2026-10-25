@@ -78,9 +78,10 @@ for line in sys.stdin:
         time.sleep(0.2)
         send({"jsonrpc": "2.0", "id": mid, "result": {"slow": True}})
     elif method == "spawn-child":
-        # A tool the server started, in the server's own process group.
+        # A tool the server started. The real app-server gives each command
+        # a process group of its own, so this one leaves the server's.
         import subprocess
-        child = subprocess.Popen(["sleep", "60"])
+        child = subprocess.Popen(["sleep", "60"], preexec_fn=os.setpgrp)
         send({"jsonrpc": "2.0", "id": mid, "result": {"pid": child.pid}})
     elif method == "stderr-noise":
         # Not UTF-8, and progress that only ever returns the carriage.
@@ -182,6 +183,8 @@ for line in sys.stdin:
         # Recorded, so a test can see which turn it was asked to stop.
         with open("HANDSHAKE_LOG", "a") as log:
             log.write(json.dumps({"method": method, "params": msg.get("params")}) + "\n")
+        # Still reporting while it stops, as a busy turn does.
+        flood()
         send({"jsonrpc": "2.0", "id": mid, "result": {}})
     elif method == "thread/list":
         flood()
@@ -210,9 +213,11 @@ for line in sys.stdin:
                 **({"nextCursor": os.environ["FAKE_PAGES"]} if os.environ.get("FAKE_PAGES") else {})}})
     elif method == "thread/read":
         flood()
-        send({"jsonrpc": "2.0", "id": mid, "result": {"thread": {"turns": [
-            {"items": [{"type": "userMessage", "text": "hello"},
-                       {"type": "agentMessage", "text": "hi"}]}]}}})
+        # As the real server does: turns only when they are asked for.
+        turns = [{"items": [{"type": "userMessage", "text": "hello"},
+                            {"type": "agentMessage", "text": "hi"}]}]
+        thread = {"turns": turns} if (msg.get("params") or {}).get("includeTurns") else {}
+        send({"jsonrpc": "2.0", "id": mid, "result": {"thread": thread}})
     elif method == "notify-me":
         send({"jsonrpc": "2.0", "method": "codex/event",
               "params": {"msg": "hello from the server"}})

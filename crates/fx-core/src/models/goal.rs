@@ -10,7 +10,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Where a goal stands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// Read through [`GoalStatus::parse`], so a status a newer Codex or a newer
+/// FlowX wrote reads as active instead of failing the transcript it is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum GoalStatus {
     Active,
@@ -57,6 +60,13 @@ impl GoalStatus {
             Self::BudgetLimited => "Budget limited",
             Self::Complete => "Complete",
         }
+    }
+}
+
+impl<'de> Deserialize<'de> for GoalStatus {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Ok(Self::parse(&raw))
     }
 }
 
@@ -136,6 +146,32 @@ fn compact_count(count: u64) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn an_unknown_saved_status_reads_as_active() {
+        let goal: ConversationGoal = serde_json::from_value(json!({
+            "threadId": "t",
+            "objective": "ship it",
+            "status": "awaitingReview",
+        }))
+        .expect("a newer status still reads");
+        assert_eq!(goal.status, GoalStatus::Active);
+        for status in [
+            GoalStatus::Active,
+            GoalStatus::Paused,
+            GoalStatus::Blocked,
+            GoalStatus::UsageLimited,
+            GoalStatus::BudgetLimited,
+            GoalStatus::Complete,
+        ] {
+            let written = serde_json::to_value(status).unwrap();
+            assert_eq!(written, status.as_str());
+            assert_eq!(
+                serde_json::from_value::<GoalStatus>(written).unwrap(),
+                status
+            );
+        }
+    }
 
     #[test]
     fn a_codex_goal_reads_with_codex_spelling() {

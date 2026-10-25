@@ -38,9 +38,11 @@ pub struct ProviderDefaults {
         deserialize_with = "deserialize_or_default"
     )]
     pub effort: Option<String>,
+    /// A level this build cannot read asks first, as a thread's own does:
+    /// unset would fall to the app default, which is the widest.
     #[serde(
         skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_or_default"
+        deserialize_with = "fx_core::models::agent::access_or_inherit"
     )]
     pub agent_access: Option<AgentAccess>,
 }
@@ -320,7 +322,13 @@ pub struct PersistedApp {
     pub min_right_panel_width: f32,
     #[serde(rename = "maxRightPanelWidth", default = "default_max_panel_width")]
     pub max_right_panel_width: f32,
-    #[serde(rename = "rightPanelTab", default)]
+    /// A tab a newer build added reads as the default. Decoded strictly, one
+    /// unknown name failed the whole snapshot, and every project vanished.
+    #[serde(
+        rename = "rightPanelTab",
+        default,
+        deserialize_with = "deserialize_or_default"
+    )]
     pub right_panel_tab: RightPanelTab,
     /// Where the main window was. Absent until the window first moves.
     #[serde(
@@ -527,11 +535,12 @@ pub struct PersistedBinding {
     pub model: Option<String>,
     #[serde(default)]
     pub effort: Option<String>,
-    /// A level this build does not know reads as unset, never as the widest.
+    /// A level this build does not know asks first. Unset is not narrower:
+    /// it falls to the app default, which is the widest.
     #[serde(
         rename = "agentAccess",
         default,
-        deserialize_with = "deserialize_or_default"
+        deserialize_with = "fx_core::models::agent::access_or_inherit"
     )]
     pub agent_access: Option<AgentAccess>,
     #[serde(rename = "isArchived", default)]
@@ -595,14 +604,24 @@ impl PersistedApp {
         for record in &mut self.projects {
             let agents: std::collections::HashSet<_> =
                 record.agents.iter().map(|agent| agent.id).collect();
+            // A thread this build cannot read is still a thread: it is carried
+            // to the next save, and so is what the project says about it. Pruned,
+            // a newer build's archived thread came back unarchived.
+            let carried: std::collections::HashSet<Uuid> = record
+                .unreadable
+                .elements("agents")
+                .iter()
+                .filter_map(|agent| agent.get("id")?.as_str()?.parse().ok())
+                .collect();
+            let known = |id: &Uuid| agents.contains(id) || carried.contains(id);
             let mut seen = std::collections::HashSet::new();
             record
                 .auto_title_pending
-                .retain(|id| agents.contains(id) && seen.insert(*id));
+                .retain(|id| known(id) && seen.insert(*id));
             seen.clear();
             record
                 .archived_agent_ids
-                .retain(|id| agents.contains(id) && seen.insert(*id));
+                .retain(|id| known(id) && seen.insert(*id));
             if record
                 .last_selected_agent_id
                 .is_some_and(|id| !agents.contains(&id) || record.archived_agent_ids.contains(&id))
@@ -717,7 +736,13 @@ pub struct PersistedConversation {
     pub draft_text: String,
     /// The thread's goal as the provider last reported it, so the row above
     /// the composer is there before the provider is asked again.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// A goal this build cannot read costs only the goal, never the transcript.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_or_default",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub goal: Option<fx_core::models::ConversationGoal>,
 }
 
@@ -809,7 +834,11 @@ mod tests {
             Some("saved-model")
         );
         assert_eq!(decoded.codex_defaults.effort, None);
-        assert_eq!(decoded.codex_defaults.agent_access, None);
+        assert_eq!(
+            decoded.codex_defaults.agent_access,
+            Some(AgentAccess::Supervised),
+            "an unknown level asks first rather than falling to Full Access"
+        );
         assert_eq!(decoded.claude_defaults, ProviderDefaults::default());
     }
 
@@ -873,6 +902,68 @@ mod tests {
         assert_eq!(decoded.sidebar_width, built.sidebar_width);
         assert_eq!(decoded.right_panel_visible, built.right_panel_visible);
         assert_eq!(decoded.right_panel_tab, built.right_panel_tab);
+    }
+
+    #[test]
+    fn an_unknown_inspector_tab_reads_as_the_default_and_keeps_the_projects() {
+        let agent = Agent::new("Kept");
+        let mut value = serde_json::to_value(PersistedApp {
+            projects: vec![PersistedProject {
+                agents: vec![agent.clone()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        value["rightPanelTab"] = serde_json::json!("terminal");
+        let decoded: PersistedApp = serde_json::from_value(value).expect("the snapshot reads");
+        assert_eq!(decoded.right_panel_tab, RightPanelTab::Changes);
+        assert_eq!(decoded.projects.len(), 1);
+        assert_eq!(decoded.projects[0].agents, vec![agent]);
+    }
+
+    #[test]
+    fn an_unreadable_threads_archive_and_title_flags_survive_normalizing() {
+        let readable = Agent::new("Readable");
+        let unreadable = Uuid::new_v4();
+        let mut value = serde_json::to_value(PersistedProject {
+            agents: vec![readable.clone()],
+            archived_agent_ids: vec![readable.id, unreadable],
+            auto_title_pending: vec![unreadable],
+            ..Default::default()
+        })
+        .unwrap();
+        // A thread written by a newer build, in a shape this one cannot read.
+        value["agents"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({ "id": unreadable.to_string(), "kind": "future" }));
+        let project: PersistedProject = serde_json::from_value(value).unwrap();
+        assert_eq!(project.unreadable.elements("agents").len(), 1);
+        let mut app = PersistedApp {
+            projects: vec![project],
+            ..Default::default()
+        };
+        app.normalize();
+        assert_eq!(
+            app.projects[0].archived_agent_ids,
+            vec![readable.id, unreadable]
+        );
+        assert_eq!(app.projects[0].auto_title_pending, vec![unreadable]);
+    }
+
+    #[test]
+    fn an_unreadable_goal_costs_only_the_goal() {
+        let mut value = serde_json::to_value(PersistedConversation::from_messages(
+            Uuid::new_v4(),
+            vec![ConversationMessage::text(MessageRole::User, "kept")],
+        ))
+        .unwrap();
+        value["goal"] = serde_json::json!({ "threadId": "t", "objective": 7 });
+        let decoded: PersistedConversation =
+            serde_json::from_value(value).expect("the transcript reads");
+        assert_eq!(decoded.messages.len(), 1);
+        assert_eq!(decoded.goal, None);
     }
 
     #[test]
@@ -1317,10 +1408,18 @@ mod tests {
             record.agents[0].execution_state,
             fx_core::AgentExecutionState::Idle
         );
-        assert_eq!(record.agents[0].configuration.agent_access, None);
+        // An access level this build cannot read asks first: unset would
+        // fall to the app default, which is Full Access.
+        assert_eq!(
+            record.agents[0].configuration.agent_access,
+            Some(AgentAccess::Supervised)
+        );
         assert_eq!(record.workspaces.len(), 1);
         assert_eq!(record.native_bindings.len(), 1);
-        assert_eq!(record.native_bindings[0].agent_access, None);
+        assert_eq!(
+            record.native_bindings[0].agent_access,
+            Some(AgentAccess::Supervised)
+        );
         for key in ["agents", "workspaces", "native_bindings"] {
             assert_eq!(record.unreadable.elements(key).len(), 1, "{key}");
         }

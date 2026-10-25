@@ -2,11 +2,23 @@
 //! of its own, keep the tail of what it writes to stderr, and stop it together
 //! with everything it started.
 //!
-//! The group is the point. A provider runs tools as its own children — a
-//! `cargo build`, a `sleep 200`, a `docker build` — and those inherit its
-//! group. Signalling only the provider leaves the build running with nobody
-//! left to report on it, which is what Stop used to do.
+//! The group alone is not "everything it started". Both real CLIs move their
+//! tools out of it: `claude` starts each `Bash` call in a session of its own,
+//! and `codex app-server` gives each command a process group of its own, so
+//! signalling the provider's group reached the provider and none of its tools.
+//! Stopping works on a [`Tree`] instead: the provider, everything descended
+//! from it, and every group and session one of those leads. The groups and
+//! sessions are what still find a tool's children once the tool has exited and
+//! they have been handed to launchd, where a walk by parent no longer reaches
+//! them.
+//!
+//! Quit cannot wait for a turn to wind down — GPUI gives its quit handlers a
+//! tenth of a second before the process exits — so every transport registers
+//! its provider for as long as it runs, and [`stop_all_now`] ends each
+//! registered tree on the calling thread.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use tokio::process::{Child, Command};
@@ -35,35 +47,152 @@ impl Group {
         (pid > 0 && unsafe { libc::getpgid(pid) } == pid).then_some(Self(pid))
     }
 
-    fn signal(self, signal: libc::c_int) {
-        // SAFETY: `killpg` has no memory effects; a group that has already
-        // emptied answers ESRCH, which is the outcome being asked for.
-        unsafe {
-            libc::killpg(self.0, signal);
+    /// Everything the group's leader has started, as it stands now.
+    ///
+    /// Taken before the leader is asked to exit: once it has, its tools belong
+    /// to launchd and only the groups and sessions recorded here find them.
+    pub(crate) fn tree(self) -> Tree {
+        let mut tree = Tree::new(self.0);
+        tree.refresh(&process_table(), own_pid());
+        tree
+    }
+
+    /// Stop everything the leader started: SIGTERM, a grace period, SIGKILL.
+    pub(crate) async fn terminate(self, leader: Option<&mut Child>, grace: Duration) {
+        self.tree().terminate(leader, grace).await;
+    }
+}
+
+/// One row of the process table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Entry {
+    pub pid: libc::pid_t,
+    pub ppid: libc::pid_t,
+    pub pgid: libc::pid_t,
+    pub sid: libc::pid_t,
+}
+
+/// A provider and everything it started.
+///
+/// A process belongs when it is the provider, a child of a member, or in a
+/// group or session a member leads. Groups and sessions are kept once seen,
+/// because they are how an orphan is still found after its parent has gone.
+#[derive(Debug)]
+pub(crate) struct Tree {
+    root: libc::pid_t,
+    groups: BTreeSet<libc::pid_t>,
+    sessions: BTreeSet<libc::pid_t>,
+    /// Each member as it was when it joined, so a pid reused by an unrelated
+    /// process — one in a different group or session — is not mistaken for it.
+    members: BTreeMap<libc::pid_t, Entry>,
+}
+
+impl Tree {
+    fn new(root: libc::pid_t) -> Self {
+        Self {
+            root,
+            groups: BTreeSet::from([root]),
+            sessions: BTreeSet::new(),
+            members: BTreeMap::new(),
         }
     }
 
-    /// Whether anything is still in the group.
-    fn is_alive(self) -> bool {
-        // SAFETY: signal 0 only checks permission and existence.
-        let answered = unsafe { libc::killpg(self.0, 0) };
-        answered == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    /// Re-read membership from `table`.
+    ///
+    /// `parent` is FlowX's own pid. The provider counts only as FlowX's child,
+    /// so a pid reused after it was reaped is never taken for it, and FlowX
+    /// itself is never a member. A table missing a process (it exited, or it
+    /// could not be read) drops it.
+    pub(crate) fn refresh(&mut self, table: &[Entry], parent: libc::pid_t) {
+        let current: BTreeMap<libc::pid_t, Entry> =
+            table.iter().map(|entry| (entry.pid, *entry)).collect();
+        self.members.retain(|pid, seen| {
+            current
+                .get(pid)
+                .is_some_and(|now| now.pgid == seen.pgid && now.sid == seen.sid)
+        });
+        loop {
+            let before = self.members.len();
+            for entry in table {
+                if entry.pid == parent || self.members.contains_key(&entry.pid) {
+                    continue;
+                }
+                let belongs = (entry.pid == self.root && entry.ppid == parent)
+                    || self.members.contains_key(&entry.ppid)
+                    || self.groups.contains(&entry.pgid)
+                    || self.sessions.contains(&entry.sid);
+                if !belongs {
+                    continue;
+                }
+                self.members.insert(entry.pid, *entry);
+                if entry.pgid == entry.pid {
+                    self.groups.insert(entry.pid);
+                }
+                if entry.sid == entry.pid {
+                    self.sessions.insert(entry.pid);
+                }
+            }
+            if self.members.len() == before {
+                break;
+            }
+        }
     }
 
-    /// End everything in the group: SIGTERM, a grace period, then SIGKILL.
+    /// The pids that belong, as of the last refresh.
+    #[cfg(test)]
+    pub(crate) fn members(&self) -> Vec<libc::pid_t> {
+        self.members.keys().copied().collect()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.members.is_empty()
+    }
+
+    fn refresh_now(&mut self) {
+        self.refresh(&process_table(), own_pid());
+    }
+
+    /// Signal every group a member leads and every member by pid, which also
+    /// reaches a member sitting in a group nobody in the tree leads.
+    fn signal(&self, signal: libc::c_int) {
+        let own = own_pid();
+        // SAFETY: `getpgid(0)` reads FlowX's own group.
+        let own_group = unsafe { libc::getpgid(0) };
+        for group in &self.groups {
+            if *group > 1 && *group != own_group {
+                // SAFETY: `killpg` has no memory effects; a group that has
+                // already emptied answers ESRCH, the outcome being asked for.
+                unsafe {
+                    libc::killpg(*group, signal);
+                }
+            }
+        }
+        for pid in self.members.keys() {
+            if *pid > 1 && *pid != own {
+                // SAFETY: as above, for one process.
+                unsafe {
+                    libc::kill(*pid, signal);
+                }
+            }
+        }
+    }
+
+    /// End the tree: SIGTERM, a grace period, then SIGKILL.
     ///
-    /// The grace is the group's, not only the leader's: a tool that outlives
+    /// The grace is the tree's, not only the leader's: a tool that outlives
     /// the provider by a moment is still given the chance to exit on SIGTERM
     /// before it is killed. The leader, when it is still held, is reaped along
     /// the way so its zombie does not read as a survivor.
-    pub(crate) async fn terminate(self, mut leader: Option<&mut Child>, grace: Duration) {
+    pub(crate) async fn terminate(mut self, mut leader: Option<&mut Child>, grace: Duration) {
+        self.refresh_now();
         self.signal(libc::SIGTERM);
         let deadline = tokio::time::Instant::now() + grace;
         loop {
             if let Some(child) = leader.as_deref_mut() {
                 let _ = child.try_wait();
             }
-            if !self.is_alive() {
+            self.refresh_now();
+            if self.is_empty() {
                 return;
             }
             if tokio::time::Instant::now() >= deadline {
@@ -76,6 +205,164 @@ impl Group {
             let _ = tokio::time::timeout(grace, child.wait()).await;
         }
     }
+}
+
+/// End several trees on this thread, sharing one grace period.
+fn end_blocking(trees: &mut [Tree], grace: Duration) {
+    for tree in trees.iter() {
+        tree.signal(libc::SIGTERM);
+    }
+    let deadline = std::time::Instant::now() + grace;
+    loop {
+        std::thread::sleep(POLL);
+        let table = process_table();
+        let own = own_pid();
+        for tree in trees.iter_mut() {
+            tree.refresh(&table, own);
+        }
+        if trees.iter().all(Tree::is_empty) {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+    }
+    for tree in trees.iter() {
+        tree.signal(libc::SIGKILL);
+    }
+}
+
+/// The providers running now, by the pid that leads each one's group.
+static RUNNING: Mutex<BTreeSet<libc::pid_t>> = Mutex::new(BTreeSet::new());
+
+/// A provider's entry in the list Quit ends. Dropping it removes the entry.
+///
+/// A transport holds one from spawn until it closes or terminates. A closed
+/// transport's leftovers — a dev server started on purpose — are not FlowX's
+/// to end, at Quit any more than at the end of a turn.
+#[derive(Debug)]
+pub(crate) struct Running(libc::pid_t);
+
+impl Running {
+    pub(crate) fn register(group: Group) -> Self {
+        running().insert(group.0);
+        Self(group.0)
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        running().remove(&self.0);
+    }
+}
+
+fn running() -> std::sync::MutexGuard<'static, BTreeSet<libc::pid_t>> {
+    RUNNING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// How long Quit gives the running providers to exit on SIGTERM.
+pub const QUIT_GRACE: Duration = Duration::from_millis(500);
+
+/// End every running provider and everything it started, on this thread.
+///
+/// For Quit, which cannot wait for a turn's own teardown: SIGTERM to every
+/// tree at once, up to `grace` for them to exit, then SIGKILL.
+pub fn stop_all_now(grace: Duration) {
+    let roots: Vec<libc::pid_t> = running().iter().copied().collect();
+    stop_now(&roots, grace);
+}
+
+/// [`stop_all_now`] for the providers led by `roots`.
+fn stop_now(roots: &[libc::pid_t], grace: Duration) {
+    if roots.is_empty() {
+        return;
+    }
+    let table = process_table();
+    let own = own_pid();
+    let mut trees: Vec<Tree> = roots
+        .iter()
+        .map(|root| {
+            let mut tree = Tree::new(*root);
+            tree.refresh(&table, own);
+            tree
+        })
+        .collect();
+    end_blocking(&mut trees, grace);
+}
+
+fn own_pid() -> libc::pid_t {
+    // SAFETY: `getpid` cannot fail and has no memory effects.
+    unsafe { libc::getpid() }
+}
+
+/// Every live process this user can read, with its parent, group and session.
+///
+/// Zombies are left out: one is already dead, and counting it would read as a
+/// survivor until whoever owns it reaps it.
+#[cfg(target_os = "macos")]
+pub(crate) fn process_table() -> Vec<Entry> {
+    // SAFETY: a null buffer asks only for the count.
+    let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    let Ok(count) = usize::try_from(count) else {
+        return Vec::new();
+    };
+    // Room for whatever starts between the two calls.
+    let mut pids: Vec<libc::pid_t> = vec![0; count + 64];
+    let Ok(bytes) = libc::c_int::try_from(std::mem::size_of_val(pids.as_slice())) else {
+        return Vec::new();
+    };
+    // SAFETY: the buffer is `bytes` long and lives across the call.
+    let filled = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+    let Ok(filled) = usize::try_from(filled) else {
+        return Vec::new();
+    };
+    pids.truncate(filled.min(pids.len()));
+    pids.into_iter()
+        .filter(|pid| *pid > 0)
+        .filter_map(table_entry)
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn table_entry(pid: libc::pid_t) -> Option<Entry> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdshortinfo>::zeroed();
+    let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdshortinfo>()).ok()?;
+    // SAFETY: the buffer is one `proc_bsdshortinfo`, which is what this flavor
+    // writes, and `size` says so.
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDT_SHORTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if read != size {
+        return None;
+    }
+    // SAFETY: `proc_pidinfo` filled all `size` bytes.
+    let info = unsafe { info.assume_init() };
+    if info.pbsi_status == libc::SZOMB {
+        return None;
+    }
+    // SAFETY: `getsid` reads process state and has no memory effects.
+    let sid = unsafe { libc::getsid(pid) };
+    Some(Entry {
+        pid,
+        ppid: libc::pid_t::try_from(info.pbsi_ppid).ok()?,
+        pgid: libc::pid_t::try_from(info.pbsi_pgid).ok()?,
+        sid,
+    })
+}
+
+/// Elsewhere there is no table to read: only the provider's own group is
+/// signalled, and only with SIGTERM.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn process_table() -> Vec<Entry> {
+    Vec::new()
 }
 
 /// Stop one process politely: SIGTERM, a grace period, then SIGKILL.
@@ -167,6 +454,225 @@ pub(crate) mod testing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn entry(pid: i32, ppid: i32, pgid: i32, sid: i32) -> Entry {
+        Entry {
+            pid,
+            ppid,
+            pgid,
+            sid,
+        }
+    }
+
+    /// FlowX is 100, in its own group and session.
+    const FLOWX: i32 = 100;
+
+    fn tree_over(table: &[Entry]) -> Tree {
+        let mut tree = Tree::new(200);
+        tree.refresh(table, FLOWX);
+        tree
+    }
+
+    #[test]
+    fn a_tool_in_its_own_session_or_group_is_part_of_the_tree() {
+        // What the real CLIs do: Claude's `Bash` gets a session of its own,
+        // Codex's command a group of its own. Neither is in the provider's
+        // group, which is all the old Stop signalled.
+        let table = [
+            entry(FLOWX, 1, FLOWX, FLOWX),
+            entry(200, FLOWX, 200, FLOWX),
+            entry(300, 200, 300, 300),
+            entry(301, 300, 300, 300),
+            entry(400, 200, 400, FLOWX),
+            entry(401, 400, 400, FLOWX),
+            entry(500, 1, 500, 500),
+        ];
+        assert_eq!(tree_over(&table).members(), [200, 300, 301, 400, 401]);
+    }
+
+    #[test]
+    fn an_orphan_is_still_found_by_the_session_or_group_it_was_in() {
+        let mut tree = tree_over(&[
+            entry(FLOWX, 1, FLOWX, FLOWX),
+            entry(200, FLOWX, 200, FLOWX),
+            entry(300, 200, 300, 300),
+            entry(301, 300, 300, 300),
+            entry(400, 200, 400, FLOWX),
+            entry(401, 400, 400, FLOWX),
+        ]);
+        // The provider and both tools have exited; their children now belong
+        // to launchd, and a walk by parent reaches neither.
+        tree.refresh(
+            &[
+                entry(FLOWX, 1, FLOWX, FLOWX),
+                entry(301, 1, 300, 300),
+                entry(401, 1, 400, FLOWX),
+            ],
+            FLOWX,
+        );
+        assert_eq!(tree.members(), [301, 401]);
+    }
+
+    #[test]
+    fn flowx_and_its_own_group_and_session_are_never_members() {
+        // A tool that joined FlowX's group still dies by pid, but the group
+        // itself, which holds FlowX, is never one of the tree's.
+        let tree = tree_over(&[
+            entry(FLOWX, 1, FLOWX, FLOWX),
+            entry(200, FLOWX, 200, FLOWX),
+            entry(300, 200, FLOWX, FLOWX),
+            entry(600, FLOWX, FLOWX, FLOWX),
+        ]);
+        assert_eq!(tree.members(), [200, 300]);
+        assert!(!tree.groups.contains(&FLOWX));
+        assert!(!tree.sessions.contains(&FLOWX));
+    }
+
+    #[test]
+    fn a_reused_pid_is_not_taken_for_the_provider_or_a_member() {
+        // The provider was reaped and its pid handed to something else.
+        let tree = tree_over(&[entry(FLOWX, 1, FLOWX, FLOWX), entry(200, 1, 777, 777)]);
+        assert!(tree.members().is_empty());
+
+        let mut tree = tree_over(&[
+            entry(FLOWX, 1, FLOWX, FLOWX),
+            entry(200, FLOWX, 200, FLOWX),
+            entry(300, 200, 200, FLOWX),
+        ]);
+        // 300 exited and its pid now names an unrelated process.
+        tree.refresh(
+            &[
+                entry(FLOWX, 1, FLOWX, FLOWX),
+                entry(200, FLOWX, 200, FLOWX),
+                entry(300, 1, 888, 888),
+            ],
+            FLOWX,
+        );
+        assert_eq!(tree.members(), [200]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_process_table_reads_this_process() {
+        let own = own_pid();
+        let table = process_table();
+        let this = table
+            .iter()
+            .find(|entry| entry.pid == own)
+            .expect("this process is listed");
+        // SAFETY: no memory effects.
+        assert_eq!(this.pgid, unsafe { libc::getpgid(0) });
+        assert_eq!(this.sid, unsafe { libc::getsid(0) });
+    }
+
+    /// A provider that starts its tools the way the real CLIs do: one in a
+    /// session of its own running a child of its own, one in a group of its
+    /// own. It prints their pids and waits.
+    #[cfg(target_os = "macos")]
+    const PROVIDER: &str = r#"
+import os, subprocess, sys, time
+shell = subprocess.Popen(["sh", "-c", "sleep 60 & echo $!; wait"],
+                         start_new_session=True, stdout=subprocess.PIPE)
+inner = shell.stdout.readline().decode().strip()
+command = subprocess.Popen(["sleep", "60"], preexec_fn=os.setpgrp)
+print(shell.pid, inner, command.pid, flush=True)
+time.sleep(60)
+"#;
+
+    /// Start [`PROVIDER`] in a group of its own, and read its tools' pids.
+    #[cfg(target_os = "macos")]
+    async fn provider_with_tools() -> Option<(Child, Group, Vec<libc::pid_t>)> {
+        use tokio::io::AsyncBufReadExt;
+        let mut command = Command::new("python3");
+        command
+            .args(["-c", PROVIDER])
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        in_own_group(&mut command);
+        let Ok(mut child) = command.spawn() else {
+            eprintln!("skipping: python3 is not on PATH");
+            return None;
+        };
+        let group = Group::led_by(&child).expect("leads its group");
+        let stdout = child.stdout.take().expect("piped");
+        let mut line = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::io::BufReader::new(stdout).read_line(&mut line),
+        )
+        .await
+        .expect("the tools started")
+        .expect("read");
+        let pids = line
+            .split_whitespace()
+            .map(|pid| pid.parse().expect("a pid"))
+            .collect::<Vec<_>>();
+        assert_eq!(pids.len(), 3, "{line:?}");
+        Some((child, group, pids))
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn terminating_ends_tools_outside_the_providers_group() {
+        let Some((mut child, group, pids)) = provider_with_tools().await else {
+            return;
+        };
+        let _reap: Vec<_> = pids.iter().map(|pid| testing::KillOnDrop(*pid)).collect();
+        group
+            .terminate(Some(&mut child), Duration::from_millis(500))
+            .await;
+        for pid in pids {
+            assert!(
+                testing::gone_within(pid, Duration::from_secs(5)).await,
+                "tool {pid} outlived Stop"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn tools_are_ended_after_the_provider_has_already_exited() {
+        // Claude is given a moment to exit on its own before the tree is
+        // stopped. Once it has, its tools belong to launchd: only the tree
+        // taken beforehand still leads to them.
+        let Some((mut child, group, pids)) = provider_with_tools().await else {
+            return;
+        };
+        let _reap: Vec<_> = pids.iter().map(|pid| testing::KillOnDrop(*pid)).collect();
+        let tree = group.tree();
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        tree.terminate(None, Duration::from_millis(500)).await;
+        for pid in pids {
+            assert!(
+                testing::gone_within(pid, Duration::from_secs(5)).await,
+                "tool {pid} outlived its provider and Stop"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn quitting_ends_a_running_provider_on_the_calling_thread() {
+        // Quit cannot await a turn's teardown, so this one blocks instead.
+        let Some((mut child, group, pids)) = provider_with_tools().await else {
+            return;
+        };
+        let _reap: Vec<_> = pids.iter().map(|pid| testing::KillOnDrop(*pid)).collect();
+        let registration = Running::register(group);
+        assert!(running().contains(&group.0), "a running provider is listed");
+        // Only this provider: the list is shared by every test in the process.
+        stop_now(&[group.0], Duration::from_millis(500));
+        for pid in pids {
+            assert!(
+                testing::gone_within(pid, Duration::from_secs(1)).await,
+                "tool {pid} outlived Quit"
+            );
+        }
+        let _ = child.wait().await;
+        drop(registration);
+        assert!(!running().contains(&group.0), "a closed provider is listed");
+    }
 
     #[test]
     fn the_tail_is_kept_within_its_limit() {

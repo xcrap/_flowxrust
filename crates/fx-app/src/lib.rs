@@ -396,6 +396,12 @@ impl Render for FlowX {
             .active_agent()
             .map(|agent| agent.id)
             .filter(|id| !self.state.read(cx).is_thread_busy(*id));
+        // Registered only when they can act, so their menu items are greyed
+        // out otherwise: a thread needs a project, and nothing opens behind a
+        // modal; images need a thread that takes them.
+        let can_create_thread = self.state.read(cx).active_project().is_some()
+            && !workspace_ui::has_modal(&self.state, cx);
+        let can_attach = attach_target(cx).is_some();
 
         let root = div()
             .relative()
@@ -463,17 +469,19 @@ impl Render for FlowX {
                     state::open_project_picker(handle.0, window, cx);
                 }
             })
-            .on_action(|_: &NewThread, _, cx| {
-                if let Some(handle) = AppHandle::get(cx) {
-                    if workspace_ui::has_modal(&handle.0, cx) {
-                        return;
+            .when(can_create_thread, |root| {
+                root.on_action(|_: &NewThread, _, cx| {
+                    if let Some(handle) = AppHandle::get(cx) {
+                        if workspace_ui::has_modal(&handle.0, cx) {
+                            return;
+                        }
+                        handle.0.update(cx, |state, cx| {
+                            state.create_thread();
+                            state.save();
+                            cx.notify();
+                        });
                     }
-                    handle.0.update(cx, |state, cx| {
-                        state.create_thread();
-                        state.save();
-                        cx.notify();
-                    });
-                }
+                })
             })
             .on_action(|_: &ToggleSidebar, _, cx| shell_action("sidebar", cx))
             .on_action(|_: &ToggleInspector, _, cx| shell_action("inspector", cx))
@@ -486,10 +494,12 @@ impl Render for FlowX {
                 })
             })
             .map(|root| command_handlers(root, idle_thread))
-            .on_action(|_: &composer::AttachImages, _, cx| {
-                if let Some((state, agent)) = attach_target(cx) {
-                    pick_attachments(&state, agent, cx);
-                }
+            .when(can_attach, |root| {
+                root.on_action(|_: &composer::AttachImages, _, cx| {
+                    if let Some((state, agent)) = attach_target(cx) {
+                        pick_attachments(&state, agent, cx);
+                    }
+                })
             })
             // Anywhere in the window: the composer's own target claims a drop
             // on the card first, and this catches the rest.
@@ -621,7 +631,7 @@ fn command_handlers(
         };
         state.update(cx, |state, cx| {
             if let Some(agent) = state.active_agents().get(action.index) {
-                state.open_thread(agent.id);
+                state.open_thread(agent.id, cx);
                 cx.notify();
             }
         });
@@ -1085,7 +1095,7 @@ fn composer_row(
         .map(|conversation| {
             let queued = conversation
                 .queued()
-                .map(fx_agent::conversation::QueuedPrompt::preview)
+                .map(composer::QueuedPreview::of)
                 .collect();
             let editing = editor
                 .filter(|editor| editor.agent_id == agent.id)
@@ -1169,13 +1179,13 @@ fn composer_row(
             state.remove_attachment(agent.id, id);
             cx.notify();
         }),
-        composer::ComposerAction::RemoveQueued(index) => {
-            for_actions.update(cx, |state, _| state.remove_queued(agent.id, index));
+        composer::ComposerAction::RemoveQueued(id) => {
+            for_actions.update(cx, |state, _| state.remove_queued(agent.id, id));
             cx.refresh_windows();
         }
-        composer::ComposerAction::EditQueued(index) => {
+        composer::ComposerAction::EditQueued(id) => {
             let editor = for_actions.update(cx, |state, cx| {
-                state.begin_editing_queued(agent.id, index, cx);
+                state.begin_editing_queued(agent.id, id, cx);
                 cx.notify();
                 state.queue_editor().map(|editor| editor.field.clone())
             });
@@ -1304,9 +1314,11 @@ fn run_slash_command(
         )
     } else if !control.supported_by(&provider) {
         Some("Goals are available for Codex threads only.")
+    } else if !control.instructions_supported_by(&provider) {
+        Some("Codex compacts without instructions. Send /compact on its own.")
     } else if state.read(cx).is_thread_busy(agent_id) {
         Some(match control {
-            ThreadControl::Compact => {
+            ThreadControl::Compact(_) => {
                 "Wait for the current turn to finish before compacting context."
             }
             _ => "Wait for the current turn to finish before changing the goal.",
@@ -1339,7 +1351,10 @@ fn run_slash_command(
             state.update(cx, |state, cx| state.clear_draft(agent_id, cx));
             return;
         }
-        session::Work::prompt("/compact")
+        match control.claude_prompt() {
+            Some(prompt) => session::Work::prompt(prompt),
+            None => return,
+        }
     } else {
         session::Work::control(control.clone())
     };
@@ -1594,6 +1609,11 @@ pub fn open_window(
             for runner in state.runners.values() {
                 runner.interrupt();
             }
+            // An interrupt only asks: the runner's own teardown would take
+            // longer than the tenth of a second GPUI waits before exiting, and
+            // a provider in its own group outlives FlowX. So every running
+            // provider, and every tool it started, is ended here, blocking.
+            fx_agent::stop_all_now(fx_agent::QUIT_GRACE);
             state.drain_updates_with_context(cx);
             state.save_all(cx);
         });
@@ -2479,7 +2499,6 @@ mod tests {
                 outcome: fx_agent::codex::TurnOutcome::Completed {
                     thread_id: "t1".into(),
                     stop_reason: "end_turn".into(),
-                    events: Vec::new(),
                 },
             })
             .unwrap();
@@ -3093,6 +3112,33 @@ mod tests {
         assert!(available(&mut test, &StopTurn));
         assert!(!available(&mut test, &commands::ResetConversation));
         assert!(!available(&mut test, &commands::RenameThread));
+    }
+
+    #[test]
+    fn new_thread_and_attach_images_are_enabled_only_where_they_can_act() {
+        let (mut test, _dir, _state, window) = shell_with_keys();
+        let available = |test: &mut gpui::TestAppContext,
+                         window: gpui::WindowHandle<FlowX>,
+                         action: &dyn gpui::Action| {
+            window
+                .update(test, |_, window, cx| window.is_action_available(action, cx))
+                .unwrap()
+        };
+        assert!(available(&mut test, window, &NewThread));
+
+        // With no project, New thread has nowhere to put a thread and Attach
+        // images no thread to attach to; both used to stay enabled anyway.
+        let empty = tempfile::tempdir().unwrap();
+        let state = test.update(|cx| {
+            let state =
+                cx.new(|cx| AppState::restore(AppPaths::at(empty.path().join("state")), cx));
+            AppHandle::install(state.clone(), cx);
+            state
+        });
+        let window = test.add_window(move |_, _| FlowX::new(state));
+        test.refresh().unwrap();
+        assert!(!available(&mut test, window, &NewThread));
+        assert!(!available(&mut test, window, &composer::AttachImages));
     }
 
     #[test]

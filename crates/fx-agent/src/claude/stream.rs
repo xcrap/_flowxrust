@@ -72,6 +72,11 @@ pub struct ClaudeStreamParser {
     /// How much of the context window the latest reply used, read from its
     /// `usage`. Reported as it arrives, and again with the window at `result`.
     context_tokens: Option<u64>,
+    /// The process's running total from the last `result` with a
+    /// `modelUsage`. That breakdown covers the whole process, so a follow-up
+    /// turn's `result` repeats everything before it; only the difference is
+    /// this turn's. Kept across [`Self::reset`], which is per turn.
+    reported_model_usage: Option<Usage>,
     /// Set by the first frame that answers the prompt, which is the proof
     /// Claude read it. Thinking, usage and lifecycle frames count even though
     /// none of them is shown, because a prompt Claude has read must not be
@@ -94,6 +99,15 @@ pub struct ClaudeStreamParser {
     last_refusal: Option<Value>,
     /// Tasks this process started and has not heard the last of, oldest first.
     tasks: VecDeque<TrackedTask>,
+    /// A background task's notification has arrived and Claude has not yet
+    /// answered it. The answer is a turn of its own, and may ask for a
+    /// permission, so the input stays open until it comes: closed at the
+    /// `result` before it, the permission's answer could not be written.
+    follow_up_owed: bool,
+    /// This process has answered a prompt. A zero-turn acknowledgement after
+    /// that is the end of a task this process started; before it, one of a
+    /// task the last process lost.
+    answered: bool,
     /// Whether `AskUserQuestion` is answered automatically.
     ///
     /// Off by default: a question is a decision for the user, and auto-answering
@@ -440,6 +454,7 @@ impl ClaudeStreamParser {
         if !background {
             return Vec::new();
         }
+        self.follow_up_owed = true;
         let status = envelope
             .get("status")
             .and_then(Value::as_str)
@@ -484,6 +499,12 @@ impl ClaudeStreamParser {
         self.tasks
             .iter()
             .any(|task| task.background && !task.finished)
+    }
+
+    /// Whether the input has to stay open past a `result`: a background task
+    /// is running, or one has ended and Claude still owes its answer.
+    pub fn holds_input_open(&self) -> bool {
+        self.has_running_tasks() || self.follow_up_owed
     }
 
     /// A streamed frame. Only text deltas are meaningful here.
@@ -594,16 +615,34 @@ impl ClaudeStreamParser {
 
     /// The end of a turn: usage, then completion.
     fn result(&mut self, envelope: &Value) -> Vec<ProviderEvent> {
-        // Nothing was asked and nothing answered, so there is nothing to end:
-        // the turn the user is waiting for has not started yet.
+        if answers_notification(envelope) {
+            self.follow_up_owed = false;
+        }
         if acknowledges_notification(envelope) {
-            return Vec::new();
+            // Nothing was asked and nothing answered. Before this process has
+            // answered anything, that is a task the last process lost, and the
+            // turn the user is waiting for has not started yet. After, it is
+            // the end of a task this one started: with nothing left running it
+            // is the end of the wait, and staying silent left the input open
+            // and the turn spinning until Stop.
+            if !self.answered || self.has_running_tasks() {
+                return Vec::new();
+            }
+            self.did_finish = true;
+            return vec![ProviderEvent::Done {
+                stop_reason: envelope
+                    .get("subtype")
+                    .and_then(Value::as_str)
+                    .unwrap_or("end_turn")
+                    .to_string(),
+            }];
         }
         // A second `result` would double-count a turn's cost.
         if self.did_finish {
             return Vec::new();
         }
         self.did_finish = true;
+        self.answered = true;
 
         if envelope.get("is_error").and_then(Value::as_bool) == Some(true) {
             return vec![ProviderEvent::Error(
@@ -615,7 +654,13 @@ impl ClaudeStreamParser {
             )];
         }
 
-        let usage = usage_of(envelope);
+        let usage = match model_usage_of(envelope) {
+            Some(total) => {
+                let previous = self.reported_model_usage.replace(total);
+                since(total, previous)
+            }
+            None => usage_of(envelope),
+        };
         let mut events = Vec::new();
         if let (Some(used), Some(window)) = (self.context_tokens, context_window_of(envelope)) {
             events.push(ProviderEvent::ContextUsage { used, window });
@@ -666,6 +711,7 @@ impl ClaudeStreamParser {
         self.sequence = 0;
         self.last_refusal = None;
         self.tasks.clear();
+        self.follow_up_owed = false;
     }
 
     /// Take a refusal produced by the last line, if any.
@@ -899,15 +945,18 @@ fn decode_questions(raw: &[Value]) -> Vec<Question> {
         .collect()
 }
 
-/// Total usage, preferring the per-model breakdown when Claude provides it.
+/// The per-model breakdown's total, when Claude provides one.
 ///
-/// The two fields disagree when a turn used more than one model: `usage` reports
-/// only the last, `modelUsage` reports all of them. The breakdown is the honest
-/// total.
-fn usage_of(envelope: &Value) -> Usage {
-    let model_usage = envelope.get("modelUsage").and_then(Value::as_object);
-    if let Some(models) = model_usage.filter(|models| !models.is_empty()) {
-        return models
+/// Preferred over `usage`, which reports only the last model when a turn used
+/// more than one. It is the process's running total, not the turn's: see
+/// [`since`].
+fn model_usage_of(envelope: &Value) -> Option<Usage> {
+    let models = envelope
+        .get("modelUsage")
+        .and_then(Value::as_object)
+        .filter(|models| !models.is_empty())?;
+    Some(
+        models
             .iter()
             // Saturating: the counts are the provider's, and an overflow in a
             // debug build is a panic in the middle of a turn.
@@ -923,9 +972,45 @@ fn usage_of(envelope: &Value) -> Usage {
                     .total_tokens
                     .saturating_add(input.saturating_add(output));
                 total
-            });
-    }
+            }),
+    )
+}
 
+/// This turn's share of a running total, given the total last reported.
+///
+/// A total smaller than the last one in any count is not a continuation of
+/// it, so it is taken whole rather than read as a negative turn.
+fn since(total: Usage, previous: Option<Usage>) -> Usage {
+    let Some(previous) = previous else {
+        return total;
+    };
+    let counts = |usage: &Usage| {
+        [
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.cached_input_tokens,
+            usage.reasoning_output_tokens,
+            usage.total_tokens,
+        ]
+    };
+    if counts(&total)
+        .iter()
+        .zip(counts(&previous))
+        .any(|(now, before)| *now < before)
+    {
+        return total;
+    }
+    Usage {
+        input_tokens: total.input_tokens - previous.input_tokens,
+        output_tokens: total.output_tokens - previous.output_tokens,
+        cached_input_tokens: total.cached_input_tokens - previous.cached_input_tokens,
+        reasoning_output_tokens: total.reasoning_output_tokens - previous.reasoning_output_tokens,
+        total_tokens: total.total_tokens - previous.total_tokens,
+    }
+}
+
+/// A turn's usage from the `usage` field, for a result with no breakdown.
+fn usage_of(envelope: &Value) -> Usage {
     let usage = Usage {
         input_tokens: count(envelope.pointer("/usage/input_tokens")),
         output_tokens: count(envelope.pointer("/usage/output_tokens")),
@@ -1422,6 +1507,48 @@ mod tests {
             ]
         );
         assert!(parser.did_finish());
+    }
+
+    #[test]
+    fn a_follow_ups_result_counts_only_what_it_added_to_the_process_total() {
+        // `modelUsage` is the process's running total. A task notification's
+        // follow-up answers in the same process, so its `result` repeats the
+        // first turn's tokens, which used to be added a second time.
+        let mut parser = ClaudeStreamParser::new();
+        let result = |input: u64, output: u64| {
+            line(json!({
+                "type": "result",
+                "subtype": "success",
+                "modelUsage": {
+                    "claude-opus": { "inputTokens": input, "outputTokens": output }
+                }
+            }))
+        };
+        let usage = |events: Vec<ProviderEvent>| {
+            events
+                .into_iter()
+                .find_map(|event| match event {
+                    ProviderEvent::Usage(usage) => Some(usage),
+                    _ => None,
+                })
+                .expect("a usage event")
+        };
+        let first = usage(parser.events(&result(100, 20)));
+        assert_eq!((first.input_tokens, first.output_tokens), (100, 20));
+        parser.events(&line(json!({ "type": "system", "subtype": "init" })));
+        let second = usage(parser.events(&result(130, 25)));
+        assert_eq!(
+            (
+                second.input_tokens,
+                second.output_tokens,
+                second.total_tokens
+            ),
+            (30, 5, 35)
+        );
+        // A turn reset between turns does not forget the process's total.
+        parser.reset();
+        let third = usage(parser.events(&result(140, 25)));
+        assert_eq!((third.input_tokens, third.total_tokens), (10, 10));
     }
 
     #[test]
@@ -2298,6 +2425,71 @@ mod tests {
                 ))
                 .is_empty()
         );
+    }
+
+    fn task_ended(id: &str) -> Value {
+        json!({"type": "system", "subtype": "task_notification", "task_id": id,
+               "tool_use_id": format!("toolu_{id}"), "status": "completed"})
+    }
+
+    #[test]
+    fn an_ended_task_holds_the_input_open_until_its_follow_up_is_answered() {
+        // The task ended before the turn's own `result`, and Claude answers
+        // its notification after it. Closed at that `result`, the input could
+        // not carry the answer to a permission the follow-up asks for.
+        let mut parser = ClaudeStreamParser::new();
+        for frame in [
+            json!({"type": "system", "subtype": "init"}),
+            task_started("t1", true),
+            task_ended("t1"),
+            json!({"type": "result", "subtype": "success", "num_turns": 1, "usage": {}}),
+        ] {
+            parser.events(&line(frame));
+        }
+        assert!(parser.did_finish());
+        assert!(!parser.has_running_tasks());
+        assert!(parser.holds_input_open(), "the follow-up is still owed");
+
+        for frame in [
+            json!({"type": "system", "subtype": "init"}),
+            json!({"type": "result", "subtype": "success", "num_turns": 1, "usage": {},
+                   "origin": {"kind": "task-notification"}}),
+        ] {
+            parser.events(&line(frame));
+        }
+        assert!(!parser.holds_input_open());
+    }
+
+    #[test]
+    fn a_zero_turn_acknowledgement_after_an_answer_ends_the_wait() {
+        // Claude can acknowledge a task's end without asking the model. With
+        // nothing left running that is the end of the wait; ignored, it left
+        // the input open and the turn spinning until Stop.
+        let mut parser = ClaudeStreamParser::new();
+        for frame in [
+            json!({"type": "system", "subtype": "init"}),
+            task_started("t1", true),
+            json!({"type": "result", "subtype": "success", "num_turns": 1, "usage": {}}),
+            task_ended("t1"),
+            json!({"type": "system", "subtype": "init"}),
+        ] {
+            parser.events(&line(frame));
+        }
+        assert!(parser.holds_input_open());
+        let events = parser.events(&line(json!({
+            "type": "result", "subtype": "success", "num_turns": 0,
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+            "origin": {"kind": "task-notification"}
+        })));
+        assert_eq!(
+            events,
+            vec![ProviderEvent::Done {
+                stop_reason: "success".into()
+            }],
+            "no usage: the acknowledgement asked the model nothing"
+        );
+        assert!(parser.did_finish());
+        assert!(!parser.holds_input_open());
     }
 
     #[test]

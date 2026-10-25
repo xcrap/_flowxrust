@@ -314,6 +314,8 @@ pub struct Transport {
     child: Mutex<Option<Child>>,
     /// The server's own process group, which its tools inherit.
     group: Option<crate::process::Group>,
+    /// The server's place in the list Quit ends, until it closes.
+    running: std::sync::Mutex<Option<crate::process::Running>>,
     stdin: mpsc::UnboundedSender<Vec<u8>>,
     /// Closed when the reader task finishes, for both EOF and a hard failure.
     events: mpsc::Receiver<ServerEvent>,
@@ -435,6 +437,7 @@ impl Transport {
         let transport = Self {
             child: Mutex::new(Some(child)),
             group,
+            running: std::sync::Mutex::new(group.map(crate::process::Running::register)),
             stdin: stdin_tx,
             events,
             shared,
@@ -542,6 +545,34 @@ impl Transport {
             .await
     }
 
+    /// [`Self::response`] for a caller that is no longer reading the stream:
+    /// what arrives meanwhile is read and dropped.
+    ///
+    /// The event queue is bounded, so with nobody draining it the reader stops
+    /// at the next notification it cannot queue, and an answer behind that is
+    /// never read. Stop drops the turn and then waits on `turn/interrupt`;
+    /// while Codex was still reporting, that wait ran to its timeout.
+    pub async fn response_discarding_events(
+        &mut self,
+        pending: &mut PendingResponse,
+    ) -> Result<Value, TransportError> {
+        let method = pending.method.clone();
+        let answer = await_outcome_in(
+            &self.shared,
+            &mut pending.receiver,
+            &method,
+            Some(json!(pending.id)),
+        );
+        tokio::pin!(answer);
+        let mut open = true;
+        loop {
+            tokio::select! {
+                result = &mut answer => return result,
+                event = self.events.recv(), if open => open = event.is_some(),
+            }
+        }
+    }
+
     /// Send a request that carries a reserved id, used only by the handshake.
     async fn await_response(
         &self,
@@ -580,29 +611,7 @@ impl Transport {
         method: &str,
         abandon: Option<Value>,
     ) -> Result<Value, TransportError> {
-        match tokio::time::timeout(CONTROL_REQUEST_TIMEOUT, receiver).await {
-            Ok(Ok(Outcome::Answered(Ok(value)))) => Ok(value),
-            Ok(Ok(Outcome::Answered(Err(error)))) => Err(TransportError::Rejected {
-                method: method.to_string(),
-                code: error.code,
-                message: error.message,
-            }),
-            Ok(Ok(Outcome::Dead(reason))) => Err(TransportError::Exited { stderr: reason }),
-            // The sender was dropped without a value, which only happens if the
-            // transport itself was torn down.
-            Ok(Err(_)) => Err(TransportError::Exited {
-                stderr: "the transport was dropped before Codex answered.".into(),
-            }),
-            Err(_) => {
-                // Give the slot back, or it leaks for the life of the transport.
-                if let Some(id) = abandon {
-                    self.shared.pending.lock().await.abandon(&id);
-                }
-                Err(TransportError::TimedOut {
-                    method: method.to_string(),
-                })
-            }
-        }
+        await_outcome_in(&self.shared, receiver, method, abandon).await
     }
 
     /// Send a notification, which expects nothing back.
@@ -661,15 +670,17 @@ impl Transport {
         if let Some(mut child) = self.child.lock().await.take() {
             crate::process::stop_leader(&mut child, TERMINATE_GRACE).await;
         }
+        self.leave_running();
         self.mark_closed().await;
     }
 
     /// Stop the server and everything it started, for Stop or a failed turn.
     ///
-    /// The whole process group gets SIGTERM, a grace period, and then SIGKILL.
-    /// Killing only the server, as `close` once did for every ending, left a
-    /// `sleep 200` or a quiet `docker build` running after the user pressed
-    /// Stop, with nothing left to report on it.
+    /// The whole tree gets SIGTERM, a grace period, and then SIGKILL: the
+    /// server, its group, and the group each command leads, since Codex gives
+    /// every command one of its own. Killing only the server, as `close` once
+    /// did for every ending, left a `sleep 200` or a quiet `docker build`
+    /// running after the user pressed Stop, with nothing left to report on it.
     pub async fn terminate(&self) {
         let mut slot = self.child.lock().await;
         match (self.group, slot.as_mut()) {
@@ -679,7 +690,16 @@ impl Transport {
         }
         slot.take();
         drop(slot);
+        self.leave_running();
         self.mark_closed().await;
+    }
+
+    /// Leave the list Quit ends: what is left now is not FlowX's to stop.
+    fn leave_running(&self) {
+        self.running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
     }
 
     /// Record that this transport is finished, so a later request reports that
@@ -826,6 +846,38 @@ async fn read_stdout(
     // recorded by the watcher, once stderr has had a chance to finish.
     if let Some(line) = framer.finish() {
         handle_line(&line, &shared, &events).await;
+    }
+}
+
+/// Wait for an answer, giving up after the control timeout.
+async fn await_outcome_in(
+    shared: &Shared,
+    receiver: impl std::future::Future<Output = Result<Outcome, oneshot::error::RecvError>>,
+    method: &str,
+    abandon: Option<Value>,
+) -> Result<Value, TransportError> {
+    match tokio::time::timeout(CONTROL_REQUEST_TIMEOUT, receiver).await {
+        Ok(Ok(Outcome::Answered(Ok(value)))) => Ok(value),
+        Ok(Ok(Outcome::Answered(Err(error)))) => Err(TransportError::Rejected {
+            method: method.to_string(),
+            code: error.code,
+            message: error.message,
+        }),
+        Ok(Ok(Outcome::Dead(reason))) => Err(TransportError::Exited { stderr: reason }),
+        // The sender was dropped without a value, which only happens if the
+        // transport itself was torn down.
+        Ok(Err(_)) => Err(TransportError::Exited {
+            stderr: "the transport was dropped before Codex answered.".into(),
+        }),
+        Err(_) => {
+            // Give the slot back, or it leaks for the life of the transport.
+            if let Some(id) = abandon {
+                shared.pending.lock().await.abandon(&id);
+            }
+            Err(TransportError::TimedOut {
+                method: method.to_string(),
+            })
+        }
     }
 }
 

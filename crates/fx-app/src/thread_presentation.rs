@@ -257,7 +257,6 @@ mod tests {
         let completed = TurnOutcome::Completed {
             thread_id: "thread".into(),
             stop_reason: "end_turn".into(),
-            events: Vec::new(),
         };
         assert!(completion_needs_attention(&completed, false));
         assert!(!completion_needs_attention(&completed, true));
@@ -265,11 +264,9 @@ mod tests {
             TurnOutcome::Failed {
                 thread_id: "thread".into(),
                 reason: "boom".into(),
-                events: Vec::new(),
             },
             TurnOutcome::Cancelled {
                 thread_id: "thread".into(),
-                events: Vec::new(),
             },
         ] {
             assert!(!completion_needs_attention(&outcome, false), "{outcome:?}");

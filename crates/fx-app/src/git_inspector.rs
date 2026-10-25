@@ -1018,6 +1018,39 @@ mod tests {
         assert_ne!(rewritten, revision(), "staging must change it");
     }
 
+    #[test]
+    fn adding_or_removing_a_remote_is_a_new_snapshot() {
+        // Push is offered only with a remote, so a snapshot that read the same
+        // across `git remote add` would leave the button as it was.
+        let temp = repository();
+        let root = temp.path();
+        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "initial"]);
+        let read = || block_on(changes_snapshot(root)).unwrap();
+        let without = read();
+        assert!(!without.repository.as_ref().unwrap().can_push());
+        git(
+            root,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+        );
+        let with = read();
+        assert!(!with.same_as(&without), "adding a remote read as no change");
+        assert!(with.repository.as_ref().unwrap().can_push());
+        git(root, &["remote", "remove", "origin"]);
+        let removed = read();
+        assert!(
+            !removed.same_as(&with),
+            "removing a remote read as no change"
+        );
+        assert!(!removed.repository.as_ref().unwrap().can_push());
+    }
+
     #[tokio::test]
     async fn a_failed_numstat_reports_incomplete_counts() {
         // A repository can disappear between the status and numstat reads.

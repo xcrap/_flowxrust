@@ -287,7 +287,11 @@ and each one exists because its alternative was tried first.
   parse; a fallback that only triggers on `read` would never fire for the damage
   it was added to survive.
 - **One unreadable entry costs only that entry.** Lists decode element by
-  element and unknown enum values read as the default. An entry this build
+  element and unknown enum values read as the default — every one, the
+  inspector tab and a goal's status included. Access levels are the exception:
+  an unknown one reads as `Supervised`, because the default and the inherited
+  app default are both Full Access. Lists that refer to entries (archived
+  threads, pending titles) keep the ids of entries carried as raw JSON. An entry this build
   cannot read is kept as raw JSON and written back unchanged, so a newer build's
   data survives a round trip through an older one.
 
@@ -409,9 +413,21 @@ Two more, for how a turn ends:
   process error, the stream closing, or Stop. A quiet `docker build` or a long
   think is not a hang, and a silence timeout killed exactly those turns.
 - **Stop ends the tools too.** Each provider runs in its own process group
-  (`fx-agent::process`). Stop sends the provider's interrupt, then SIGTERM to the
-  group, a short grace, then SIGKILL. A turn that finished normally only stops
-  the server, so a dev server the agent started on purpose keeps running.
+  (`fx-agent::process`), but its tools do not stay in it: `claude` starts each
+  `Bash` call in a session of its own and `codex app-server` gives each command
+  a group of its own. So Stop works on the provider's *tree* — its
+  descendants, and every group and session one of them leads, which still
+  finds a tool's children once launchd has adopted them. The tree is taken
+  before the provider is asked to exit. Stop sends the provider's interrupt,
+  then SIGTERM to the tree, a short grace, then SIGKILL. A turn that finished
+  normally only stops the server, so a dev server the agent started on purpose
+  keeps running. The fakes start their tools the same way; a fake whose child
+  stayed in the provider's group passed against a Stop that reached no real
+  tool.
+- **Quit cannot await any of that.** GPUI waits a tenth of a second for quit
+  handlers, so every transport registers its provider while it runs, and the
+  quit handler calls `fx_agent::stop_all_now`, which ends every registered tree
+  on the main thread.
 
 Claude's background tasks (`Agent` or `Bash` with `run_in_background`) change
 what "completion" means, and each rule here was a lost result first:
@@ -419,14 +435,21 @@ what "completion" means, and each rule here was a lost result first:
 - **A `result` with a task running is not the end.** Claude reports the task's
   end as `task_notification`, then answers it as a turn of its own (`init`, text,
   a `result` whose `origin.kind` is `task-notification`). stdin stays open while
-  a task runs, so the wait can be steered; it closes at the first `result` with
-  nothing running, and the turn then reads to the process's exit, because a
-  notification that arrived *before* that `result` is still answered after it.
-  `BackgroundWait` in `session.rs` holds these rules.
+  a task runs *or an ended task's answer is still owed*, so the wait can be
+  steered and the follow-up's permissions answered; it closes at the first
+  `result` with nothing outstanding, before that line's events are delivered,
+  and the turn then reads to the process's exit. A zero-turn acknowledgement
+  after the prompt was answered counts as that answer. `BackgroundWait` in
+  `session.rs` holds the turn's half of these rules.
+- **A steer may be answered after the `result` it raced.** Once guidance has
+  been written, a `result` reads to the process's exit rather than stopping it,
+  or the answer to a steer reported as accepted is killed 750 ms later.
 - **FlowX applies the CLI's wait ceiling.** The CLI only applies
   `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` (default 10 min) once its input is
-  closed, which FlowX no longer does while tasks run. At the ceiling the turn
-  completes with a note and the process group is stopped.
+  closed, which FlowX no longer does while tasks run. It is measured from each
+  idle `result` and again from each task's end, and is off while a steer is
+  being answered. At the ceiling the turn completes with a note and the process
+  group is stopped.
 - **A resumed session's lost tasks are not this turn's.** Resuming a session
   whose tasks were killed opens with a `stopped` notification per task and an
   `init` plus a zero-turn `result` per batch, before the prompt is read. Those
@@ -669,16 +692,21 @@ debug-build futures overflow a dispatch worker's small stack.
 
 Writes follow `fx-core::git::operations`: paths after `--` under
 `--literal-pathspecs`, no plan ever contains a force flag, and a failure shows
-git's whole combined output. A chosen-files commit stages only paths with work
-outside the index and commits with `--only`, including a rename's source. Push
+git's whole combined output. A chosen-files commit is built in a temporary index
+beside the repository's own: chosen paths from the working tree, a rename's
+source as removed, then the user's index is reset to the commit for those
+paths only. `--only` took the source from the working tree too, so after
+`git mv old new` and a fresh `old`, the unchosen file was committed. Push
 runs plain `git push` when `branch.<name>.merge` is set (it survives a gone
 upstream, which is how an empty clone starts) and otherwise
 `push --set-upstream -- <remote> HEAD`.
 
 Open in Editor never hands an agent-written file to its default handler, which
-for `.app` or `.command` means running it. Only passive viewer types keep their
-default; everything else goes to the registered source-code editor, then
-`open -t`.
+for `.app` or `.command` means running it. Only a passive viewer type keeps its
+viewer, only when the path itself is a regular file (a `shot.png` symlink to
+`evil.command` is not), and the viewer is named with `open -b`, because a bare
+`open` honours a per-file "Open With" attribute. Everything else goes to the
+registered source-code editor, then `open -t`.
 
 ## Porting conventions
 

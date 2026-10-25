@@ -323,9 +323,11 @@ impl Provider for CodexProvider {
         let connection = MetadataConnection::open(self).await?;
         let result = connection
             .transport
+            // Turns are left out unless asked for, and a read without them
+            // is an empty transcript.
             .request(
                 "thread/read",
-                Some(json!({ "threadId": identity.session_id })),
+                Some(json!({ "threadId": identity.session_id, "includeTurns": true })),
             )
             .await
             .map_err(map_transport_error);
@@ -784,10 +786,20 @@ mod tests {
         };
         let transport = start_fake(&server).await;
         let result = transport
-            .request("thread/read", Some(json!({ "threadId": "thread-a" })))
+            .request(
+                "thread/read",
+                Some(json!({ "threadId": "thread-a", "includeTurns": true })),
+            )
             .await
             .expect("the read succeeded");
         assert_eq!(thread_transcript(&result), "hello\n\nhi");
+        // A real server leaves the turns out unless asked, which made every
+        // `read_thread` an empty transcript.
+        let bare = transport
+            .request("thread/read", Some(json!({ "threadId": "thread-a" })))
+            .await
+            .expect("the read succeeded");
+        assert_eq!(thread_transcript(&bare), "");
         transport.close().await;
     }
 

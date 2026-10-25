@@ -360,9 +360,11 @@ impl TextField {
         if !self.enabled {
             return;
         }
-        // Read before `edit` clears it: a composition already under way belongs
-        // to the group its first marked text opened.
-        let composing = self.marked.is_some();
+        // Read before `edit` clears it: the input method's own next step in a
+        // composition belongs to the group its first marked text opened. A cut
+        // or paste is never that step. It ends the composition and is a step of
+        // its own; joined, Undo took the paste back along with the composition.
+        let composing = self.marked.is_some() && kind != EditKind::Clipboard;
         let before = self.snapshot();
         self.edit(range, insert);
         if self.value == before.value {
@@ -3083,6 +3085,30 @@ mod tests {
                 assert_eq!(field.value, "ab", "the composition and what followed it");
                 assert!(field.undo(cx));
                 assert_eq!(field.value, "");
+            });
+            Probe { field }
+        });
+        test.refresh().unwrap();
+    }
+
+    #[test]
+    fn a_paste_during_a_composition_is_a_step_of_its_own() {
+        let mut test = gpui::TestAppContext::single();
+        test.add_window(|window, cx| {
+            let field = cx.new(|cx| TextField::new(cx).multiline(4.0));
+            field.update(cx, |field, cx| {
+                type_text(field, "ab");
+                field.moved_caret();
+                field.replace_and_mark_text_in_range(None, "かん", Some(2..2), window, cx);
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string("PASTED".into()));
+                field.edit_command(EditCommand::Paste, cx);
+                assert_eq!(field.value, "abかんPASTED");
+
+                assert!(field.undo(cx));
+                assert_eq!(
+                    field.value, "abかん",
+                    "Undo took the paste back together with the composition"
+                );
             });
             Probe { field }
         });

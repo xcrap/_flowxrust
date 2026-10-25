@@ -34,7 +34,7 @@
 //! ```ignore
 //! let mut chrome = ComposerChrome {
 //!     busy: conversation.is_busy(),
-//!     queued: conversation.queued().map(|prompt| prompt.preview()).collect(),
+//!     queued: conversation.queued().map(QueuedPreview::of).collect(),
 //!     enabled: true,
 //!     model,
 //!     effort,
@@ -44,7 +44,7 @@
 //!         ComposerAction::Submit => send(cx),
 //!         ComposerAction::Stop => stop(cx),
 //!         ComposerAction::Attach => attach(cx),
-//!         ComposerAction::RemoveQueued(index) => dequeue(cx, index),
+//!         ComposerAction::RemoveQueued(id) => dequeue(cx, id),
 //!         ComposerAction::Select(ComposerPicker::Effort, value) => set_effort(cx, value),
 //!         // Handle model selection in the caller as well.
 //!         _ => {}
@@ -100,7 +100,7 @@ use gpui::prelude::*;
 use gpui::{AnyElement, App, ClickEvent, Entity, ExternalPaths, SharedString, Window, div, px};
 
 use crate::state::FollowUp;
-use crate::text_field::TextField;
+use crate::text_field::{self, TextField};
 
 gpui::actions!(
     composer,
@@ -160,8 +160,8 @@ pub enum ComposerAction {
     PasteImage(gpui::Image),
     /// Take one pending image back out, by its attachment id.
     RemoveAttachment(uuid::Uuid),
-    /// Open the queued prompt at this position for editing.
-    EditQueued(usize),
+    /// Open this queued prompt, by its id, for editing.
+    EditQueued(uuid::Uuid),
     /// Save the open queued-prompt edit.
     SaveQueuedEdit,
     /// Close the queued-prompt editor without saving.
@@ -169,12 +169,45 @@ pub enum ComposerAction {
     /// A picker changed. The value is the caller's own vocabulary, not the
     /// composer's.
     Select(ComposerPicker, String),
-    /// Remove the queued prompt at this position, counting from the front.
+    /// Remove this queued prompt, by its id.
     ///
-    /// The index is a position in the queue rather than in the visible strip,
-    /// because `Conversation::queued_previews` takes from the front: the strip
-    /// never shows a row whose index it could not name.
-    RemoveQueued(usize),
+    /// An id rather than a position: the queue moves on its own when a turn
+    /// ends, and a position read from the last frame then names the prompt
+    /// behind the one the reader clicked.
+    RemoveQueued(uuid::Uuid),
+}
+
+/// One queued prompt, as the strip shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedPreview {
+    /// The prompt's own id, which is what the strip's controls act on.
+    pub id: uuid::Uuid,
+    pub text: String,
+}
+
+impl QueuedPreview {
+    pub fn of(prompt: &fx_agent::conversation::QueuedPrompt) -> Self {
+        Self {
+            id: prompt.id,
+            text: prompt.preview(),
+        }
+    }
+}
+
+/// A preview with an id of its own, for a composer that only displays.
+impl From<&str> for QueuedPreview {
+    fn from(text: &str) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4(),
+            text: text.to_string(),
+        }
+    }
+}
+
+impl From<String> for QueuedPreview {
+    fn from(text: String) -> Self {
+        Self::from(text.as_str())
+    }
 }
 
 /// One exclusive choice in a picker.
@@ -234,7 +267,7 @@ pub struct ComposerChrome {
     /// want the overflow line to be truthful: previews are truncated to three
     /// by the engine, so a caller that passes them cannot tell the composer how
     /// many it is hiding.
-    pub queued: Vec<String>,
+    pub queued: Vec<QueuedPreview>,
     /// Whether the composer accepts input at all.
     pub enabled: bool,
     /// Whether attachment handling is available for this composer.
@@ -429,6 +462,7 @@ pub fn view_with_controls(
     let for_paste = handler
         .clone()
         .filter(|_| chrome.attachments_enabled && chrome.enabled && !chrome.steering);
+    let for_paste_key = for_paste.clone();
 
     div()
         .w_full()
@@ -448,11 +482,25 @@ pub fn view_with_controls(
                 handler(ComposerAction::SubmitAlternate, window, cx);
             }
         })
-        // Captured before the field sees the key: an image on the clipboard
-        // is an attachment, and the field would otherwise paste nothing.
-        .capture_key_down(move |event, window, cx| {
+        // An image on the clipboard is an attachment, and the field would
+        // otherwise paste nothing. Caught as the action, on its way down to
+        // the field: GPUI runs a bound key's action before any key-down
+        // listener and stops there, so with ⌘V bound — as the app binds it —
+        // a key-down check never ran. The Edit menu's Paste arrives here too.
+        .capture_action(move |_: &text_field::Paste, window, cx| {
             if let Some(handler) = &for_paste
-                && let Some(image) = pasted_image(&event.keystroke, cx)
+                && let Some(image) = clipboard_image(cx)
+            {
+                cx.stop_propagation();
+                handler(ComposerAction::PasteImage(image), window, cx);
+            }
+        })
+        // The same, for a window that binds nothing, where ⌘V reaches the
+        // field as a key.
+        .capture_key_down(move |event, window, cx| {
+            if let Some(handler) = &for_paste_key
+                && is_paste_key(&event.keystroke)
+                && let Some(image) = clipboard_image(cx)
             {
                 cx.stop_propagation();
                 handler(ComposerAction::PasteImage(image), window, cx);
@@ -488,17 +536,18 @@ pub fn view_with_controls(
         .into_any_element()
 }
 
-/// The image ⌘V would paste, when the clipboard holds one and no text.
+/// Whether a key is ⌘V.
+fn is_paste_key(keystroke: &gpui::Keystroke) -> bool {
+    keystroke.modifiers.secondary()
+        && !keystroke.modifiers.shift
+        && keystroke.key.eq_ignore_ascii_case("v")
+}
+
+/// The image a paste would insert, when the clipboard holds one and no text.
 ///
 /// GPUI returns text whenever the pasteboard has any, so an image here is
 /// what the reader copied rather than a rendition beside their words.
-fn pasted_image(keystroke: &gpui::Keystroke, cx: &App) -> Option<gpui::Image> {
-    if !keystroke.modifiers.secondary()
-        || keystroke.modifiers.shift
-        || !keystroke.key.eq_ignore_ascii_case("v")
-    {
-        return None;
-    }
+fn clipboard_image(cx: &App) -> Option<gpui::Image> {
     cx.read_from_clipboard()?
         .into_entries()
         .find_map(|entry| match entry {
@@ -946,7 +995,11 @@ fn queued_strip(chrome: &ComposerChrome) -> AnyElement {
 }
 
 /// One queued prompt: what it says, that it goes next, and a way to take it back.
-fn queued_row(preview: &str, index: usize, handler: &Option<ActionHandler>) -> AnyElement {
+fn queued_row(
+    preview: &QueuedPreview,
+    index: usize,
+    handler: &Option<ActionHandler>,
+) -> AnyElement {
     let theme = global::current();
     let is_next = index == 0;
 
@@ -979,7 +1032,7 @@ fn queued_row(preview: &str, index: usize, handler: &Option<ActionHandler>) -> A
                 // Two lines: a queued prompt is usually a sentence, and one line
                 // of it is not enough to recognise before it is sent.
                 .line_clamp(2)
-                .child(SharedString::from(preview.to_string())),
+                .child(SharedString::from(preview.text.clone())),
         );
 
     if is_next {
@@ -997,7 +1050,7 @@ fn queued_row(preview: &str, index: usize, handler: &Option<ActionHandler>) -> A
             .tiny()
             .ghost()
             .enabled(handler.is_some()),
-        fire(handler.clone(), ComposerAction::EditQueued(index)),
+        fire(handler.clone(), ComposerAction::EditQueued(preview.id)),
     ))
     .child(icon_button(
         IconButtonProps::new(
@@ -1009,7 +1062,7 @@ fn queued_row(preview: &str, index: usize, handler: &Option<ActionHandler>) -> A
         .tiny()
         .ghost()
         .enabled(handler.is_some()),
-        fire(handler.clone(), ComposerAction::RemoveQueued(index)),
+        fire(handler.clone(), ComposerAction::RemoveQueued(preview.id)),
     ))
     .into_any_element()
 }
@@ -1094,12 +1147,12 @@ fn waiting_label(count: usize) -> String {
 /// limits on one queue is one too many, and the copy is the one that would not
 /// move when the other moved. Taking from the front is also what makes
 /// [`ComposerAction::RemoveQueued`]'s index a real queue position.
-fn visible_queued(queued: &[String]) -> &[String] {
+fn visible_queued(queued: &[QueuedPreview]) -> &[QueuedPreview] {
     &queued[..queued.len().min(VISIBLE_QUEUED_PROMPTS)]
 }
 
 /// How many queued prompts the strip is not showing.
-fn hidden_queued(queued: &[String]) -> usize {
+fn hidden_queued(queued: &[QueuedPreview]) -> usize {
     queued.len() - visible_queued(queued).len()
 }
 
@@ -1214,30 +1267,29 @@ mod tests {
 
     #[test]
     fn the_strip_shows_the_front_of_the_queue_and_counts_the_rest() {
-        let queued: Vec<String> = (0..VISIBLE_QUEUED_PROMPTS + 4)
-            .map(|index| format!("queued prompt {index}"))
+        let queued: Vec<QueuedPreview> = (0..VISIBLE_QUEUED_PROMPTS + 4)
+            .map(|index| format!("queued prompt {index}").into())
             .collect();
 
         // The cap is the engine's, so a strip that showed more would disagree
         // with `Conversation::queued_previews` about the same queue.
         assert_eq!(visible_queued(&queued).len(), VISIBLE_QUEUED_PROMPTS);
         assert_eq!(hidden_queued(&queued), 4);
-        // Front first: the head of the strip is what goes next, and
-        // `RemoveQueued`'s index is a real queue position because of it.
-        assert_eq!(visible_queued(&queued)[0], "queued prompt 0");
-        assert_eq!(visible_queued(&queued)[1], "queued prompt 1");
+        // Front first: the head of the strip is what goes next.
+        assert_eq!(visible_queued(&queued)[0].text, "queued prompt 0");
+        assert_eq!(visible_queued(&queued)[1].text, "queued prompt 1");
     }
 
     #[test]
     fn a_queue_the_strip_can_hold_hides_nothing() {
-        let queued: Vec<String> = (0..VISIBLE_QUEUED_PROMPTS)
-            .map(|index| format!("queued prompt {index}"))
+        let queued: Vec<QueuedPreview> = (0..VISIBLE_QUEUED_PROMPTS)
+            .map(|index| format!("queued prompt {index}").into())
             .collect();
         assert_eq!(visible_queued(&queued).len(), queued.len());
         assert_eq!(hidden_queued(&queued), 0);
         // An overflow line that appeared at one queue length but not another
         // would be the bug this is here for.
-        assert_eq!(hidden_queued(&["only".to_string()]), 0);
+        assert_eq!(hidden_queued(&["only".into()]), 0);
         assert_eq!(hidden_queued(&[]), 0);
     }
 
@@ -1587,7 +1639,7 @@ mod tests {
         // The overflow line only appears when the caller handed over more than
         // the strip shows, so both halves of that have to survive a paint.
         let queued = (0..VISIBLE_QUEUED_PROMPTS + 4)
-            .map(|index| format!("queued prompt {index}"))
+            .map(|index| format!("queued prompt {index}").into())
             .collect();
         paint(
             ComposerChrome {
@@ -1848,6 +1900,33 @@ mod tests {
             },
             "",
         );
+        focus(&mut test, &window, &field);
+        test.update(|cx| cx.write_to_clipboard(gpui::ClipboardItem::new_image(&image)));
+        let mut visual = VisualTestContext::from_window(*window.deref(), &test);
+        visual.simulate_keystrokes("cmd-v");
+        assert_eq!(*actions.borrow(), vec![ComposerAction::PasteImage(image)]);
+
+        test.update(|cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string("words".into())));
+        visual.simulate_keystrokes("cmd-v");
+        assert_eq!(actions.borrow().len(), 1, "text is the field's to paste");
+    }
+
+    #[test]
+    fn pasting_an_image_attaches_it_with_the_apps_own_key_bindings() {
+        // The app binds ⌘V to the field's Paste. GPUI runs a bound action
+        // before any key-down listener and stops, so the key-down check never
+        // saw ⌘V in the app, and an image was never attached. The test above
+        // binds nothing, which is why it passed all along.
+        let image =
+            gpui::Image::from_bytes(gpui::ImageFormat::Png, b"\x89PNG\r\n\x1a\nrest".to_vec());
+        let (mut test, window, field, actions) = recording(
+            ComposerChrome {
+                attachments_enabled: true,
+                ..live()
+            },
+            "",
+        );
+        test.update(crate::commands::install_key_bindings);
         focus(&mut test, &window, &field);
         test.update(|cx| cx.write_to_clipboard(gpui::ClipboardItem::new_image(&image)));
         let mut visual = VisualTestContext::from_window(*window.deref(), &test);

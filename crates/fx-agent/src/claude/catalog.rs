@@ -239,8 +239,12 @@ async fn control_query(
                 .push(&chunk[..count])
                 .map_err(|error| error.to_string())?
             {
-                let frame: Value =
-                    serde_json::from_str(&line).map_err(|error| error.to_string())?;
+                // A line that is not JSON — a warning, an update notice — is
+                // not the answer, and is passed over like any other frame that
+                // is not. Failing on it failed the whole probe.
+                let Ok(frame) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
                 if frame["type"] != "control_response" || frame["response"]["request_id"] != wanted
                 {
                     continue;
@@ -420,6 +424,8 @@ ask = json.loads(sys.stdin.readline())
 assert ask == {"type":"control_request", "request_id":"flowx-context-usage", "request":{"subtype":"get_context_usage", "detail":"summary"}}, ask
 # A resumed session first replays tasks a killed process left behind.
 print(json.dumps({"type":"system","subtype":"task_notification","status":"stopped"}), flush=True)
+# And a CLI may print a line that is not JSON at all, which is not the answer.
+print("A newer version of Claude Code is available.", flush=True)
 print(json.dumps({"type":"result","subtype":"success","num_turns":0}), flush=True)
 print(json.dumps({"type":"control_response","response":{"subtype":"success","request_id":"flowx-model-discovery","response":{"models":[]}}}), flush=True)
 print(json.dumps({"type":"control_response","response":{"subtype":"success","request_id":"flowx-context-usage","response":{"totalTokens":88443,"maxTokens":1000000,"rawMaxTokens":1000000,"percentage":9,"model":"claude-opus-5-5[1m]"}}}), flush=True)

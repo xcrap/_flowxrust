@@ -271,6 +271,55 @@ impl State {
         )
     }
 
+    /// Whether the selection covers any text keyed under `prefix`.
+    ///
+    /// Asked while a row is being built, which is before this frame has drawn
+    /// it: the frame's list starts empty and fills as rows paint. Reading only
+    /// that list answered "no" for every row, so the menu never offered the
+    /// selection and its Copy copied the whole message. A row the frame has
+    /// not drawn yet is read from the document, as copying reads one.
+    fn touches(&self, prefix: &str) -> bool {
+        // Asked once per message on screen per pass, so with nothing selected
+        // nothing is scanned.
+        let Some((start, end)) = self.ends() else {
+            return false;
+        };
+        let mut drawn = false;
+        for index in 0..self.runs.len() {
+            if self.runs[index].key.starts_with(prefix) {
+                drawn = true;
+                if self.range_of(index).is_some() {
+                    return true;
+                }
+            }
+        }
+        if drawn {
+            return false;
+        }
+        let Some(document) = self.document.as_ref() else {
+            return false;
+        };
+        let Some(row) = document.row_of(prefix) else {
+            return false;
+        };
+        if row < start.row || row > end.row || self.drawn(row).is_some() {
+            return false;
+        }
+        if start.row < row && row < end.row {
+            return true;
+        }
+        // A row an end is in: the part it covers may stop short of this
+        // message's text, or begin after it.
+        document
+            .paragraphs(row)
+            .iter()
+            .enumerate()
+            .any(|(index, paragraph)| {
+                paragraph.key.starts_with(prefix)
+                    && covered((row, index), paragraph.text.len(), start, end).is_some()
+            })
+    }
+
     /// The selected text, read from the frame for the rows it drew and from
     /// the document for the rest.
     fn selected_text(&self) -> Option<String> {
@@ -523,17 +572,7 @@ pub(crate) fn copy_selection(cx: &mut App) -> bool {
 /// Every key in one message starts with that message's id, which is how a
 /// message row decides whether its context menu should offer the selection.
 pub(crate) fn touches(prefix: &str) -> bool {
-    STATE.with(|state| {
-        let state = state.borrow();
-        // Asked once per message on screen per pass, so with nothing selected
-        // nothing is scanned, and otherwise only the frame's own runs are.
-        if state.ends().is_none() {
-            return false;
-        }
-        (0..state.runs.len()).any(|index| {
-            state.runs[index].key.starts_with(prefix) && state.range_of(index).is_some()
-        })
-    })
+    STATE.with(|state| state.borrow().touches(prefix))
 }
 
 /// The keyboard shortcuts a read-only selection answers. Returns whether the
@@ -966,6 +1005,33 @@ pub(crate) mod tests {
             Some(Rc::new(document)),
             vec![run("2:0", "on screen", 0.0, false)],
         )
+    }
+
+    #[test]
+    fn a_row_being_built_knows_the_selection_touches_it() {
+        // The row asks while it is built: the frame has begun and drawn
+        // nothing yet, so only the document can answer.
+        let document = Rows(vec![
+            vec![("first row", false)],
+            vec![("second row", false), ("one", true), ("two", true)],
+            vec![("third row", false)],
+            vec![("fourth row", false)],
+        ]);
+        let mut state = framed(Some(Rc::new(document)), Vec::new());
+        state.anchor = caret("1:1", 1);
+        state.head = caret("1:2", 2);
+        assert!(state.touches("1:"));
+        assert!(!state.touches("0:"));
+        assert!(!state.touches("2:"));
+
+        // Across rows: the middle is covered whole, and an end that stops at
+        // the very end of a row's text covers none of it.
+        state.anchor = caret("0:0", 9);
+        state.head = caret("3:0", 3);
+        assert!(!state.touches("0:"));
+        assert!(state.touches("1:"));
+        assert!(state.touches("2:"));
+        assert!(state.touches("3:"));
     }
 
     #[test]

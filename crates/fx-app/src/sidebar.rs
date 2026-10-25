@@ -1773,7 +1773,6 @@ mod tests {
                     outcome: fx_agent::codex::TurnOutcome::Completed {
                         thread_id: "thread".into(),
                         stop_reason: "end_turn".into(),
-                        events: Vec::new(),
                     },
                 });
                 state.drain_updates();

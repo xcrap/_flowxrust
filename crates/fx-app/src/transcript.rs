@@ -718,20 +718,32 @@ impl Rows {
                         is_active,
                     }
                 }
-                RowPlan::Plan { message, is_live } => {
-                    let message = &snapshot.messages[message];
-                    RowStamp::Plan {
-                        id: message.id,
-                        message: Arc::downgrade(message),
-                        is_live,
-                    }
-                }
+                RowPlan::Plan { message, is_live } => RowStamp::Plan {
+                    id: plan_turn_id(snapshot, message),
+                    message: Arc::downgrade(&snapshot.messages[message]),
+                    is_live,
+                },
                 RowPlan::Tail => RowStamp::Tail(snapshot.streaming_revision),
                 RowPlan::Tasks => RowStamp::Tasks(snapshot.tasks_revision),
                 RowPlan::Failure => RowStamp::Failure(snapshot.error.clone(), snapshot.recovery),
             })
             .collect()
     }
+}
+
+/// What a plan card is the card *of*: its turn, named by the prompt that
+/// opened it, or by the transcript's first message for a turn with none.
+///
+/// Not the plan message. Every update records a new one, so a card keyed by
+/// it was a different row on each update, and a reader scrolled into it was
+/// moved to its top every time.
+fn plan_turn_id(snapshot: &Snapshot, message: usize) -> Uuid {
+    snapshot.messages[..message]
+        .iter()
+        .rev()
+        .find(|message| message.role == MessageRole::User)
+        .or(snapshot.messages.first())
+        .map_or(Uuid::nil(), |message| message.id)
 }
 
 /// What a row's height depends on, as far as the conversation decides it.
@@ -752,6 +764,7 @@ enum RowStamp {
         is_active: bool,
     },
     Plan {
+        /// The turn's, so every update of one card is the same row.
         id: Uuid,
         message: Weak<ConversationMessage>,
         is_live: bool,
@@ -764,6 +777,14 @@ enum RowStamp {
 }
 
 impl RowStamp {
+    /// The message a message or group row is keyed by.
+    fn message_id(&self) -> Option<Uuid> {
+        match self {
+            Self::Message { id, .. } | Self::Activity { id, .. } => Some(*id),
+            _ => None,
+        }
+    }
+
     /// Whether two stamps are the same row, changed or not.
     fn same_row(&self, other: &Self) -> bool {
         match (self, other) {
@@ -848,16 +869,35 @@ fn splice_changed(list: &ListState, old: &[RowStamp], new: &[RowStamp]) {
     list.splice(replaced.clone(), count);
     if anchored && replaced.contains(&top.item_ix) {
         let row = &old[top.item_ix];
-        if let Some(at) = new[prefix..prefix + count]
-            .iter()
-            .position(|stamp| stamp.same_row(row))
-        {
+        let stretch = &new[prefix..prefix + count];
+        if let Some(at) = continuation(row, old, stretch) {
             list.scroll_to(ListOffset {
                 item_ix: prefix + at,
                 offset_in_item: top.offset_in_item,
             });
         }
     }
+}
+
+/// Where in a spliced stretch the row the reader was in now is.
+///
+/// Usually the same row. The live reply is the exception: when a tool call
+/// splits it or the turn ends, its text is committed as a message, a row of
+/// its own, and the tail that follows is a new, empty reply. Followed as "the
+/// tail", a reader halfway up the reply was moved to the top of the stretch
+/// on every tool call. The text they were reading is the first row in the
+/// stretch that did not exist before.
+fn continuation(row: &RowStamp, old: &[RowStamp], stretch: &[RowStamp]) -> Option<usize> {
+    if matches!(row, RowStamp::Tail(_)) {
+        let known: HashSet<Uuid> = old.iter().filter_map(RowStamp::message_id).collect();
+        if let Some(at) = stretch
+            .iter()
+            .position(|stamp| stamp.message_id().is_some_and(|id| !known.contains(&id)))
+        {
+            return Some(at);
+        }
+    }
+    stretch.iter().position(|stamp| stamp.same_row(row))
 }
 
 /// Forget every row's height, keeping the reader's place.
@@ -3622,6 +3662,15 @@ enum LiveStep<'a> {
 /// The latest open call rather than the latest call: with calls running side
 /// by side, the one that finished last says nothing about what is still going.
 fn live_step<'a>(group: &ActivityGroup<'a>, snapshot: &Snapshot) -> LiveStep<'a> {
+    // Waiting on the reader is not work. The call awaiting approval has not
+    // started, so it is not "Running", and no clock ticks against the agent
+    // while the reader decides.
+    if snapshot.waiting_for_user {
+        return LiveStep::Between {
+            label: format!("{}…", snapshot.phase.label()),
+            since: None,
+        };
+    }
     if let Some(call) = group
         .calls
         .iter()
@@ -6176,6 +6225,88 @@ mod tests {
     }
 
     #[test]
+    fn a_reader_in_the_live_reply_stays_in_it_when_a_tool_call_commits_it() {
+        let mut conversation = long_conversation(60);
+        let id = conversation.id;
+        conversation.apply(ProviderEvent::Lifecycle(Lifecycle::TurnStarted));
+        conversation.apply(ProviderEvent::TextDelta("The reply begins.".into()));
+        for line in 0..40 {
+            conversation.apply(ProviderEvent::TextDelta(format!(
+                "\n\nLine {line} of a reply long enough to grow the tail past the viewport."
+            )));
+        }
+        let mut test = TestAppContext::single();
+        let window = test.add_window(move |_, _| Harness { conversation });
+        let mut visual = VisualTestContext::from_window(*window.deref(), &test);
+        visual.simulate_resize(size(px(700.0), px(500.0)));
+        redraw(&mut test);
+        let middle = visual.debug_bounds(SCROLL_ID).unwrap().center();
+        scroll_wheel(&mut visual, middle, 200.0);
+        redraw(&mut test);
+        let held = list_state(id).logical_scroll_top();
+        assert_eq!(held.item_ix, 60, "the reader should be inside the reply");
+        assert!(held.offset_in_item > px(0.0), "{held:?}");
+
+        // The call commits the reply as a message and starts a new segment.
+        window
+            .update(&mut test, |view, _, cx| {
+                view.conversation.apply(ProviderEvent::ToolUse {
+                    id: "call-1".into(),
+                    name: "Bash".into(),
+                    input: r#"{"command":"ls"}"#.into(),
+                });
+                cx.notify();
+            })
+            .unwrap();
+        redraw(&mut test);
+        let now = list_state(id).logical_scroll_top();
+        assert_eq!(
+            (now.item_ix, now.offset_in_item),
+            (held.item_ix, held.offset_in_item),
+            "the reader was moved off the text they were reading"
+        );
+    }
+
+    #[test]
+    fn a_plan_update_is_the_same_row() {
+        let prompt = ConversationMessage::text(MessageRole::User, "Fix it");
+        let plan = |step: &str| {
+            ConversationMessage::new(
+                MessageRole::Assistant,
+                vec![MessageContent::ToolUse {
+                    id: format!("plan-{step}"),
+                    name: fx_core::policy::turn_plan::PLAN_TOOL_NAME.into(),
+                    input: format!(r#"{{"plan":[{{"step":"{step}","status":"in_progress"}}]}}"#),
+                }],
+            )
+        };
+        let snapshot = |messages: Vec<ConversationMessage>| {
+            let mut conversation = Conversation::new(Uuid::from_u128(0x91a));
+            conversation.replace_full_history(messages);
+            super::snapshot(&conversation)
+        };
+        let first = snapshot(vec![prompt.clone(), plan("one")]);
+        let second = snapshot(vec![prompt.clone(), plan("one"), plan("two")]);
+        let stamp = |snapshot: &Snapshot, message: usize| {
+            Rows {
+                plan: Rc::from(vec![RowPlan::Plan {
+                    message,
+                    is_live: true,
+                }]),
+                tail: false,
+                tasks: false,
+                failure: false,
+            }
+            .stamps(snapshot)
+            .remove(0)
+        };
+        let before = stamp(&first, 1);
+        let after = stamp(&second, 2);
+        assert!(before != after, "an update must still re-measure the card");
+        assert!(before.same_row(&after), "an update made the card a new row");
+    }
+
+    #[test]
     fn the_page_keys_move_the_list_and_end_follows_the_bottom_again() {
         let conversation = long_conversation(80);
         let id = conversation.id;
@@ -6630,6 +6761,27 @@ mod tests {
             input: r#"{"command":"cargo test --workspace"}"#.into(),
         });
         conversation
+    }
+
+    #[test]
+    fn a_call_awaiting_approval_is_not_running_and_has_no_clock() {
+        let mut conversation = running_the_tests();
+        conversation.apply(ProviderEvent::Approval(
+            fx_agent::provider::ApprovalRequest {
+                id: "approve-test".into(),
+                tool_name: "Bash".into(),
+                input: serde_json::json!({ "command": "cargo test --workspace" }),
+                risk: fx_agent::provider::RiskLevel::Moderate,
+            },
+        ));
+        let mut test = TestAppContext::single();
+        let window = test.add_window(move |_, _| Harness { conversation });
+        let mut visual = VisualTestContext::from_window(*window.deref(), &test);
+        visual.simulate_resize(size(px(900.0), px(600.0)));
+        redraw(&mut test);
+        assert!(drew(&mut visual, &live("label", "Waiting for approval…")));
+        assert!(!drew(&mut visual, &live("label", "Running command")));
+        assert!(!drew(&mut visual, &live("elapsed", "0s")), "a clock ticked");
     }
 
     #[test]
