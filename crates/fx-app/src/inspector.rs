@@ -898,6 +898,43 @@ mod tests {
     }
 
     #[test]
+    fn a_successful_commit_preserves_a_message_edited_while_it_runs() {
+        let root = repo();
+        std::fs::write(root.path().join("sample.txt"), "after the edit\n").unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let mut test = gpui::TestAppContext::single();
+        let (inspector, _window) = mount(&mut test, data.path(), Some(root.path()), 360.0);
+        inspector.update(&mut test, |inspector, cx| {
+            inspector.composer.visible = true;
+            inspector
+                .composer
+                .field
+                .update(cx, |field, cx| field.set_value("Ship it", cx));
+            inspector.commit("Ship it".into(), cx);
+            // The completion callback has not been polled. This is the next
+            // message typed while Git or a commit hook is still running.
+            inspector
+                .composer
+                .field
+                .update(cx, |field, cx| field.set_value("The next change", cx));
+        });
+        wait_until(&mut test, &inspector, |i| i.running().is_none());
+        test.read(|cx| {
+            let inspector = inspector.read(cx);
+            assert!(matches!(
+                inspector.composer.outcome,
+                Some(Outcome::Succeeded(_))
+            ));
+            assert_eq!(inspector.composer.field.read(cx).value(), "The next change");
+            assert!(inspector.composer.visible, "the new draft stays open");
+        });
+        assert_eq!(
+            git(root.path(), &["log", "-1", "--format=%s"]).trim(),
+            "Ship it"
+        );
+    }
+
+    #[test]
     fn a_write_ends_even_after_a_switch_the_hidden_inspector_never_saw() {
         // Hidden, the inspector does not sync, so it never hears of the
         // switch to B and back. The monitor does, and its generation moves.
@@ -1030,6 +1067,80 @@ mod tests {
         assert_eq!(
             git(second.path(), &["log", "--format=%s"]).trim(),
             "Initial fixture"
+        );
+    }
+
+    #[test]
+    fn a_commit_preserves_newer_drafts_through_project_switches() {
+        let first = repo();
+        let second = repo();
+        std::fs::write(first.path().join("sample.txt"), "after the edit\n").unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let mut test = gpui::TestAppContext::single();
+        let (inspector, _window) = mount(&mut test, data.path(), Some(first.path()), 360.0);
+        let state = test.read(|cx| inspector.read(cx).state.clone());
+        let first_key = test.read(|cx| inspector.read(cx).project.clone().unwrap());
+        let first_id = state.update(&mut test, |state, _| {
+            state
+                .project_with_root(&first.path().to_string_lossy())
+                .unwrap()
+        });
+        let second_id = state.update(&mut test, |state, _| {
+            state.add_project(&second.path().to_string_lossy())
+        });
+        let show = |test: &mut gpui::TestAppContext, project| {
+            state.update(test, |state, _| state.select_project(project));
+            inspector.update(test, |inspector, cx| inspector.sync(cx));
+        };
+        let edit = |test: &mut gpui::TestAppContext, text: &str| {
+            inspector.update(test, |inspector, cx| {
+                inspector
+                    .composer
+                    .field
+                    .update(cx, |field, cx| field.set_value(text, cx));
+            });
+        };
+        edit(&mut test, "Ship it");
+        inspector.update(&mut test, |inspector, cx| {
+            inspector.commit("Ship it".into(), cx)
+        });
+        edit(&mut test, "The next change");
+        show(&mut test, second_id);
+        edit(&mut test, "Other project draft");
+        show(&mut test, first_id);
+        test.read(|cx| {
+            assert_eq!(
+                inspector.read(cx).composer.field.read(cx).value(),
+                "The next change"
+            );
+        });
+        edit(&mut test, "An even newer change");
+        show(&mut test, second_id);
+        // Let the commit finish while its new draft is in the per-project map.
+        wait_until(&mut test, &inspector, |i| {
+            i.composer.writing(Some(&first_key)).is_none()
+        });
+        test.read(|cx| {
+            assert_eq!(
+                inspector.read(cx).composer.field.read(cx).value(),
+                "Other project draft"
+            );
+        });
+        show(&mut test, first_id);
+        test.read(|cx| {
+            let inspector = inspector.read(cx);
+            assert!(matches!(
+                inspector.composer.outcome,
+                Some(Outcome::Succeeded(_))
+            ));
+            assert_eq!(
+                inspector.composer.field.read(cx).value(),
+                "An even newer change"
+            );
+        });
+        assert_eq!(
+            git(first.path(), &["log", "-1", "--format=%s"]).trim(),
+            "Ship it"
         );
     }
 

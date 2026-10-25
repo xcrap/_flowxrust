@@ -333,6 +333,19 @@ quit. It comes back in the composer rather than as a queue. After a relaunch
 nothing is running for it to wait behind, and FlowX never sends a prompt on
 its own.
 
+A composer's unsent images are saved with its draft, including an image-only
+draft. The saved image list distinguishes an absent legacy field from an
+explicit empty list, so removing a failed prompt's image stays removed after
+relaunch. Image ids participate in the save version; checkpoints share the bytes
+with the writer instead of copying them on the UI thread.
+
+Recovering a queue keeps every saved character and image, even when several
+valid prompts exceed one composer's ordinary limits. Recovery reports that
+case and allows the draft to be edited without growing until it is back under
+the normal cap; it never silently truncates already saved work. Workspace
+metadata saves measure and write the same encoded bytes before replacing either
+recovery file.
+
 A binding records where its session starts in the transcript (`local_start`)
 when FlowX opened that session in a thread that already had turns, as Restart
 does. Native sync compares and replaces only from there. Compared whole, a
@@ -465,8 +478,9 @@ Two more, for how a turn ends:
 - **The tree is watched, not taken at Stop.** Taken at Stop, it missed every
   tool of a Claude that had already died, or been killed for an oversized
   line: with Claude gone, nothing in the table leads to a session it started.
-  `process::Watched` records Claude's tree from spawn and re-reads it every
-  500 ms and at each `task_started`, and Stop, a failed turn and Quit all end
+  `process::Watched` records both providers' trees from spawn and re-reads them
+  every 500 ms, at Claude's `task_started`, and at Codex command lifecycle
+  notifications. Stop, a failed turn and Quit all end
   what it last saw joined with what the table shows now. A group or session is
   forgotten once empty, because a record that lives for hours would otherwise
   claim the next unrelated process to be handed its id.
@@ -540,6 +554,9 @@ Read-only command checks for both providers go through one classifier,
 `fx-agent::shell`, which fails closed on control operators, substitutions and
 the write flags of otherwise read-only tools (`find -delete`, `sort -o`,
 `git diff --output`).
+Claude's `AskUserQuestion` answers are an object keyed by the original question
+text, with string values. An array of question/answer pairs fails the CLI's
+`updatedInput` validation; the fake CLI validates that wire shape too.
 `LineFramer` remembers how far it has scanned. Without that, a line arriving in
 many chunks is rescanned from the front each time — quadratic, which for a 64 MB
 message is billions of comparisons. The `scan_offset` field in the Swift original
@@ -843,6 +860,10 @@ Six rules, each of which is a bug that was written first:
   the banner waits until it is shown. Dropping the task on a switch cancelled
   it after git had already committed, so the message came back as a draft,
   with no banner, and Commit was enabled for a duplicate.
+
+A successful commit clears only the exact draft submitted. The field remains
+editable while Git runs, so edits made during a hook, including ones saved by a
+project switch, must remain available after the older commit completes.
 
 Every Git job runs on one shared multi-thread runtime whose workers have an
 8 MiB stack. Jobs are *built* there (`spawn_git` takes a closure), because

@@ -66,6 +66,9 @@ const STDERR_DRAIN: Duration = Duration::from_millis(250);
 /// SIGTERM before it is killed.
 pub const TERMINATE_GRACE: Duration = Duration::from_millis(500);
 
+/// Remember tool groups before a crashed server's children become orphans.
+const TREE_REFRESH: Duration = Duration::from_millis(500);
+
 /// Why a request did not produce a result.
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
@@ -312,8 +315,6 @@ pub struct PendingResponse {
 #[derive(Debug)]
 pub struct Transport {
     child: Mutex<Option<Child>>,
-    /// The server's own process group, which its tools inherit.
-    group: Option<crate::process::Group>,
     /// The server's place in the list Quit ends, until it closes.
     running: std::sync::Mutex<Option<crate::process::Running>>,
     stdin: mpsc::UnboundedSender<Vec<u8>>,
@@ -324,6 +325,9 @@ pub struct Transport {
 
 #[derive(Debug)]
 struct Shared {
+    /// The server's descendants and their groups, remembered while it runs so
+    /// a failed turn still ends tools already adopted by launchd.
+    tree: Option<crate::process::Watched>,
     pending: Mutex<PendingRequests>,
     stderr: Mutex<String>,
     exited: Mutex<Option<Exit>>,
@@ -370,11 +374,17 @@ impl Transport {
         let stderr = child.stderr.take().expect("stderr was piped");
         let mut stdin = child.stdin.take().expect("stdin was piped");
 
+        let tree = group.map(crate::process::Watched::new);
+        let running = group
+            .zip(tree.clone())
+            .map(|(group, tree)| crate::process::Running::watching(group, tree));
         let shared = Arc::new(Shared {
+            tree,
             pending: Mutex::new(PendingRequests::new()),
             stderr: Mutex::new(String::new()),
             exited: Mutex::new(None),
         });
+        watch_tree(&shared);
         let (events_tx, events) = mpsc::channel(EVENT_QUEUE_DEPTH);
         let (stdin_tx, stdin_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
@@ -436,8 +446,7 @@ impl Transport {
 
         let transport = Self {
             child: Mutex::new(Some(child)),
-            group,
-            running: std::sync::Mutex::new(group.map(crate::process::Running::register)),
+            running: std::sync::Mutex::new(running),
             stdin: stdin_tx,
             events,
             shared,
@@ -682,9 +691,14 @@ impl Transport {
     /// did for every ending, left a `sleep 200` or a quiet `docker build`
     /// running after the user pressed Stop, with nothing left to report on it.
     pub async fn terminate(&self) {
+        let tree = self
+            .shared
+            .tree
+            .as_ref()
+            .map(crate::process::Watched::snapshot);
         let mut slot = self.child.lock().await;
-        match (self.group, slot.as_mut()) {
-            (Some(group), leader) => group.terminate(leader, TERMINATE_GRACE).await,
+        match (tree, slot.as_mut()) {
+            (Some(tree), leader) => tree.terminate(leader, TERMINATE_GRACE).await,
             (None, Some(child)) => crate::process::stop_leader(child, TERMINATE_GRACE).await,
             (None, None) => {}
         }
@@ -808,6 +822,29 @@ impl Requester {
     }
 }
 
+/// Keep the same tree Stop and Quit use current until the server exits.
+fn watch_tree(shared: &Arc<Shared>) {
+    let Some(tree) = shared.tree.clone() else {
+        return;
+    };
+    let transport = Arc::downgrade(shared);
+    tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(TREE_REFRESH);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticks.tick().await;
+            let Some(shared) = transport.upgrade() else {
+                break;
+            };
+            if shared.exited.lock().await.is_some() {
+                break;
+            }
+            drop(shared);
+            tree.refresh();
+        }
+    });
+}
+
 async fn read_stdout(
     stdout: tokio::process::ChildStdout,
     shared: Arc<Shared>,
@@ -905,6 +942,14 @@ async fn dispatch(
             shared.pending.lock().await.resolve(&id, payload);
         }
         Classified::Notification { method, params } => {
+            // A command's lifecycle can expose a new process before
+            // the next timer tick, including one whose server then crashes.
+            if (method == "item/started" || method == "item/completed")
+                && params.pointer("/item/type").and_then(Value::as_str) == Some("commandExecution")
+                && let Some(tree) = &shared.tree
+            {
+                tree.refresh();
+            }
             // Awaited, not discarded: the queue is bounded, so `send` is a
             // future. Discarding it compiles and silently delivers nothing.
             let _ = events
@@ -923,6 +968,11 @@ async fn dispatch(
 }
 
 async fn record_exit(shared: &Arc<Shared>, stderr: String) {
+    // The reader can fail before the process does; capture what it still
+    // leads to before the turn tears the server down.
+    if let Some(tree) = &shared.tree {
+        tree.refresh();
+    }
     let mut slot = shared.exited.lock().await;
     if slot.is_some() {
         return;
@@ -1359,6 +1409,67 @@ mod process {
             transport.request("echo", None).await,
             Err(TransportError::Exited { .. })
         ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn terminating_ends_tools_after_the_server_crashes() {
+        let Some(server) = FakeServer::new() else {
+            return;
+        };
+        let transport = connect(&server).await.expect("started");
+        let started = transport
+            .request("spawn-child", None)
+            .await
+            .expect("tool started");
+        let pid = libc::pid_t::try_from(started["pid"].as_i64().expect("a pid")).unwrap();
+        let _reap = crate::process::testing::KillOnDrop(pid);
+
+        // This command reports no lifecycle notifications: the periodic watch
+        // must remember its group while the server is still its parent.
+        tokio::time::sleep(TREE_REFRESH * 2).await;
+        assert!(matches!(
+            transport.request("die", None).await,
+            Err(TransportError::Exited { .. })
+        ));
+        assert!(
+            crate::process::process_table()
+                .iter()
+                .any(|entry| { entry.pid == pid && entry.ppid == 1 && entry.pgid == pid }),
+            "the tool must be orphaned in its own group before cleanup"
+        );
+
+        transport.terminate().await;
+        assert!(
+            crate::process::testing::gone_within(pid, Duration::from_secs(5)).await,
+            "the crashed server's orphaned tool outlived failure cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn closing_a_successful_turn_preserves_its_background_tools() {
+        let Some(server) = FakeServer::new() else {
+            return;
+        };
+        let transport = connect(&server).await.expect("started");
+        let started = transport
+            .request("spawn-child", None)
+            .await
+            .expect("tool started");
+        let pid = libc::pid_t::try_from(started["pid"].as_i64().expect("a pid")).unwrap();
+        let _reap = crate::process::testing::KillOnDrop(pid);
+        tokio::time::sleep(TREE_REFRESH * 2).await;
+
+        transport.close().await;
+        // The tree is retained for failures and Stop, but a successful turn's
+        // dev server is deliberately left running and unregistered from Quit.
+        assert!(transport.running.lock().unwrap().is_none());
+        // SAFETY: signal 0 only checks whether this test's child still exists.
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "background tool was stopped"
+        );
     }
 
     #[tokio::test]

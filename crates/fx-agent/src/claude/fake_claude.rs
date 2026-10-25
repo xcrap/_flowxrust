@@ -267,6 +267,16 @@ for line in sys.stdin:
             die(0, "")
     elif message.get("type") == "control_response":
         request_id = (message.get("response") or {}).get("request_id")
+        decision = (message.get("response") or {}).get("response") or {}
+        if request_id == "req-2" and decision.get("behavior") == "allow":
+            # Claude 2.1.283 validates updatedInput before calling the tool.
+            # AskUserQuestion accepts a question-text -> answer-string record,
+            # not an array of pairs (which our old fake silently accepted).
+            answers = (decision.get("updatedInput") or {}).get("answers")
+            if not isinstance(answers, dict) or not all(isinstance(v, str) for v in answers.values()):
+                send({"type": "result", "is_error": True,
+                      "result": "AskUserQuestion updatedInput.answers must be an object"})
+                continue
         if request_id in waiting:
             waiting.remove(request_id)
         if not waiting:

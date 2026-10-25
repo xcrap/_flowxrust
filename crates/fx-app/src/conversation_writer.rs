@@ -35,6 +35,11 @@ pub(crate) struct Job {
     pub agent_id: Uuid,
     pub conversation: Arc<GuardedConversation>,
     pub draft: String,
+    /// Shared until the worker encodes them, so checkpoints do not copy image
+    /// bytes on the UI thread.
+    /// None means the composer was cleared for a submitted prompt; Some(empty)
+    /// records an explicit removal, even for an image-only retry.
+    pub draft_attachments: Option<Arc<Vec<fx_core::Attachment>>>,
     /// A rejected prompt to offer again when the composer is otherwise empty.
     pub retry_draft: Option<String>,
     /// The thread's goal, which lives in the same file.
@@ -318,6 +323,7 @@ impl Memory {
             agent_id,
             conversation,
             draft,
+            draft_attachments,
             retry_draft,
             goal,
             cost,
@@ -333,6 +339,7 @@ impl Memory {
         };
         persisted.total_cost_usd = cost;
         persisted.draft_text = draft;
+        persisted.draft_attachments = draft_attachments.map(Arc::unwrap_or_clone);
         persisted.goal = goal;
         // Copied here, off the UI thread, rather than into every job.
         for prompt in &mut persisted.queued {
@@ -342,6 +349,10 @@ impl Memory {
         }
         // Whitespace is not a draft; the rejected prompt takes its place.
         if persisted.draft_text.trim().is_empty()
+            && persisted
+                .draft_attachments
+                .as_ref()
+                .is_none_or(Vec::is_empty)
             && let Some(prompt) = retry_draft
         {
             persisted.draft_text = prompt;

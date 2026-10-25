@@ -30,6 +30,10 @@ pub enum LoadError {
 pub enum SaveError {
     #[error(transparent)]
     Write(#[from] WriteError),
+    #[error(
+        "the workspace exceeds its {limit} byte metadata limit; the previous saved workspace has been preserved"
+    )]
+    TooLarge { limit: u64 },
 }
 
 /// Persistent storage for one FlowX installation.
@@ -66,7 +70,15 @@ impl Store {
     }
 
     pub fn save_app(&self, app: &PersistedApp) -> Result<(), SaveError> {
-        write::write_json_atomically(&self.paths.projects_file(), app)?;
+        // Bound the encoding that will actually be read back. Compact JSON can
+        // fit while this pretty encoding exceeds the reader's limit, making
+        // both the primary and its recovery copy unreadable after a good save.
+        let bytes = serde_json::to_vec_pretty(app).map_err(WriteError::from)?;
+        let limit = crate::format::MAX_PROJECTS_BYTES;
+        if bytes.len() as u64 > limit {
+            return Err(SaveError::TooLarge { limit });
+        }
+        write::write_atomically(&self.paths.projects_file(), &bytes)?;
         Ok(())
     }
 
@@ -676,6 +688,33 @@ mod tests {
             .set_len(crate::format::MAX_PROJECTS_BYTES + 1)
             .unwrap();
         assert!(store.load_app().is_ok());
+    }
+
+    #[test]
+    fn an_oversized_written_encoding_preserves_both_saved_snapshots() {
+        let (store, _temp) = store();
+        let previous = populated();
+        store.save_app(&previous).unwrap();
+        let path = store.paths().projects_file();
+        let backup = write::backup_path(&path);
+        let primary_before = std::fs::read(&path).unwrap();
+        let backup_before = std::fs::read(&backup).unwrap();
+
+        let mut next = previous.clone();
+        let limit = crate::format::MAX_PROJECTS_BYTES;
+        let compact_size = serde_json::to_vec(&next).unwrap().len();
+        next.projects[0].project.as_mut().unwrap().description =
+            "x".repeat(limit as usize - compact_size);
+        assert_eq!(serde_json::to_vec(&next).unwrap().len() as u64, limit);
+        assert!(serde_json::to_vec_pretty(&next).unwrap().len() as u64 > limit);
+
+        assert!(matches!(
+            store.save_app(&next),
+            Err(SaveError::TooLarge { limit: actual }) if actual == limit
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), primary_before);
+        assert_eq!(std::fs::read(&backup).unwrap(), backup_before);
+        assert_eq!(store.load_app().unwrap(), previous);
     }
 
     #[test]

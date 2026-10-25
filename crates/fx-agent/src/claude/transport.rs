@@ -2245,9 +2245,10 @@ mod process {
 
         let responses = control_responses(&server, 1).await;
         let input = &responses[0]["response"]["response"]["updatedInput"];
-        let answers = input["answers"].as_array().expect("answers");
-        assert_eq!(answers[0]["question"], "Which database?");
-        assert_eq!(answers[0]["answer"], "Postgres");
+        let answers = input["answers"]
+            .as_object()
+            .expect("answers keyed by question");
+        assert_eq!(answers["Which database?"], "Postgres");
         let end = tokio::time::timeout(Duration::from_secs(5), reader.wait_for_end())
             .await
             .expect("the turn ended");

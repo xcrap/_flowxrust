@@ -81,7 +81,9 @@ for line in sys.stdin:
         # A tool the server started. The real app-server gives each command
         # a process group of its own, so this one leaves the server's.
         import subprocess
-        child = subprocess.Popen(["sleep", "60"], preexec_fn=os.setpgrp)
+        child = subprocess.Popen(["sleep", "60"], preexec_fn=os.setpgrp,
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
         send({"jsonrpc": "2.0", "id": mid, "result": {"pid": child.pid}})
     elif method == "stderr-noise":
         # Not UTF-8, and progress that only ever returns the carriage.

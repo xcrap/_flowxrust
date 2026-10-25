@@ -91,6 +91,9 @@ pub(super) struct CommitComposer {
 /// A write in flight, and the task that reports how it ends.
 struct Write {
     operation: Operation,
+    /// The exact draft submitted, before Git's whitespace normalization. A
+    /// successful commit spends only this draft, not edits made while it runs.
+    submitted_draft: Option<String>,
     _task: Task<()>,
 }
 
@@ -222,9 +225,13 @@ impl Inspector {
                 return;
             }
         };
-        self.start(Operation::Commit, project, cx, move || async move {
-            fx_core::git::operations::commit(&root, &plan).await
-        });
+        self.start(
+            Operation::Commit,
+            project,
+            Some(message),
+            cx,
+            move || async move { fx_core::git::operations::commit(&root, &plan).await },
+        );
     }
 
     pub(super) fn push(&mut self, cx: &mut Context<Self>) {
@@ -234,7 +241,7 @@ impl Inspector {
         if self.composer.writing(Some(&project)).is_some() {
             return;
         }
-        self.start(Operation::Push, project, cx, move || async move {
+        self.start(Operation::Push, project, None, cx, move || async move {
             fx_core::git::operations::push(&root).await
         });
     }
@@ -257,6 +264,7 @@ impl Inspector {
         &mut self,
         operation: Operation,
         project: String,
+        submitted_draft: Option<String>,
         cx: &mut Context<Self>,
         job: F,
     ) where
@@ -276,6 +284,7 @@ impl Inspector {
             project,
             Write {
                 operation,
+                submitted_draft,
                 _task: task,
             },
         );
@@ -286,8 +295,8 @@ impl Inspector {
     ///
     /// Hidden, the inspector never hears of a switch from A to B and back, so
     /// a check of the monitor's generation here kept "Committing…" up for
-    /// good. A commit's message is spent either way: its draft is removed, and
-    /// the field cleared only while the field is that project's.
+    /// good. A successful commit removes only the draft that was submitted;
+    /// later edits survive, whether held in the field or saved during a switch.
     pub(super) fn finish_operation(
         &mut self,
         operation: Operation,
@@ -295,13 +304,21 @@ impl Inspector {
         result: Result<String, String>,
         cx: &mut Context<Self>,
     ) {
-        self.composer.writes.remove(project);
+        let submitted_draft = self
+            .composer
+            .writes
+            .remove(project)
+            .and_then(|write| write.submitted_draft);
         let shown = self.project.as_deref() == Some(project);
         let outcome = match result {
             Ok(summary) => {
-                if operation == Operation::Commit {
-                    self.composer.drafts.remove(project);
-                    if shown {
+                if operation == Operation::Commit
+                    && let Some(submitted_draft) = submitted_draft
+                {
+                    if self.composer.drafts.get(project) == Some(&submitted_draft) {
+                        self.composer.drafts.remove(project);
+                    }
+                    if shown && self.composer.field.read(cx).value() == submitted_draft {
                         self.composer
                             .field
                             .update(cx, |field, cx| field.set_value("", cx));

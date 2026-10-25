@@ -62,11 +62,6 @@ impl Group {
         tree.refresh(&process_table(), own_pid());
         tree
     }
-
-    /// Stop everything the leader started: SIGTERM, a grace period, SIGKILL.
-    pub(crate) async fn terminate(self, leader: Option<&mut Child>, grace: Duration) {
-        self.tree().terminate(leader, grace).await;
-    }
 }
 
 /// One row of the process table.
@@ -308,11 +303,6 @@ static RUNNING: Mutex<BTreeMap<libc::pid_t, Watched>> = Mutex::new(BTreeMap::new
 pub(crate) struct Running(libc::pid_t);
 
 impl Running {
-    /// List a provider whose tree nothing else keeps current.
-    pub(crate) fn register(group: Group) -> Self {
-        Self::watching(group, Watched::new(group))
-    }
-
     /// List a provider with the tree its transport keeps current, so Quit
     /// still finds a tool whose provider has already gone.
     pub(crate) fn watching(group: Group, tree: Watched) -> Self {
@@ -728,6 +718,7 @@ time.sleep(60)
         };
         let _reap: Vec<_> = pids.iter().map(|pid| testing::KillOnDrop(*pid)).collect();
         group
+            .tree()
             .terminate(Some(&mut child), Duration::from_millis(500))
             .await;
         for pid in pids {
@@ -768,7 +759,7 @@ time.sleep(60)
             return;
         };
         let _reap: Vec<_> = pids.iter().map(|pid| testing::KillOnDrop(*pid)).collect();
-        let registration = Running::register(group);
+        let registration = Running::watching(group, Watched::new(group));
         let watched = running().get(&group.0).cloned();
         let watched = watched.expect("a running provider is listed");
         // Only this provider: the list is shared by every test in the process.

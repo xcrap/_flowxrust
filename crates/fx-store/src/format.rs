@@ -808,6 +808,14 @@ pub struct PersistedConversation {
     /// Text still in the composer, independent of a submitted prompt awaiting acknowledgment.
     #[serde(rename = "draftText", default)]
     pub draft_text: String,
+    /// Images still in the composer. An absent legacy field falls back to the
+    /// unsent prompt's images; an explicit empty list records their removal.
+    #[serde(
+        rename = "draftAttachments",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub draft_attachments: Option<Vec<fx_core::Attachment>>,
     /// The thread's goal as the provider last reported it, so the row above
     /// the composer is there before the provider is asked again.
     ///
@@ -857,6 +865,10 @@ impl PersistedConversation {
         !self.messages.is_empty()
             || self.unsent_prompt.is_some()
             || !self.draft_text.is_empty()
+            || self
+                .draft_attachments
+                .as_ref()
+                .is_some_and(|images| !images.is_empty())
             || self.session_id.is_some()
             || self.total_tokens > 0
             || self.goal.is_some()
@@ -884,6 +896,7 @@ impl PersistedConversation {
             reported_context_window: None,
             unsent_prompt: None,
             draft_text: String::new(),
+            draft_attachments: None,
             goal: None,
             queued: Vec::new(),
         }

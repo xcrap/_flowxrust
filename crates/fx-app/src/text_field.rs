@@ -324,9 +324,8 @@ impl TextField {
 
     /// Replace the text; used to restore a draft or clear after submit.
     ///
-    /// Goes through the same path as typing, so `max_len` and the single-line
-    /// newline rule hold here too — restoring a draft cannot smuggle in a
-    /// newline or exceed the cap.
+    /// Goes through the same path as typing, including the single-line newline
+    /// rule and input cap. Use `restore_value` for saved work beyond that cap.
     ///
     /// Not an edit, so it is not undoable: the history starts again from here.
     pub fn set_value(&mut self, value: impl Into<String>, cx: &mut Context<Self>) {
@@ -335,6 +334,16 @@ impl TextField {
         self.selection = Selection::collapsed(self.selection.head);
         self.history = UndoHistory::default();
         cx.notify();
+    }
+
+    /// Restore saved work without discarding text beyond the normal input cap.
+    /// A recovered queue may contain several individually valid prompts. Edits
+    /// may keep or reduce that length; clearing returns to the ordinary cap.
+    pub(crate) fn restore_value(&mut self, value: impl Into<String>, cx: &mut Context<Self>) {
+        let max_len = self.max_len;
+        self.max_len = 0;
+        self.set_value(value, cx);
+        self.max_len = max_len;
     }
 
     /// Focus handle, so a caller can move focus to this field.
@@ -387,8 +396,8 @@ impl TextField {
     ///
     /// Every rule that constrains what may live in a field lives here rather
     /// than in each caller, so a single-line field can never gain a newline, a
-    /// '\r' never reaches the value, and `max_len` can never split a
-    /// character, whatever the source.
+    /// '\r' never reaches the value, and the length cap never splits a
+    /// character. Recovered text above the cap may be edited without growing.
     ///
     /// Returns how many characters of `insert` the cap left out, so a caller
     /// that can tell the user does.
@@ -401,7 +410,12 @@ impl TextField {
         self.marked = None;
         let range = sanitize_range(&self.value, range);
         let insert = normalise_line_breaks(insert, self.multiline.is_some());
-        let kept = truncate_to_max_len(&self.value, &range, &insert, self.max_len);
+        let limit = if self.max_len == 0 {
+            0
+        } else {
+            self.max_len.max(self.value.chars().count())
+        };
+        let kept = truncate_to_max_len(&self.value, &range, &insert, limit);
         // What is kept is always a prefix, so the rest is what was dropped.
         let dropped = insert[kept.len()..].chars().count();
 
@@ -2974,6 +2988,39 @@ mod tests {
             assert_eq!(field.read(cx).value(), "abc");
             field.update(cx, |field, cx| field.set_value("a\r\nbc", cx));
             assert_eq!(field.read(cx).value(), "a b");
+        });
+    }
+
+    #[test]
+    fn recovered_text_keeps_unicode_and_returns_to_the_input_cap_when_reduced() {
+        let test = gpui::TestAppContext::single();
+        test.update(|cx| {
+            let field = cx.new(|cx| TextField::new(cx).multiline(4.0).max_len(3));
+            field.update(cx, |field, cx| {
+                field.restore_value("é🦀a\r\nøz", cx);
+                assert_eq!(field.value(), "é🦀a\nøz");
+                assert_eq!(field.value().chars().count(), 6);
+                assert_eq!(field.max_len, 3, "recovery does not raise the normal cap");
+
+                // Replace one character with another of a different byte
+                // length. Saved work stays editable without being truncated.
+                assert_eq!(field.edit(0.."é".len(), "界"), 0);
+                assert_eq!(field.value(), "界🦀a\nøz");
+                let end = field.value.len();
+                assert_eq!(field.edit(end..end, "x"), 1);
+                assert_eq!(field.value(), "界🦀a\nøz", "recovery cannot grow");
+
+                // Once below the ordinary cap, only its remaining room is
+                // available; the former recovered length grants no headroom.
+                field.edit("界🦀".len()..end, "");
+                let end = field.value.len();
+                assert_eq!(field.edit(end..end, "xy"), 1);
+                assert_eq!(field.value(), "界🦀x");
+
+                field.set_value("", cx);
+                assert_eq!(field.edit(0..0, "😀béz"), 1);
+                assert_eq!(field.value(), "😀bé");
+            });
         });
     }
 

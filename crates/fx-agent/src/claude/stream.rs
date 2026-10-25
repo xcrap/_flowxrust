@@ -906,7 +906,10 @@ impl ClaudeStreamParser {
 
         let mut updated = input.clone();
         if let Some(object) = updated.as_object_mut() {
-            let responses: Vec<Value> = question_text_by_id
+            // Claude's tool schema is a record keyed by the original question
+            // text. An array of question/answer pairs fails updatedInput
+            // validation before AskUserQuestion can read the user's answer.
+            let responses: serde_json::Map<String, Value> = question_text_by_id
                 .iter()
                 .map(|(question_id, question)| {
                     let answer = answers
@@ -914,10 +917,10 @@ impl ClaudeStreamParser {
                         .find(|(id, _)| id == question_id)
                         .map(|(_, answer)| answer.clone())
                         .unwrap_or_default();
-                    json!({ "question": question, "answer": answer })
+                    (question.clone(), Value::String(answer))
                 })
                 .collect();
-            object.insert("answers".into(), Value::Array(responses));
+            object.insert("answers".into(), Value::Object(responses));
         }
 
         Some(control_response(
@@ -2005,11 +2008,12 @@ mod tests {
             .expect("a response");
 
         let input = &response["response"]["response"]["updatedInput"];
-        let answers = input["answers"].as_array().expect("answers were set");
+        let answers = input["answers"]
+            .as_object()
+            .expect("answers are keyed by question");
         assert_eq!(answers.len(), 2);
-        assert_eq!(answers[0]["question"], "Which database?");
-        assert_eq!(answers[0]["answer"], "Postgres");
-        assert_eq!(answers[1]["answer"], "eu-west-1");
+        assert_eq!(answers["Which database?"], "Postgres");
+        assert_eq!(answers["Which region?"], "eu-west-1");
     }
 
     #[test]

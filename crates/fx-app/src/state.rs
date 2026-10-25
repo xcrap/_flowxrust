@@ -85,10 +85,10 @@ pub struct AppState {
     /// Claude threads whose context has been asked for this launch, so a
     /// failed or slow check is not repeated on every frame.
     context_probed: HashSet<Uuid>,
-    /// The revision and draft each transcript was last handed to the writer at,
+    /// The revision, draft and image ids each transcript was handed to the writer at,
     /// or read from disk at. A version, never the bytes: the writer compares
     /// content by hash, so nothing here grows with the size of a transcript.
-    saved_conversations: HashMap<Uuid, (u64, String)>,
+    saved_conversations: HashMap<Uuid, (u64, String, Option<Vec<Uuid>>)>,
     /// Encodes and writes transcripts on its own thread.
     writer: crate::conversation_writer::ConversationWriter,
     /// Threads whose transcript is being read in the background.
@@ -825,15 +825,13 @@ impl AppState {
     fn commit_thread_change(&mut self, mut next: PersistedApp, action: &str) -> bool {
         next.sidebar_visible = self.sidebar_visible;
         next.normalize();
-        if serde_json::to_vec(&next)
-            .is_ok_and(|bytes| bytes.len() as u64 > fx_store::format::MAX_PROJECTS_BYTES)
-        {
-            self.last_error = Some(format!(
-                "Could not {action}: native thread metadata exceeds the workspace file size limit. The previous workspace has been preserved."
-            ));
-            return false;
-        }
         if let Err(error) = self.store.save_app(&next) {
+            // A rejected encoding never touched either file, so there is no
+            // partial write to roll back.
+            if matches!(error, fx_store::SaveError::TooLarge { .. }) {
+                self.last_error = Some(format!("Could not {action}: {error}"));
+                return false;
+            }
             let rollback = self.store.save_app(&self.snapshot);
             self.last_error = Some(match rollback {
                 Ok(()) => format!("Could not {action}: {error}"),
@@ -1151,12 +1149,10 @@ impl AppState {
         if let Some(goal) = goal {
             self.composer.goals.insert(agent_id, goal);
         }
-        if !attachments.is_empty() {
-            self.composer
-                .attachments
-                .entry(agent_id)
-                .or_insert(attachments);
-        }
+        self.composer
+            .attachments
+            .entry(agent_id)
+            .or_insert_with(|| Arc::new(attachments));
         if let Some(reason) = failure {
             self.protected_conversations.insert(agent_id);
             self.last_error = Some(format!(
@@ -1181,10 +1177,29 @@ impl AppState {
         }
         if let Some((cost, draft)) = restored {
             self.restored_costs.insert(agent_id, cost);
+            let images = self.attachments(agent_id);
+            if draft.chars().count() > COMPOSER_MAX_CHARACTERS
+                || images.len() > crate::attachments::MAX_PENDING_ATTACHMENTS
+                || images.iter().map(|image| image.data.len()).sum::<usize>()
+                    > crate::attachments::MAX_PENDING_ATTACHMENT_BYTES
+            {
+                self.set_composer_notice(agent_id, Some("Recovered prompts exceed the usual composer limits. All text and images were kept; review them before sending.".into()));
+            }
             // The file holds exactly this, so opening a thread is not a reason
             // to write it back.
-            self.saved_conversations
-                .insert(agent_id, (conversation.revision(), draft.clone()));
+            self.saved_conversations.insert(
+                agent_id,
+                (
+                    conversation.revision(),
+                    draft.clone(),
+                    Some(
+                        self.attachments(agent_id)
+                            .iter()
+                            .map(|image| image.id)
+                            .collect(),
+                    ),
+                ),
+            );
             self.restored_drafts.insert(agent_id, draft);
         }
         let conversation = Arc::new(Mutex::new(conversation));
@@ -1207,7 +1222,7 @@ impl AppState {
             .filter(|draft| !draft.is_empty())
             .cloned()
         {
-            field.update(cx, |field, cx| field.set_value(draft, cx));
+            field.update(cx, |field, cx| field.restore_value(draft, cx));
         }
     }
 
@@ -1247,8 +1262,8 @@ impl AppState {
                 .bare()
                 .placeholder("Ask anything, or describe a task…")
                 .multiline(8.0)
-                .max_len(32_000);
-            field.set_value(initial, cx);
+                .max_len(COMPOSER_MAX_CHARACTERS);
+            field.restore_value(initial, cx);
             field
         });
         // A paste the cap cut short says so: the prompt would otherwise reach
@@ -1573,13 +1588,19 @@ impl AppState {
         self.capture_drafts(cx);
         let applied = self.drain_updates();
         for (agent_id, prompt) in std::mem::take(&mut self.retry_drafts) {
+            // Images alone are a newer draft too. Keep the failed prompt in
+            // its transcript recovery row instead of relabelling these images.
+            if !self.attachments(agent_id).is_empty() {
+                self.composer.retry_attachments.remove(&agent_id);
+                continue;
+            }
             let mut restored = false;
             if let Some(field) = self.drafts.get(&agent_id).cloned() {
                 // Never overwrite a follow-up drafted while startup was pending.
                 // Whitespace is not a follow-up: `prepare_prompt` trims, so a
                 // field holding only "\n" would otherwise swallow the retry.
                 if field.read(cx).value().trim().is_empty() {
-                    field.update(cx, |field, cx| field.set_value(prompt, cx));
+                    field.update(cx, |field, cx| field.restore_value(prompt, cx));
                     restored = true;
                 }
             } else if self
@@ -1597,7 +1618,7 @@ impl AppState {
                 && let Some(images) = images
                 && self.attachments(agent_id).is_empty()
             {
-                self.composer.attachments.insert(agent_id, images);
+                self.composer.attachments.insert(agent_id, Arc::new(images));
             }
         }
         self.clear_accepted_steers(cx);
@@ -2073,12 +2094,6 @@ impl AppState {
         }
         self.snapshot.sidebar_visible = self.sidebar_visible;
         self.snapshot.normalize();
-        if serde_json::to_vec(&self.snapshot)
-            .is_ok_and(|bytes| bytes.len() as u64 > fx_store::format::MAX_PROJECTS_BYTES)
-        {
-            self.last_error = Some("The workspace exceeds its metadata file size limit and could not be saved. The previous saved workspace has been preserved.".into());
-            return;
-        }
         match self.store.save_app(&self.snapshot) {
             Ok(()) => {}
             Err(error) => {
@@ -2125,7 +2140,14 @@ impl AppState {
                 let queued: Vec<Uuid> = conversation.queued().map(|prompt| prompt.id).collect();
                 (conversation.revision(), queued)
             };
-            let version = (revision, draft);
+            let draft_attachments = self.composer.attachments.get(&agent_id).cloned();
+            let version = (
+                revision,
+                draft,
+                draft_attachments
+                    .as_ref()
+                    .map(|images| images.iter().map(|image| image.id).collect()),
+            );
             if self.saved_conversations.get(&agent_id) == Some(&version) {
                 continue;
             }
@@ -2142,6 +2164,7 @@ impl AppState {
                 agent_id,
                 conversation,
                 draft: version.1.clone(),
+                draft_attachments,
                 retry_draft: self.retry_drafts.get(&agent_id).cloned(),
                 goal: self.composer.goals.get(&agent_id).cloned(),
                 cost: self
@@ -2999,6 +3022,7 @@ impl AppState {
 /// together. The original's limits.
 pub const MAX_QUEUED_PROMPTS: usize = 20;
 pub const MAX_QUEUED_ATTACHMENT_BYTES: usize = 64 * 1024 * 1024;
+const COMPOSER_MAX_CHARACTERS: usize = 32_000;
 
 /// What each thread's composer holds besides its text, and what is in flight
 /// on its behalf.
@@ -3008,7 +3032,7 @@ pub const MAX_QUEUED_ATTACHMENT_BYTES: usize = 64 * 1024 * 1024;
 /// all live and die with the thread, and are read together by one view.
 #[derive(Default)]
 pub struct ComposerStore {
-    attachments: HashMap<Uuid, Vec<fx_core::Attachment>>,
+    attachments: HashMap<Uuid, Arc<Vec<fx_core::Attachment>>>,
     preparing: HashMap<Uuid, usize>,
     notices: HashMap<Uuid, String>,
     /// Images of an unaccepted prompt, put back with its text.
@@ -3095,7 +3119,7 @@ impl AppState {
         self.composer
             .attachments
             .get(&agent_id)
-            .map(Vec::as_slice)
+            .map(|images| images.as_slice())
             .unwrap_or_default()
     }
 
@@ -3137,7 +3161,7 @@ impl AppState {
             return;
         }
         let pending = self.composer.attachments.entry(agent_id).or_default();
-        let notice = crate::attachments::admit(pending, prepared);
+        let notice = crate::attachments::admit(Arc::make_mut(pending), prepared);
         self.set_composer_notice(agent_id, notice);
     }
 
@@ -3159,7 +3183,7 @@ impl AppState {
 
     pub fn remove_attachment(&mut self, agent_id: Uuid, attachment_id: Uuid) {
         if let Some(pending) = self.composer.attachments.get_mut(&agent_id) {
-            pending.retain(|attachment| attachment.id != attachment_id);
+            Arc::make_mut(pending).retain(|attachment| attachment.id != attachment_id);
         }
     }
 
@@ -3167,7 +3191,12 @@ impl AppState {
     /// attached since.
     fn release_sent_attachments(&mut self, agent_id: Uuid, sent: &[Uuid]) {
         if let Some(pending) = self.composer.attachments.get_mut(&agent_id) {
-            pending.retain(|attachment| !sent.contains(&attachment.id));
+            Arc::make_mut(pending).retain(|attachment| !sent.contains(&attachment.id));
+            if pending.is_empty() {
+                // No explicit draft remains: a save before acceptance must
+                // recover the submitted prompt's images from its user row.
+                self.composer.attachments.remove(&agent_id);
+            }
         }
     }
 
@@ -3288,7 +3317,7 @@ impl AppState {
                 .placeholder("Edit queued prompt")
                 .multiline(6.0)
                 .max_len(32_000);
-            field.set_value(queued.text.clone(), cx);
+            field.restore_value(queued.text.clone(), cx);
             field
         });
         // The edit has the draft's cap, and says so the same way when a paste
@@ -3651,8 +3680,10 @@ impl AppState {
     ) {
         let field = self.draft(agent_id, cx);
         if field.read(cx).value().trim().is_empty() && self.attachments(agent_id).is_empty() {
-            field.update(cx, |field, cx| field.set_value(text, cx));
-            self.composer.attachments.insert(agent_id, attachments);
+            field.update(cx, |field, cx| field.restore_value(text, cx));
+            self.composer
+                .attachments
+                .insert(agent_id, Arc::new(attachments));
         } else {
             // The draft stays the reader's. The prompt's text fits in the
             // notice, but its images do not, so they join the draft's under
@@ -3661,7 +3692,7 @@ impl AppState {
             if !attachments.is_empty() {
                 let pending = self.composer.attachments.entry(agent_id).or_default();
                 let refused = crate::attachments::admit(
-                    pending,
+                    Arc::make_mut(pending),
                     crate::attachments::Prepared {
                         attachments,
                         errors: Vec::new(),
@@ -4013,7 +4044,7 @@ pub(crate) struct LoadedConversation {
     failure: Option<String>,
     /// The thread's saved goal.
     goal: Option<fx_core::models::ConversationGoal>,
-    /// The unsent prompt's images, when the draft is that prompt.
+    /// Draft images, including recovered queued and legacy unsent prompts.
     attachments: Vec<fx_core::Attachment>,
 }
 
@@ -4032,10 +4063,15 @@ impl LoadedConversation {
 fn read_conversation(store: &Store, project_id: Uuid, agent_id: Uuid) -> LoadedConversation {
     let mut loaded = LoadedConversation::empty(agent_id);
     match store.load_conversation(project_id, agent_id) {
-        Ok(Some(persisted)) if persisted.agent_id == agent_id => {
+        Ok(Some(mut persisted)) if persisted.agent_id == agent_id => {
             // Whitespace is not a draft. A composer holding only a newline
             // must not stand in for the prompt that failed.
-            let draft = if persisted.draft_text.trim().is_empty() {
+            let draft = if persisted.draft_text.trim().is_empty()
+                && persisted
+                    .draft_attachments
+                    .as_ref()
+                    .is_none_or(Vec::is_empty)
+            {
                 persisted
                     .unsent_prompt
                     .as_ref()
@@ -4064,21 +4100,19 @@ fn read_conversation(store: &Store, project_id: Uuid, agent_id: Uuid) -> LoadedC
                 .iter()
                 .flat_map(|prompt| prompt.attachments.iter().cloned())
                 .collect();
+            let draft_images = persisted.draft_attachments.take();
             loaded.goal = persisted.goal.clone();
             loaded.restored = Some((persisted.total_cost_usd, draft));
             restore_conversation(&mut loaded.conversation, persisted);
-            if recover_images {
-                loaded.attachments = unsent_attachments(&loaded.conversation);
-            }
-            if !queued_images.is_empty() {
-                crate::attachments::admit(
-                    &mut loaded.attachments,
-                    crate::attachments::Prepared {
-                        attachments: queued_images,
-                        errors: Vec::new(),
-                    },
-                );
-            }
+            loaded.attachments = match draft_images {
+                Some(images) => images,
+                None if recover_images => unsent_attachments(&loaded.conversation),
+                None => Vec::new(),
+            };
+            // The store already bounded this saved record. Admission limits
+            // apply to newly attached images, never to recovering saved work:
+            // several valid queued prompts can exceed one composer's limit.
+            loaded.attachments.extend(queued_images);
         }
         Ok(None) => {}
         result => {
@@ -5375,6 +5409,177 @@ mod persistence_tests {
                 errors: Vec::new(),
             },
         );
+    }
+
+    #[test]
+    fn draft_images_survive_relaunch_and_image_only_edits_are_saved() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, project, agent, _) = test.update(|cx| workspace(cx, &paths));
+        let first = image(1);
+        let second = image(2);
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                state.draft(agent, cx);
+                attach(state, agent, vec![first.clone()]);
+                state.save_all(cx);
+                assert!(
+                    paths.conversation_file(project, agent).exists(),
+                    "an image alone is a draft"
+                );
+                attach(state, agent, vec![second.clone()]);
+                state.save_all(cx);
+                state.remove_attachment(agent, first.id);
+                state.save_all(cx);
+            });
+        });
+        let reopened = test.update(|cx| cx.new(|cx| AppState::restore(paths.clone(), cx)));
+        test.update(|cx| {
+            reopened.update(cx, |state, cx| {
+                state.conversation(project, agent);
+                assert_eq!(state.attachments(agent), std::slice::from_ref(&second));
+                state
+                    .draft(agent, cx)
+                    .update(cx, |field, cx| field.set_value("keep this draft", cx));
+                state.save_all(cx);
+            });
+        });
+        let reopened = test.update(|cx| cx.new(|cx| AppState::restore(paths, cx)));
+        test.update(|cx| {
+            reopened.update(cx, |state, cx| {
+                state.conversation(project, agent);
+                assert_eq!(state.draft(agent, cx).read(cx).value(), "keep this draft");
+                assert_eq!(state.attachments(agent), &[second]);
+            });
+        });
+    }
+
+    #[test]
+    fn an_image_only_follow_up_keeps_its_own_draft_after_relaunch() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, project, agent, _) = test.update(|cx| workspace(cx, &paths));
+        let follow_up = image(2);
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                state.draft(agent, cx);
+                assert!(state.prepare_prompt_with(agent, "earlier prompt", &[image(1)], cx));
+                attach(state, agent, vec![follow_up.clone()]);
+                // A failure checkpoint can run before its UI drain restores
+                // the rejected prompt into an otherwise empty draft.
+                state.retry_drafts.insert(agent, "earlier prompt".into());
+                state.save_all(cx);
+                state.update_sender_for(agent)(SessionUpdate::Failed {
+                    reason: "CLI unavailable".into(),
+                });
+                state.drain_updates_with_context(cx);
+                assert!(state.draft(agent, cx).read(cx).value().is_empty());
+                state.save_all(cx);
+            });
+        });
+        let reopened = test.update(|cx| cx.new(|cx| AppState::restore(paths, cx)));
+        test.update(|cx| {
+            reopened.update(cx, |state, cx| {
+                state.conversation(project, agent);
+                assert!(state.draft(agent, cx).read(cx).value().is_empty());
+                assert_eq!(state.attachments(agent), &[follow_up]);
+            });
+        });
+    }
+
+    #[test]
+    fn removing_a_failed_prompts_image_is_preserved_on_relaunch() {
+        for prompt in ["look at this", ""] {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = AppPaths::at(temp.path().join("state"));
+            let test = gpui::TestAppContext::single();
+            let (state, project, agent, _) = test.update(|cx| workspace(cx, &paths));
+            test.update(|cx| {
+                state.update(cx, |state, cx| {
+                    let shot = image(1);
+                    assert!(state.prepare_prompt_with(agent, prompt, &[shot], cx));
+                    state.update_sender_for(agent)(SessionUpdate::Failed {
+                        reason: "CLI unavailable".into(),
+                    });
+                    state.drain_updates_with_context(cx);
+                    let restored = state.attachments(agent)[0].id;
+                    state.remove_attachment(agent, restored);
+                    state.save_all(cx);
+                });
+            });
+            let reopened = test.update(|cx| cx.new(|cx| AppState::restore(paths, cx)));
+            test.update(|cx| {
+                reopened.update(cx, |state, cx| {
+                    state.conversation(project, agent);
+                    assert_eq!(state.draft(agent, cx).read(cx).value(), prompt);
+                    assert!(
+                        state.attachments(agent).is_empty(),
+                        "an explicitly removed image must not return from the unsent row"
+                    );
+                });
+            });
+        }
+    }
+
+    #[test]
+    fn recovered_queues_keep_all_text_and_images_across_repeated_relaunches() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, project, agent, _) = test.update(|cx| workspace(cx, &paths));
+        let first = "é".repeat(20_000);
+        let second = "🦀".repeat(20_000);
+        let shots: Vec<_> = (1..=12).map(image).collect();
+        let draft_image = image(99);
+        let expected_images: Vec<_> = std::iter::once(draft_image.clone())
+            .chain(shots.iter().cloned())
+            .collect();
+        let mut expected = format!("draft\n\n{first}\n\n{second}");
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                state
+                    .draft(agent, cx)
+                    .update(cx, |field, cx| field.set_value("draft", cx));
+                attach(state, agent, vec![draft_image]);
+                state
+                    .enqueue_prompt(agent, &first, shots[..6].to_vec(), cx)
+                    .unwrap();
+                state
+                    .enqueue_prompt(agent, &second, shots[6..].to_vec(), cx)
+                    .unwrap();
+                state.save_all(cx);
+            });
+        });
+        for _ in 0..2 {
+            let reopened = test.update(|cx| cx.new(|cx| AppState::restore(paths.clone(), cx)));
+            test.update(|cx| {
+                reopened.update(cx, |state, cx| {
+                    let conversation = state.conversation(project, agent);
+                    let field = state.draft(agent, cx);
+                    assert_eq!(field.read(cx).value(), expected);
+                    assert_eq!(state.attachments(agent), expected_images);
+                    assert_eq!(conversation.lock().unwrap().queued_count(), 0);
+                    assert!(
+                        state.take_ready_queues().is_empty(),
+                        "recovery never sends on its own"
+                    );
+                    assert!(
+                        state
+                            .composer_notice(agent)
+                            .unwrap()
+                            .contains("All text and images were kept")
+                    );
+                    // Editing the recovered draft must save the merged images,
+                    // not depend on the original queued record surviving.
+                    expected = expected.replacen("draft", "DRAFT", 1);
+                    field.update(cx, |field, cx| field.set_value(expected.clone(), cx));
+                    state.save_all(cx);
+                    assert!(state.last_error.is_none(), "{:?}", state.last_error);
+                });
+            });
+        }
     }
 
     #[test]

@@ -2902,8 +2902,8 @@ for worker in workers: worker.join()
             .find(|item| item["type"] == "control_response")
             .unwrap();
         let answers = &response["response"]["response"]["updatedInput"]["answers"];
-        assert_eq!(answers[0]["answer"], "SQLite");
-        assert_eq!(answers[1]["answer"], "eu-west");
+        assert_eq!(answers["Which database?"], "SQLite");
+        assert_eq!(answers["Which region?"], "eu-west");
         assert!(lock(&conversation).pending_questions().is_empty());
     }
 
