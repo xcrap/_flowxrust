@@ -57,6 +57,9 @@ def prompt_of(message):
 def emit_init():
     send({"type": "system", "subtype": "init",
           "session_id": "fake-session", "model": "fake-model"})
+    # Every turn's first request, which is where Claude reads what was queued
+    # for it, steers included.
+    send({"type": "system", "subtype": "status", "status": "requesting"})
 
 def emit_result(text):
     # Streamed first and repeated in the assembled message, because that is what

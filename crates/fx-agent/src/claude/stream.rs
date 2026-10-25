@@ -392,12 +392,13 @@ impl ClaudeStreamParser {
             }
             // A request is going out. Claude gathers what it has queued just
             // before, so a notification that arrived earlier in the turn goes
-            // with it and is answered in this turn.
+            // with it and is answered in this turn, and a steer written since
+            // the last request is read here.
             Some("status")
                 if envelope.get("status").and_then(Value::as_str) == Some("requesting") =>
             {
                 self.notified_in_turn = false;
-                Vec::new()
+                vec![ProviderEvent::Lifecycle(Lifecycle::Requesting)]
             }
             Some("compact_boundary") => vec![ProviderEvent::Lifecycle(Lifecycle::Compacted)],
             Some("task_started") => self.task_started(envelope),
@@ -2371,6 +2372,20 @@ mod tests {
         assert!(
             !parser.saw_text_delta(),
             "a subagent's delta suppressed the reply"
+        );
+    }
+
+    #[test]
+    fn a_request_going_out_is_reported_as_one() {
+        // The point where Claude reads what was queued for it, steers
+        // included, so the conversation can put them there.
+        let mut parser = ClaudeStreamParser::new();
+        let events = parser.events(&line(
+            json!({"type": "system", "subtype": "status", "status": "requesting"}),
+        ));
+        assert_eq!(
+            events,
+            vec![ProviderEvent::Lifecycle(Lifecycle::Requesting)]
         );
     }
 

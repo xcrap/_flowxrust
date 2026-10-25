@@ -351,6 +351,8 @@ pub struct Conversation {
     /// new one begins. Every segment is drawn in the same place, so this is
     /// what tells one reply's text from the next.
     streaming_segment: u64,
+    /// Guidance the provider has taken but not read yet, in the order sent.
+    steers: Vec<Arc<ConversationMessage>>,
     phase: Phase,
     error: Option<String>,
     queued: VecDeque<QueuedPrompt>,
@@ -433,6 +435,38 @@ impl Conversation {
     /// send.
     pub fn replace_messages(&mut self, messages: Vec<ConversationMessage>) {
         self.messages = messages.into_iter().map(Arc::new).collect();
+        self.trim();
+        self.message_revision += 1;
+        self.touch();
+    }
+
+    /// Hold guidance until the provider reads it.
+    ///
+    /// Claude reads a steer at its next request, not when it is written: one
+    /// sent mid-sentence is read after that sentence and the calls it leads
+    /// to, which is where Claude's own history records it. Placed on arrival
+    /// it split the sentence around it, and the history, which has the
+    /// sentence whole, could never be matched again.
+    pub fn hold_steer(&mut self, message: ConversationMessage) {
+        self.steers.push(Arc::new(message));
+        self.touch();
+    }
+
+    /// Guidance taken but not read yet, which a view draws after the live
+    /// reply.
+    pub fn held_steers(&self) -> &[Arc<ConversationMessage>] {
+        &self.steers
+    }
+
+    /// Land held guidance in the transcript, after whatever streamed before
+    /// it. The same messages, not copies, so a view that drew them while they
+    /// waited sees the rows it already measured.
+    pub fn place_steers(&mut self) {
+        if self.steers.is_empty() {
+            return;
+        }
+        self.commit_streaming();
+        self.messages.extend(std::mem::take(&mut self.steers));
         self.trim();
         self.message_revision += 1;
         self.touch();
@@ -1054,6 +1088,7 @@ impl Conversation {
                             self.set_phase(Phase::Starting);
                         }
                     }
+                    L::Requesting => self.place_steers(),
                 }
             }
             ProviderEvent::TextDelta(delta) => {
@@ -1743,6 +1778,56 @@ mod tests {
 
         c.apply(ProviderEvent::TextDelta("Picking up where".into()));
         assert_eq!(c.phase(), Phase::Running, "the retry left it on Starting");
+    }
+
+    #[test]
+    fn a_steer_held_mid_sentence_lands_where_the_next_request_reads_it() {
+        // Claude reads a steer at its next request. Placed on arrival, it split
+        // the sentence streaming at the time in two, around itself, where
+        // Claude's history has the sentence whole and the steer after the call
+        // it led to.
+        let mut c = Conversation::new(Uuid::nil());
+        c.apply(ProviderEvent::Lifecycle(
+            crate::provider::Lifecycle::TurnStarted,
+        ));
+        c.apply(ProviderEvent::TextDelta("Let me check th".into()));
+        c.hold_steer(user_message("Use the staging config"));
+        assert_eq!(c.held_steers().len(), 1);
+        assert_eq!(c.message_count(), 0, "the steer split the live sentence");
+
+        c.apply(ProviderEvent::TextDelta("e config file.".into()));
+        c.apply(ProviderEvent::TextEnd);
+        c.apply(ProviderEvent::ToolUse {
+            id: "t1".into(),
+            name: "Read".into(),
+            input: "{}".into(),
+        });
+        c.apply(ProviderEvent::ToolResult {
+            id: "t1".into(),
+            content: "env = production".into(),
+            is_error: false,
+        });
+        assert_eq!(c.held_steers().len(), 1, "placed before Claude read it");
+        let held = c.held_steers()[0].clone();
+
+        c.apply(ProviderEvent::Lifecycle(
+            crate::provider::Lifecycle::Requesting,
+        ));
+        c.apply(ProviderEvent::TextDelta("Switching to staging.".into()));
+        c.apply(ProviderEvent::TextEnd);
+        assert!(c.held_steers().is_empty());
+        let roles_and_text: Vec<(MessageRole, String)> = c
+            .messages()
+            .map(|message| (message.role, message.text_content()))
+            .collect();
+        assert_eq!(roles_and_text[0].1, "Let me check the config file.");
+        assert_eq!(
+            roles_and_text[3],
+            (MessageRole::User, "Use the staging config".into())
+        );
+        assert_eq!(roles_and_text[4].1, "Switching to staging.");
+        // The message the view drew while it waited, not a copy of it.
+        assert!(Arc::ptr_eq(c.shared_messages().nth(3).unwrap(), &held));
     }
 
     #[test]

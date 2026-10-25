@@ -101,6 +101,9 @@ const PROMPT_BODY_SELECTOR: &str = "transcript.prompt-body";
 const PROMPT_TOGGLE_SELECTOR: &str = "transcript.prompt-toggle";
 const MESSAGE_COPY_SELECTOR: &str = "transcript.copy-message";
 const STREAMING_SELECTOR: &str = "transcript.streaming";
+const HELD_STEER_SELECTOR: &str = "transcript.held-steer";
+/// What a steer waiting for the provider to read it says about itself.
+const HELD_STEER_NOTE: &str = "Read at the next step";
 /// A group's title, followed by the title itself, so a test can read it.
 const ACTIVITY_TITLE_PREFIX: &str = "transcript.activity-title:";
 /// The step a live group is on, under its header.
@@ -377,6 +380,7 @@ impl ThreadMemory {
                         // to it.
                         RowPlan::Plan { .. }
                         | RowPlan::Tail
+                        | RowPlan::Steer(_)
                         | RowPlan::Tasks
                         | RowPlan::Failure => {
                             return None;
@@ -647,6 +651,10 @@ enum RowPlan {
     },
     /// The reply still being written, or the indicator standing in for one.
     Tail,
+    /// Guidance the provider has taken but not read yet: an index into the
+    /// snapshot's held steers. After the tail, because it is read after the
+    /// reply streaming now, and becomes a message there when it is.
+    Steer(usize),
     /// The latest turn's background tasks, running and finished.
     ///
     /// After the tail, so a follow-up's reply streams in above the block and
@@ -662,6 +670,8 @@ enum RowPlan {
 struct Rows {
     plan: Rc<[RowPlan]>,
     tail: bool,
+    /// How many held steers follow the tail.
+    steers: usize,
     tasks: bool,
     failure: bool,
 }
@@ -670,6 +680,7 @@ impl Rows {
     fn len(&self) -> usize {
         self.plan.len()
             + usize::from(self.tail)
+            + self.steers
             + usize::from(self.tasks)
             + usize::from(self.failure)
     }
@@ -678,19 +689,28 @@ impl Rows {
         if let Some(row) = self.plan.get(index) {
             return Some(row.clone());
         }
-        [
-            (self.tail, RowPlan::Tail),
+        let tail = self.tail.then_some(RowPlan::Tail);
+        let steers = (0..self.steers).map(RowPlan::Steer);
+        let rest = [
             (self.tasks, RowPlan::Tasks),
             (self.failure, RowPlan::Failure),
         ]
         .into_iter()
         .filter(|(shown, _)| *shown)
-        .map(|(_, row)| row)
-        .nth(index - self.plan.len())
+        .map(|(_, row)| row);
+        tail.into_iter()
+            .chain(steers)
+            .chain(rest)
+            .nth(index - self.plan.len())
     }
 
     fn tail_index(&self) -> Option<usize> {
         self.tail.then_some(self.plan.len())
+    }
+
+    /// The row a held steer is drawn in.
+    fn steer_index(&self, steer: usize) -> Option<usize> {
+        (steer < self.steers).then(|| self.plan.len() + usize::from(self.tail) + steer)
     }
 
     /// What each row's height depends on, as far as the conversation decides.
@@ -724,6 +744,15 @@ impl Rows {
                     is_live,
                 },
                 RowPlan::Tail => RowStamp::Tail(snapshot.streaming_revision),
+                // The same message the transcript takes when it is read, so
+                // landing there is the same row and measures nothing again.
+                RowPlan::Steer(index) => {
+                    let message = &snapshot.steers[index];
+                    RowStamp::Message {
+                        id: message.id,
+                        message: Arc::downgrade(message),
+                    }
+                }
                 RowPlan::Tasks => RowStamp::Tasks(snapshot.tasks_revision),
                 RowPlan::Failure => RowStamp::Failure(snapshot.error.clone(), snapshot.recovery),
             })
@@ -1150,7 +1179,11 @@ fn build_rows<'a>(
                 index,
                 is_active,
             ))),
-            RowPlan::Plan { .. } | RowPlan::Tail | RowPlan::Tasks | RowPlan::Failure => None,
+            RowPlan::Plan { .. }
+            | RowPlan::Tail
+            | RowPlan::Steer(_)
+            | RowPlan::Tasks
+            | RowPlan::Failure => None,
         })
         .collect()
 }
@@ -1305,6 +1338,8 @@ pub(crate) struct Snapshot {
     streaming_revision: u64,
     streaming: Rc<str>,
     streaming_segment: u64,
+    /// Guidance taken but not read yet, drawn after the live reply.
+    steers: Rc<[Arc<ConversationMessage>]>,
     phase: Phase,
     busy: bool,
     waiting_for_user: bool,
@@ -1501,6 +1536,7 @@ pub(crate) fn snapshot(conversation: &crate::Conversation) -> Snapshot {
         streaming_revision,
         streaming,
         streaming_segment: conversation.streaming_segment(),
+        steers: conversation.held_steers().iter().cloned().collect(),
         phase: conversation.phase(),
         busy,
         waiting_for_user: conversation.is_waiting_for_user(),
@@ -1558,6 +1594,7 @@ fn render(mut snapshot: Snapshot, window: &mut Window, cx: &mut App) -> AnyEleme
     let rows = Rows {
         plan,
         tail: has_tail(&snapshot, has_active_group),
+        steers: snapshot.steers.len(),
         tasks: !snapshot.tasks.is_empty(),
         failure: snapshot.error.is_some(),
     };
@@ -1706,6 +1743,7 @@ fn row_element(
         }
         RowPlan::Tail => streaming_tail(snapshot, frame, has_active_group)
             .unwrap_or_else(|| div().into_any_element()),
+        RowPlan::Steer(index) => held_steer(&snapshot.steers[*index], snapshot, cx),
         RowPlan::Tasks => background_tasks(&snapshot.tasks, Instant::now(), frame),
         RowPlan::Failure => match snapshot.error.as_deref() {
             Some(error) => error_banner(error, snapshot),
@@ -2058,6 +2096,28 @@ fn image_menu() -> MenuModel {
 }
 
 /// One transcript row. A bubble for the reader's own prompts, prose for the rest.
+/// Guidance the provider has taken but not read yet: the reader's message,
+/// with a line saying it waits for the next step.
+fn held_steer(message: &ConversationMessage, snapshot: &Snapshot, cx: &App) -> AnyElement {
+    let theme = global::current();
+    div()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .items_end()
+        .gap(px_len(Spacing::XS))
+        .child(
+            div()
+                .debug_selector(|| HELD_STEER_SELECTOR.to_string())
+                .fx_caption()
+                .text_color(Colors::fg_tertiary(&theme))
+                .child(SharedString::from(HELD_STEER_NOTE)),
+        )
+        .child(message_row(message, snapshot, cx))
+        .into_any_element()
+}
+
 fn message_row(message: &ConversationMessage, snapshot: &Snapshot, cx: &App) -> AnyElement {
     let theme = global::current();
     let is_user = message.role == MessageRole::User;
@@ -2654,7 +2714,14 @@ impl selection::Document for TranscriptDocument {
             None => key,
         };
         let id: Uuid = head.get(..36)?.parse().ok()?;
-        self.heads.get(&id).copied()
+        self.heads.get(&id).copied().or_else(|| {
+            let steer = self
+                .snapshot
+                .steers
+                .iter()
+                .position(|steer| steer.id == id)?;
+            self.rows.steer_index(steer)
+        })
     }
 
     fn paragraphs(&self, row: usize) -> Vec<Paragraph> {
@@ -2676,6 +2743,7 @@ impl selection::Document for TranscriptDocument {
             Some(RowPlan::Tail) if !snapshot.streaming.trim().is_empty() => {
                 crate::markdown::paragraphs(&snapshot.streaming, streaming_id(snapshot))
             }
+            Some(RowPlan::Steer(index)) => message_paragraphs(&snapshot.steers[index], snapshot.id),
             // Status, not prose: the block is read, not copied from.
             Some(RowPlan::Tail | RowPlan::Tasks | RowPlan::Failure) | None => Vec::new(),
         }
@@ -5873,6 +5941,33 @@ mod tests {
     }
 
     #[test]
+    fn a_steer_waiting_to_be_read_is_drawn_after_the_live_reply() {
+        // Claude reads it after the sentence streaming now, so that is where
+        // it waits, saying so, and where it becomes a message once read.
+        let mut conversation = Conversation::new(Uuid::new_v4());
+        conversation.apply(ProviderEvent::Lifecycle(Lifecycle::TurnStarted));
+        conversation.apply(ProviderEvent::TextDelta("Let me check th".into()));
+        conversation.hold_steer(text(MessageRole::User, "Use the staging config"));
+        let (_test, mut visual) = open(conversation, 700.0, 600.0);
+        let reply = visual
+            .debug_bounds(STREAMING_SELECTOR)
+            .expect("the live reply is drawn");
+        let note = visual
+            .debug_bounds(HELD_STEER_SELECTOR)
+            .expect("the steer is drawn while it waits");
+        assert!(
+            note.top() >= reply.bottom(),
+            "the steer was drawn above the sentence it waits behind"
+        );
+        assert!(
+            crate::selection::tests::painted_paragraphs()
+                .iter()
+                .any(|(_, text, _)| text == "Use the staging config"),
+            "the reader's own words went undrawn"
+        );
+    }
+
+    #[test]
     fn a_selection_in_the_live_reply_does_not_come_back_over_the_next_one() {
         // Every streamed segment is drawn in the tail. Under one id for all of
         // them, a selection made in one reply reappeared over the next, and
@@ -6423,6 +6518,7 @@ mod tests {
                     is_live: true,
                 }]),
                 tail: false,
+                steers: 0,
                 tasks: false,
                 failure: false,
             }

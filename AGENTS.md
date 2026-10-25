@@ -560,7 +560,7 @@ refusal failed the call with nothing on screen to say why.
 ## The transcript
 
 The transcript carries tool calls as first-class rows, not only as the activity
-strip above it. Four rules, each of which is a bug that was written first:
+strip above it. Five rules, each of which is a bug that was written first:
 
 - **`Done` commits the streaming buffer, never clears it.** Clearing discards the
   turn's last — often only — sentence, so the final answer never appears.
@@ -576,6 +576,15 @@ strip above it. Four rules, each of which is a bug that was written first:
   first result. It tracks completion for the spinner; that is all — so only
   the result claims it. Claiming the call as it started made every running call
   read as finished.
+- **A steer lands where the provider reads it.** Codex takes one when it
+  accepts it, so its row goes in then. Claude reads one at its next request,
+  reported as `status: requesting`, so the row is held (`hold_steer`), drawn
+  after the live reply, and placed at that frame or when the turn ends.
+  Placed when it was written, a steer sent mid-sentence split the sentence
+  around itself, and Claude's history, which keeps the sentence whole and the
+  steer after the call it led to, never matched that thread again. Both fakes
+  send `requesting` at every turn that asks the model anything, as the CLI
+  does, and never in a zero-turn acknowledgement.
 
 Tool output is read from `aggregatedOutput` first, then `output`, `result`,
 `error`, `contentItems`, `changes`, `results`, `agentsStates` — that order is the

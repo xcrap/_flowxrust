@@ -3956,6 +3956,13 @@ pub fn persisted_from(conversation: &Conversation) -> PersistedConversation {
             conversation.streaming_text(),
         ));
     }
+    // Sent, if not read yet: a quit mid-turn must not lose them.
+    persisted.messages.extend(
+        conversation
+            .held_steers()
+            .iter()
+            .map(|message| (**message).clone()),
+    );
     persisted.session_id = conversation.session_id().map(str::to_string);
     let usage = conversation.usage();
     persisted.total_input_tokens = usage.input_tokens;
@@ -7786,6 +7793,76 @@ mod native_sync_tests {
             &carried[2].content[0],
             fx_core::MessageContent::ToolUse { input, .. } if input.contains("ls")
         ));
+    }
+
+    #[test]
+    fn a_steer_sent_mid_sentence_matches_the_history_that_has_the_sentence_whole() {
+        // Claude's history keeps the sentence whole and records the steer
+        // after the call it led to. Placed when it was written, the steer split
+        // the live sentence, and the check never passed for that thread again.
+        use fx_agent::ProviderEvent;
+        use fx_agent::provider::Lifecycle;
+        let steer = || ConversationMessage::text(MessageRole::User, "Use the staging config");
+        let turn = |hold: bool| {
+            let mut conversation = Conversation::new(Uuid::new_v4());
+            conversation.append(ConversationMessage::text(
+                MessageRole::User,
+                "Fix the deploy",
+            ));
+            conversation.apply(ProviderEvent::Lifecycle(Lifecycle::TurnStarted));
+            conversation.apply(ProviderEvent::TextDelta("Let me check th".into()));
+            if hold {
+                conversation.hold_steer(steer());
+            } else {
+                conversation.commit_streaming();
+                conversation.append(steer());
+            }
+            conversation.apply(ProviderEvent::TextDelta("e config file.".into()));
+            conversation.apply(ProviderEvent::TextEnd);
+            conversation.apply(ProviderEvent::ToolUse {
+                id: "t1".into(),
+                name: "Read".into(),
+                input: "{}".into(),
+            });
+            conversation.apply(ProviderEvent::ToolResult {
+                id: "t1".into(),
+                content: "env = production".into(),
+                is_error: false,
+            });
+            conversation.apply(ProviderEvent::Lifecycle(Lifecycle::Requesting));
+            conversation.apply(ProviderEvent::TextDelta("Switching to staging.".into()));
+            conversation.apply(ProviderEvent::Done {
+                stop_reason: "end_turn".into(),
+            });
+            conversation
+        };
+        let history = [
+            ConversationMessage::text(MessageRole::User, "Fix the deploy"),
+            ConversationMessage::text(MessageRole::Assistant, "Let me check the config file."),
+            ConversationMessage::new(
+                MessageRole::Assistant,
+                vec![fx_core::MessageContent::ToolUse {
+                    id: "t1".into(),
+                    name: "Read".into(),
+                    input: "{}".into(),
+                }],
+            ),
+            ConversationMessage::new(
+                MessageRole::Tool,
+                vec![fx_core::MessageContent::ToolResult {
+                    id: "t1".into(),
+                    content: "env = production".into(),
+                    is_error: false,
+                }],
+            ),
+            steer(),
+            ConversationMessage::text(MessageRole::Assistant, "Switching to staging."),
+        ];
+        assert!(native_contains_local_tail(turn(true).messages(), &history));
+        assert!(
+            !native_contains_local_tail(turn(false).messages(), &history),
+            "the split this replaces matched after all, so the test proves nothing"
+        );
     }
 
     #[test]

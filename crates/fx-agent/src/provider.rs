@@ -192,6 +192,9 @@ pub enum Lifecycle {
     Compacting,
     Compacted,
     Preparing,
+    /// A request to the model is going out, carrying whatever was queued for
+    /// it. Claude reads a steer here, not when it is written.
+    Requesting,
 }
 
 #[derive(Debug, Clone, PartialEq)]

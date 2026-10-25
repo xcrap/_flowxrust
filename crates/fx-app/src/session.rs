@@ -1091,15 +1091,20 @@ impl Job {
     /// Land accepted guidance in the transcript, then report the outcome.
     ///
     /// The row is added here rather than by the UI so it sits where the
-    /// provider took it: after the prose streamed so far, before the reply.
+    /// provider took it. Codex takes a steer when it accepts it: after the
+    /// prose streamed so far, before the reply. Claude takes one at its next
+    /// request, so the row waits for that, drawn after the live reply, rather
+    /// than splitting a sentence Claude finishes before reading it.
     fn steer_finished(&self, steer: Steer, result: Result<(), String>) {
         if result.is_ok() {
             let mut conversation = lock(&self.conversation);
-            conversation.commit_streaming();
-            conversation.append(crate::attachments::user_message(
-                &steer.text,
-                &steer.attachments,
-            ));
+            let message = crate::attachments::user_message(&steer.text, &steer.attachments);
+            if matches!(self.provider, RuntimeProvider::Claude { .. }) {
+                conversation.hold_steer(message);
+            } else {
+                conversation.commit_streaming();
+                conversation.append(message);
+            }
         }
         emit(
             &self.on_update,
@@ -1332,6 +1337,9 @@ impl Job {
         // would discard the turn's last and often only sentence. `fail` commits
         // for the same reason.
         conversation.commit_streaming();
+        // Guidance no request read is still the reader's, and stays where they
+        // can see it: at the end, after the turn's last words.
+        conversation.place_steers();
         // The process is gone, and the tasks with it. A spinner left on one
         // would never stop.
         conversation.stop_running_tasks(match outcome {
@@ -1367,6 +1375,7 @@ impl Job {
         };
         let mut conversation = lock(&self.conversation);
         conversation.commit_streaming();
+        conversation.place_steers();
         conversation.stop_running_tasks("Ended when the turn failed.");
         conversation.set_error(reason.clone());
         drop(conversation);
@@ -2390,6 +2399,12 @@ def finish(text, origin=None):
     send(result)
 def init():
     send({"type":"system","subtype":"init","session_id":SESSION})
+def turn():
+    # A turn that asks the model something opens with a request, which is
+    # where Claude reads what was queued for it, steers included. A zero-turn
+    # acknowledgement makes none.
+    init()
+    send({"type":"system","subtype":"status","status":"requesting","session_id":SESSION})
 # The origin of the turn a permission's answer completes, when it is a
 # follow-up's.
 ANSWER_ORIGIN=[]
@@ -2398,12 +2413,12 @@ def task_ended():
     send({"type":"system","subtype":"task_notification","task_id":"task-1","tool_use_id":"tool-bg","status":"completed","output_file":"/tmp/task-1","summary":"Agent \"review the transport\" completed","usage":{"total_tokens":1200,"tool_uses":4,"duration_ms":60}})
 def follow_up():
     # Claude answers a task's notification as a turn of its own.
-    init()
+    turn()
     finish("finished", "task-notification")
 def background(prompt):
     # The shape Claude Code 2.1.283 writes for an `Agent` call with
     # `run_in_background`, as captured from a real run.
-    init()
+    turn()
     send({"type":"assistant","message":{"content":[{"type":"tool_use","id":"tool-bg","name":"Agent","input":{"description":"review the transport","subagent_type":"general-purpose","run_in_background":True}}]}})
     send({"type":"system","subtype":"task_started","task_id":"task-1","tool_use_id":"tool-bg","description":"review the transport","subagent_type":"general-purpose","is_backgrounded":True,"task_type":"local_agent"})
     send({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tool-bg","content":"Async agent launched successfully."}]}})
@@ -2427,7 +2442,7 @@ def background(prompt):
         finish("started")
         def later():
             time.sleep(0.2)
-            init()
+            turn()
             ANSWER_ORIGIN.append("task-notification")
             send({"type":"control_request","request_id":"control-f","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"tool-f","input":{"command":"cargo test"}}})
         worker=threading.Thread(target=later)
@@ -2469,8 +2484,21 @@ for line in sys.stdin:
         if prompt.startswith("background"):
             background(prompt)
             continue
-        init()
+        turn()
         if prompt=="hang": continue
+        if prompt=="mid-sentence":
+            # Guidance written while Claude is halfway through a sentence is
+            # read at its next request, after the sentence and the call it
+            # leads to, which is where its history records it.
+            send({"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Let me check th"}}})
+            record(json.loads(sys.stdin.readline()))
+            send({"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"e config file."}}})
+            send({"type":"assistant","message":{"content":[{"type":"text","text":"Let me check the config file."}]}})
+            send({"type":"assistant","message":{"content":[{"type":"tool_use","id":"tool-c","name":"Read","input":{"file_path":"config.toml"}}]}})
+            send({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tool-c","content":"env = production"}]}})
+            send({"type":"system","subtype":"status","status":"requesting","session_id":SESSION})
+            finish("Switching to staging.")
+            continue
         if prompt=="read":
             send({"type":"control_request","request_id":"control-1","request":{"subtype":"can_use_tool","tool_name":"Read","tool_use_id":"tool-1","input":{"file_path":"Cargo.toml"}}})
             continue
@@ -3597,6 +3625,42 @@ for line in sys.stdin:
                 "{path} outlived the turn"
             );
         }
+    }
+
+    #[test]
+    fn a_steer_claude_takes_mid_sentence_lands_where_its_history_puts_it() {
+        // Claude reads guidance at its next request. Placed when it was
+        // written, the row split the sentence streaming at the time, and the
+        // provider's history, which has the sentence whole and the guidance
+        // after the call, never matched the thread again.
+        let Some(server) = ClaudeFixture::new() else {
+            return;
+        };
+        let conversation = conversation();
+        let (runner, recorder) =
+            server.start(&conversation, "mid-sentence", AgentAccess::FullAccess);
+        wait_until(&recorder, "the sentence to start", || {
+            lock(&conversation).streaming_text() == "Let me check th"
+        });
+        let id = Uuid::new_v4();
+        assert!(runner.steer(id, "use staging".into(), Vec::new()));
+        let updates = recorder.wait_for_end(TURN_BUDGET);
+
+        assert!(
+            updates.contains(&SessionUpdate::Steered { id, result: Ok(()) }),
+            "{updates:?}"
+        );
+        assert_eq!(
+            rows(&conversation),
+            [
+                "text: Let me check the config file.",
+                "call: Read",
+                "result",
+                "text: use staging",
+                "text: Switching to staging."
+            ],
+            "the guidance must sit where Claude read it"
+        );
     }
 
     #[test]

@@ -1930,7 +1930,10 @@ mod process {
         assert_eq!(
             events
                 .iter()
-                .filter(|event| matches!(event, ProviderEvent::Lifecycle(_)))
+                .filter(|event| matches!(
+                    event,
+                    ProviderEvent::Lifecycle(crate::provider::Lifecycle::TurnStarted)
+                ))
                 .count(),
             1,
             "{events:?}"
