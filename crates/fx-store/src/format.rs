@@ -117,8 +117,35 @@ where
     D: serde::Deserializer<'de>,
     T: serde::de::DeserializeOwned + Default,
 {
+    decode_or(deserializer, T::default)
+}
+
+/// Read one field, and a value it cannot hold as `fallback`.
+fn decode_or<'de, D, T>(deserializer: D, fallback: fn() -> T) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
     let value = serde_json::Value::deserialize(deserializer)?;
-    Ok(serde_json::from_value(value).unwrap_or_default())
+    Ok(serde_json::from_value(value).unwrap_or_else(|_| fallback()))
+}
+
+/// `deserialize_with` functions for fields whose default is not their type's,
+/// so a malformed value reads as the same default an absent one does: `false`
+/// for a visible sidebar, or `0.0` for a panel width, is a value nobody chose.
+macro_rules! or_field_default {
+    ($($name:ident: $type:ty = $default:expr;)*) => {$(
+        fn $name<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<$type, D::Error> {
+            decode_or(deserializer, $default)
+        }
+    )*};
+}
+
+or_field_default! {
+    deserialize_or_true: bool = default_true;
+    deserialize_panel_width: f32 = default_panel_width;
+    deserialize_min_panel_width: f32 = default_min_panel_width;
+    deserialize_max_panel_width: f32 = default_max_panel_width;
 }
 
 /// List elements that did not decode, kept verbatim for the next save.
@@ -293,6 +320,10 @@ impl Default for PersistedPreferences {
 ///
 /// The derives are `remote = "Self"` so the hand-written impls below can wrap
 /// them: the `projects` list is decoded one element at a time first.
+///
+/// Every other field is lenient. The backup holds the same bytes as the
+/// primary, so one malformed layout value here fails both copies and hides
+/// every project.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(remote = "Self")]
 pub struct PersistedApp {
@@ -301,11 +332,19 @@ pub struct PersistedApp {
     /// Projects this build could not read, written back unchanged.
     #[serde(skip)]
     pub unreadable: Unreadable,
-    #[serde(rename = "activeProjectId")]
+    #[serde(
+        rename = "activeProjectId",
+        default,
+        deserialize_with = "deserialize_or_default"
+    )]
     pub active_project_id: Option<Uuid>,
-    #[serde(rename = "activeAgentId")]
+    #[serde(
+        rename = "activeAgentId",
+        default,
+        deserialize_with = "deserialize_or_default"
+    )]
     pub active_agent_id: Option<Uuid>,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", deserialize_with = "deserialize_or_true")]
     pub sidebar_visible: bool,
     #[serde(
         rename = "sidebarWidth",
@@ -313,14 +352,26 @@ pub struct PersistedApp {
         deserialize_with = "deserialize_sidebar_width"
     )]
     pub sidebar_width: f32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_or_default")]
     pub right_panel_visible: bool,
-    #[serde(rename = "rightPanelWidth", default = "default_panel_width")]
+    #[serde(
+        rename = "rightPanelWidth",
+        default = "default_panel_width",
+        deserialize_with = "deserialize_panel_width"
+    )]
     pub right_panel_width: f32,
     /// Narrowest and widest the inspector may be dragged.
-    #[serde(rename = "minRightPanelWidth", default = "default_min_panel_width")]
+    #[serde(
+        rename = "minRightPanelWidth",
+        default = "default_min_panel_width",
+        deserialize_with = "deserialize_min_panel_width"
+    )]
     pub min_right_panel_width: f32,
-    #[serde(rename = "maxRightPanelWidth", default = "default_max_panel_width")]
+    #[serde(
+        rename = "maxRightPanelWidth",
+        default = "default_max_panel_width",
+        deserialize_with = "deserialize_max_panel_width"
+    )]
     pub max_right_panel_width: f32,
     /// A tab a newer build added reads as the default. Decoded strictly, one
     /// unknown name failed the whole snapshot, and every project vanished.
@@ -920,6 +971,44 @@ mod tests {
         assert_eq!(decoded.right_panel_tab, RightPanelTab::Changes);
         assert_eq!(decoded.projects.len(), 1);
         assert_eq!(decoded.projects[0].agents, vec![agent]);
+    }
+
+    #[test]
+    fn a_malformed_layout_value_reads_as_its_default_and_keeps_the_projects() {
+        let agent = Agent::new("Kept");
+        let mut value = serde_json::to_value(PersistedApp {
+            projects: vec![PersistedProject {
+                agents: vec![agent.clone()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        value["activeProjectId"] = serde_json::json!("not-a-uuid");
+        value["activeAgentId"] = serde_json::json!(7);
+        value["sidebar_visible"] = serde_json::json!("yes");
+        value["right_panel_visible"] = serde_json::json!(1);
+        value["rightPanelWidth"] = serde_json::json!("wide");
+        value["minRightPanelWidth"] = serde_json::json!(null);
+        value["maxRightPanelWidth"] = serde_json::json!([600]);
+        let decoded: PersistedApp = serde_json::from_value(value).expect("the snapshot reads");
+        assert_eq!(decoded.projects.len(), 1);
+        assert_eq!(decoded.projects[0].agents, vec![agent]);
+        // The same defaults an absent value gets, not the type's zero.
+        let defaults = PersistedApp::default();
+        assert_eq!(decoded.active_project_id, None);
+        assert_eq!(decoded.active_agent_id, None);
+        assert_eq!(decoded.sidebar_visible, defaults.sidebar_visible);
+        assert_eq!(decoded.right_panel_visible, defaults.right_panel_visible);
+        assert_eq!(decoded.right_panel_width, defaults.right_panel_width);
+        assert_eq!(
+            decoded.min_right_panel_width,
+            defaults.min_right_panel_width
+        );
+        assert_eq!(
+            decoded.max_right_panel_width,
+            defaults.max_right_panel_width
+        );
     }
 
     #[test]

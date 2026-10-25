@@ -3485,10 +3485,26 @@ impl AppState {
             field.update(cx, |field, cx| field.set_value(text, cx));
             self.composer.attachments.insert(agent_id, attachments);
         } else {
-            self.set_composer_notice(
-                agent_id,
-                Some(format!("A queued prompt could not be sent: {text}")),
-            );
+            // The draft stays the reader's. The prompt's text fits in the
+            // notice, but its images do not, so they join the draft's under
+            // the usual limits rather than being dropped.
+            let mut notice = format!("A queued prompt could not be sent: {text}");
+            if !attachments.is_empty() {
+                let pending = self.composer.attachments.entry(agent_id).or_default();
+                let refused = crate::attachments::admit(
+                    pending,
+                    crate::attachments::Prepared {
+                        attachments,
+                        errors: Vec::new(),
+                    },
+                );
+                notice.push_str(" Its images were added to the composer.");
+                if let Some(refused) = refused {
+                    notice.push(' ');
+                    notice.push_str(&refused);
+                }
+            }
+            self.set_composer_notice(agent_id, Some(notice));
         }
     }
 
@@ -5158,6 +5174,31 @@ mod persistence_tests {
                 assert_eq!(state.draft(agent, cx).read(cx).value(), "look at this");
                 assert_eq!(state.attachments(agent).len(), 1, "lost across a restart");
                 assert_eq!(state.attachments(agent)[0].data, sent.data);
+            })
+        });
+    }
+
+    #[test]
+    fn a_queued_prompt_that_cannot_start_keeps_its_images_beside_a_draft() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, _, agent, _) = test.update(|cx| workspace(cx, &paths));
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                let field = state.draft(agent, cx);
+                field.update(cx, |field, cx| field.set_value("my own draft", cx));
+                state.return_to_composer(agent, "queued".into(), vec![image(5)], cx);
+                // The reader's draft is untouched; the prompt is in the notice
+                // and its image waits in the composer instead of vanishing.
+                assert_eq!(field.read(cx).value(), "my own draft");
+                assert!(
+                    state
+                        .composer_notice(agent)
+                        .is_some_and(|notice| notice.contains("queued"))
+                );
+                assert_eq!(state.attachments(agent).len(), 1, "the image was dropped");
+                assert_eq!(state.attachments(agent)[0].data, image(5).data);
             })
         });
     }

@@ -775,8 +775,14 @@ impl PendingRequest {
             return None;
         }
         Some(match self.method.as_str() {
+            // A legacy denial is an object carrying the reason; the bare
+            // string `"denied"` is not a `ReviewDecision` Codex accepts.
             "execCommandApproval" | "applyPatchApproval" => {
-                json!({"decision": if approved { "approved" } else { "denied" }})
+                if approved {
+                    json!({"decision": "approved"})
+                } else {
+                    json!({"decision": {"denied": {"rejection": "Declined in FlowX."}}})
+                }
             }
             "item/permissions/requestApproval" => {
                 json!({"permissions": if approved { self.params.get("permissions").cloned().unwrap_or(json!({})) } else {json!({})}, "scope": "turn"})
@@ -1503,6 +1509,20 @@ mod tests {
             )
             .unwrap();
             assert_eq!(request.approval_result(true), Some(expected));
+        }
+    }
+
+    #[test]
+    fn a_legacy_denial_is_the_object_codex_accepts() {
+        // Codex 0.164's `ReviewDecision` has no bare "denied": a denial is
+        // `{"denied": {"rejection": …}}`, and anything else is rejected.
+        for method in ["execCommandApproval", "applyPatchApproval"] {
+            let request = PendingRequest::parse(json!(9), method, &json!({})).unwrap();
+            let result = request.approval_result(false).unwrap();
+            assert!(
+                result["decision"]["denied"]["rejection"].is_string(),
+                "{method} denied as {result}"
+            );
         }
     }
 
