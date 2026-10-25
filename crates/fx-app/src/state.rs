@@ -3236,7 +3236,7 @@ impl AppState {
     }
 
     /// Open a queued prompt for editing in place, by its id.
-    pub fn begin_editing_queued(&mut self, agent_id: Uuid, id: Uuid, cx: &mut App) {
+    pub fn begin_editing_queued(&mut self, agent_id: Uuid, id: Uuid, cx: &mut Context<Self>) {
         let Some(conversation) = self.conversation_by_agent(agent_id) else {
             return;
         };
@@ -3258,6 +3258,16 @@ impl AppState {
             field.set_value(queued.text.clone(), cx);
             field
         });
+        // The edit has the draft's cap, and says so the same way when a paste
+        // runs past it.
+        cx.subscribe(
+            &field,
+            move |state, _, event: &crate::text_field::TextFieldEvent, cx| {
+                state.set_composer_notice(agent_id, Some(event.notice()));
+                cx.notify();
+            },
+        )
+        .detach();
         self.composer.editor = Some(QueueEditor {
             agent_id,
             queued_id: queued.id,
@@ -5486,6 +5496,36 @@ mod persistence_tests {
                     crate::attachments::MAX_PENDING_ATTACHMENTS - 1
                 );
             })
+        });
+    }
+
+    #[test]
+    fn a_paste_the_queued_prompts_editor_cut_short_says_so_too() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, project, agent, _) = test.update(|cx| workspace(cx, &paths));
+        let editor = test.update(|cx| {
+            state.update(cx, |state, cx| {
+                state.conversation(project, agent);
+                state
+                    .enqueue_prompt(agent, "queued", Vec::new(), cx)
+                    .unwrap();
+                let id = queued_ids(state, project, agent)[0];
+                state.begin_editing_queued(agent, id, cx);
+                state.queue_editor().unwrap().field.clone()
+            })
+        });
+        let event = crate::text_field::TextFieldEvent::PasteTruncated {
+            dropped: 500,
+            max_len: 32_000,
+        };
+        test.update(|cx| editor.update(cx, |_, cx| cx.emit(event)));
+        test.read(|cx| {
+            assert_eq!(
+                state.read(cx).composer_notice(agent),
+                Some(event.notice().as_str())
+            );
         });
     }
 
