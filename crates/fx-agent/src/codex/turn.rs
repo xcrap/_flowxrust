@@ -23,14 +23,14 @@
 //!   blocked, so the turn answers with the configured policy and reports what it
 //!   did.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use fx_core::AgentAccess;
 use serde_json::{Value, json};
 
 use crate::codex::session::{
-    CodexWriterConflict, TurnNotifications, TurnRequest, is_read_only_command_value,
+    CodexWriterConflict, INTERRUPTED, TurnNotifications, TurnRequest, is_read_only_command_value,
     thread_id_from_result, thread_params, turn_params,
 };
 use crate::codex::session::{goal_set_params, steer_params};
@@ -322,6 +322,7 @@ impl CodexSession {
         let mut notifications = TurnNotifications::new();
         let mut pending: HashMap<String, PendingRequest> = HashMap::new();
         let mut items: HashMap<String, Value> = HashMap::new();
+        let mut spawned = SpawnedThreads::default();
 
         loop {
             let next = tokio::select! {
@@ -366,7 +367,12 @@ impl CodexSession {
             };
             match next {
                 ServerEvent::Notification { method, params } => {
-                    if !belongs_to_turn(&params, &thread_id, &turn_id) {
+                    spawned.observe(&method, &params, &thread_id);
+                    let ours = belongs_to_turn(&params, &thread_id, &turn_id);
+                    // A sub-agent's requests are answered here, so what they
+                    // need is kept for them too; their other events are not
+                    // this transcript's.
+                    if !ours && !spawned.sent(&params) {
                         continue;
                     }
                     if method == "item/started"
@@ -382,6 +388,9 @@ impl CodexSession {
                         if pending.remove(&id).is_some() {
                             resolved(id);
                         }
+                    }
+                    if !ours {
+                        continue;
                     }
                     for event in notifications.parse(&method, &params) {
                         let outcome = finish(&event, &thread_id);
@@ -399,14 +408,24 @@ impl CodexSession {
                     method,
                     mut params,
                 } => {
-                    if !belongs_to_turn(&params, &thread_id, &turn_id) {
+                    let ours = belongs_to_turn(&params, &thread_id, &turn_id);
+                    if !ours && !spawned.sent(&params) {
                         self.transport
                             .refuse(
-                                id,
+                                id.clone(),
                                 -32000,
                                 "This request does not belong to the active FlowX turn.",
                             )
                             .map_err(map_error)?;
+                        // Refused unseen, whatever asked failed with nothing on
+                        // screen to say why. Its own item belongs to the other
+                        // thread and never reached this one, so the call is
+                        // recorded here, with the refusal as its result.
+                        if let Some(request) = PendingRequest::parse(id, &method, &params) {
+                            for event in request.refused_as_foreign(&thread_id) {
+                                sink(event);
+                            }
+                        }
                         continue;
                     }
                     if method == "currentTime/read" {
@@ -449,13 +468,13 @@ impl CodexSession {
                             if let ProviderEvent::Approval(a) = event
                                 && !approved
                             {
+                                // A sub-agent's call is a row in its own
+                                // thread, not here, so the refusal brings it.
+                                if !ours {
+                                    sink(request.call_row());
+                                }
                                 sink(ProviderEvent::ToolResult {
-                                    id: params
-                                        .get("callId")
-                                        .or_else(|| params.get("itemId"))
-                                        .and_then(Value::as_str)
-                                        .unwrap_or(&a.id)
-                                        .to_owned(),
+                                    id: request.call_id(),
                                     content: self.approvals.message(&a.tool_name),
                                     is_error: true,
                                 });
@@ -712,6 +731,67 @@ fn belongs_to_turn(params: &Value, thread_id: &str, turn_id: &str) -> bool {
             .is_none_or(|id| turn_id.is_empty() || id == turn_id)
 }
 
+/// The sub-agent threads this turn's thread has started, as Codex names them.
+///
+/// A sub-agent is a thread of its own, so its approvals and questions carry
+/// its thread id and its own turn's, never this turn's. Refused as foreign,
+/// every command a sub-agent asked to run failed. Codex says which threads
+/// are children — a `subAgentActivity` item names the agent's thread, a collab
+/// call its receivers, `thread/started` a new thread's parent — and only a
+/// thread named one of those ways is accepted. Nothing else is guessed to be
+/// family.
+#[derive(Debug, Default)]
+struct SpawnedThreads(HashSet<String>);
+
+impl SpawnedThreads {
+    /// Learn the children a notification names, if it comes from this thread
+    /// or one of them: a sub-agent's own sub-agents are family too.
+    fn observe(&mut self, method: &str, params: &Value, thread_id: &str) {
+        let family = |id: &str| id == thread_id || self.0.contains(id);
+        let mut named: Vec<&str> = Vec::new();
+        match method {
+            "thread/started" => {
+                let thread = &params["thread"];
+                if thread["parentThreadId"].as_str().is_some_and(family) {
+                    named.extend(thread["id"].as_str());
+                }
+            }
+            "item/started" | "item/completed" if params["threadId"].as_str().is_none_or(family) => {
+                let item = &params["item"];
+                match item["type"].as_str() {
+                    Some("subAgentActivity") => named.extend(item["agentThreadId"].as_str()),
+                    Some("collabAgentToolCall")
+                        if item["senderThreadId"].as_str().is_none_or(family) =>
+                    {
+                        named.extend(
+                            item["receiverThreadIds"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(Value::as_str),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        for id in named {
+            if !id.is_empty() && id != thread_id {
+                self.0.insert(id.to_owned());
+            }
+        }
+    }
+
+    /// Whether a message comes from one of them.
+    fn sent(&self, params: &Value) -> bool {
+        params
+            .get("threadId")
+            .and_then(Value::as_str)
+            .is_some_and(|id| self.0.contains(id))
+    }
+}
+
 struct PendingRequest {
     wire_id: Value,
     method: String,
@@ -768,6 +848,60 @@ impl PendingRequest {
             params: params.clone(),
             event,
         })
+    }
+
+    /// The id of the call this request is about, which its result row claims.
+    fn call_id(&self) -> String {
+        self.params
+            .get("callId")
+            .or_else(|| self.params.get("itemId"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| request_key(&self.wire_id))
+    }
+
+    /// The call this request is about, as a row of its own.
+    ///
+    /// For a call whose item never reached this transcript: it belongs to
+    /// another thread, or to a sub-agent, whose items stay in its own.
+    fn call_row(&self) -> ProviderEvent {
+        let name = match &self.event {
+            ProviderEvent::Approval(approval) => approval.tool_name.clone(),
+            _ => "requestUserInput".to_owned(),
+        };
+        let call = self
+            .params
+            .get("item")
+            .filter(|item| item.is_object())
+            .unwrap_or(&self.params);
+        ProviderEvent::ToolUse {
+            id: self.call_id(),
+            name,
+            input: crate::codex::session::tool_input(call).to_string(),
+        }
+    }
+
+    /// The rows for a request refused because it came from outside this turn:
+    /// what it asked for, and why it was refused.
+    fn refused_as_foreign(&self, thread_id: &str) -> [ProviderEvent; 2] {
+        let origin = match self.params.get("threadId").and_then(Value::as_str) {
+            Some(other) if other != thread_id => format!("another Codex thread ({other})"),
+            _ => "another turn".to_owned(),
+        };
+        let what = match &self.event {
+            ProviderEvent::UserInput(_) => "question",
+            _ => "approval request",
+        };
+        [
+            self.call_row(),
+            ProviderEvent::ToolResult {
+                id: self.call_id(),
+                content: format!(
+                    "FlowX refused this {what}: it came from {origin}, not from this turn."
+                ),
+                is_error: true,
+            },
+        ]
     }
 
     fn approval_result(&self, approved: bool) -> Option<Value> {
@@ -857,6 +991,15 @@ impl PendingRequest {
 /// Finish the turn if this event ends it.
 fn finish(event: &ProviderEvent, thread_id: &str) -> Option<TurnOutcome> {
     match event {
+        // Another client stopped the turn, or Codex did. Read as a completion
+        // it showed the Ready check and the unseen-completion dot for a turn
+        // that never answered. FlowX's own Stop never arrives here: it drops
+        // the turn before Codex reports it.
+        ProviderEvent::Done { stop_reason } if stop_reason == INTERRUPTED => {
+            Some(TurnOutcome::Cancelled {
+                thread_id: thread_id.to_string(),
+            })
+        }
         ProviderEvent::Done { stop_reason } => Some(TurnOutcome::Completed {
             thread_id: thread_id.to_string(),
             stop_reason: stop_reason.clone(),
@@ -1012,6 +1155,26 @@ mod tests {
             TurnOutcome::Failed { reason, .. } => assert!(!reason.is_empty()),
             other => panic!("expected a failure, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_turn_interrupted_elsewhere_is_cancelled_rather_than_completed() {
+        // Another client, or Codex itself, stopped it. Read as complete, it
+        // showed the Ready check and the unseen-completion dot for a turn that
+        // never answered.
+        let Some(server) = FakeServer::new() else {
+            return;
+        };
+        let mut session = session_with(&server, &[]).await;
+        let thread_id = session.thread_id().to_string();
+        let outcome = session
+            .run_turn(
+                &TurnRequest::new(&thread_id, "interrupted-elsewhere", "/tmp"),
+                |_| {},
+            )
+            .await
+            .expect("the turn ran");
+        assert_eq!(outcome, TurnOutcome::Cancelled { thread_id });
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1454,6 +1617,187 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(echoed_response(&seen.borrow())["error"]["code"], -32000);
+    }
+
+    #[tokio::test]
+    async fn a_refused_request_from_another_thread_says_what_it_asked_for() {
+        // Refused unseen, the command failed with nothing on screen to say why:
+        // its own item belongs to the other thread and never arrives here.
+        let Some(server) = FakeServer::new() else {
+            return;
+        };
+        let mut session = interactive_session(&server).await;
+        let thread = session.thread_id().to_owned();
+        let (_sender, mut responses) = mpsc::unbounded_channel();
+        let mut conversation = crate::conversation::Conversation::new(uuid::Uuid::from_u128(1));
+        session
+            .run_turn_interactive(
+                &request(&thread, "foreign-request", "/tmp"),
+                &mut responses,
+                |event| conversation.apply(event),
+                || {},
+                |_| {},
+            )
+            .await
+            .unwrap();
+        let (call, name, input) = conversation
+            .messages()
+            .find_map(|message| match message.content.as_slice() {
+                [fx_core::MessageContent::ToolUse { id, name, input }] => {
+                    Some((id.clone(), name.clone(), input.clone()))
+                }
+                _ => None,
+            })
+            .expect("the refused call has a row");
+        assert_eq!(name, "commandExecution");
+        assert!(input.contains("cargo test"), "{input}");
+        let refusal = conversation
+            .messages()
+            .find_map(|message| match message.content.as_slice() {
+                [
+                    fx_core::MessageContent::ToolResult {
+                        id,
+                        content,
+                        is_error: true,
+                    },
+                ] if *id == call => Some(content.clone()),
+                _ => None,
+            })
+            .expect("the refusal is the call's result");
+        assert!(refusal.contains("other-thread"), "{refusal}");
+    }
+
+    #[tokio::test]
+    async fn a_sub_agents_request_is_answered_like_the_turns_own() {
+        // A sub-agent asks under its own thread and turn. Refused as foreign,
+        // every command a sub-agent wanted to run failed.
+        let Some(server) = FakeServer::new() else {
+            return;
+        };
+        let mut session = interactive_session(&server).await;
+        let thread = session.thread_id().to_owned();
+        let (sender, mut responses) = mpsc::unbounded_channel();
+        let mut resolved = Vec::new();
+        let seen = std::cell::RefCell::new(Vec::new());
+        let outcome = session
+            .run_turn_interactive(
+                &request(&thread, "subagent-request", "/tmp"),
+                &mut responses,
+                |event| {
+                    seen.borrow_mut().push(event.clone());
+                    if let ProviderEvent::Approval(request) = event {
+                        assert_eq!(request.input["command"], "cargo test");
+                        sender
+                            .send(UserResponse::Approval {
+                                id: request.id,
+                                approved: true,
+                            })
+                            .unwrap();
+                    }
+                },
+                || {},
+                |id| resolved.push(id),
+            )
+            .await
+            .unwrap();
+        assert!(outcome.is_completed(), "{outcome:?}");
+        assert_eq!(
+            echoed_response(&seen.borrow())["result"]["decision"],
+            "accept"
+        );
+        assert_eq!(resolved, vec!["codex:\"interactive-1\""]);
+    }
+
+    #[tokio::test]
+    async fn a_sub_agents_call_refused_by_policy_has_a_row_to_finish() {
+        // The call's own item stays in the sub-agent's thread, so the refusal
+        // alone was a result with nothing above it.
+        let Some(server) = FakeServer::new() else {
+            return;
+        };
+        let mut session = CodexSession::open(
+            Transport::start(server.launch(), "FlowX", "test")
+                .await
+                .expect("started"),
+            None,
+            AgentAccess::FullAccess,
+            "/tmp",
+            ApprovalPolicy::DenyAll,
+        )
+        .await
+        .expect("a session");
+        let thread_id = session.thread_id().to_string();
+        let mut events = Vec::new();
+        session
+            .run_turn(
+                &TurnRequest::new(&thread_id, "subagent-request", "/tmp"),
+                |event| events.push(event),
+            )
+            .await
+            .expect("the turn ran");
+        let call = events
+            .iter()
+            .position(
+                |event| matches!(event, ProviderEvent::ToolUse { id, .. } if id == "command-1"),
+            )
+            .expect("the sub-agent's call has a row");
+        let refusal = events
+            .iter()
+            .position(|event| {
+                matches!(event, ProviderEvent::ToolResult { id, is_error: true, .. } if id == "command-1")
+            })
+            .expect("the refusal is its result");
+        assert!(call < refusal, "{events:?}");
+    }
+
+    #[test]
+    fn only_threads_codex_names_as_children_are_family() {
+        let mut spawned = SpawnedThreads::default();
+        for (method, params) in [
+            (
+                "item/started",
+                json!({"threadId":"parent", "item":{"type":"subAgentActivity", "agentThreadId":"child"}}),
+            ),
+            (
+                "item/completed",
+                json!({"threadId":"parent", "item":{"type":"collabAgentToolCall",
+                       "senderThreadId":"parent", "receiverThreadIds":["worker"]}}),
+            ),
+            // A sub-agent's own sub-agent is family too.
+            (
+                "thread/started",
+                json!({"thread":{"id":"grandchild", "parentThreadId":"child"}}),
+            ),
+            // Children named by a thread that is not family are not.
+            (
+                "item/started",
+                json!({"threadId":"stranger", "item":{"type":"subAgentActivity", "agentThreadId":"strangers-child"}}),
+            ),
+            (
+                "thread/started",
+                json!({"thread":{"id":"orphan", "parentThreadId":"stranger"}}),
+            ),
+            (
+                "item/completed",
+                json!({"threadId":"parent", "item":{"type":"collabAgentToolCall",
+                       "senderThreadId":"stranger", "receiverThreadIds":["borrowed"]}}),
+            ),
+        ] {
+            spawned.observe(method, &params, "parent");
+        }
+        for id in ["child", "worker", "grandchild"] {
+            assert!(spawned.sent(&json!({ "threadId": id })), "{id}");
+        }
+        for id in [
+            "stranger",
+            "strangers-child",
+            "orphan",
+            "borrowed",
+            "parent",
+        ] {
+            assert!(!spawned.sent(&json!({ "threadId": id })), "{id}");
+        }
+        assert!(!spawned.sent(&json!({})));
     }
 
     #[tokio::test]

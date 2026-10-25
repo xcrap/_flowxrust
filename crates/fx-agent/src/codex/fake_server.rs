@@ -131,9 +131,26 @@ for line in sys.stdin:
             sys.stderr.write("server died mid turn\n")
             sys.stderr.flush()
             sys.exit(4)
-        elif prompt in ("interactive-approval", "interactive-question", "foreign-request"):
+        elif prompt == "interrupted-elsewhere":
+            # Another client, or Codex itself, stops the turn part-way.
+            send({"jsonrpc": "2.0", "method": "turn/started",
+                  "params": {"turn": {"id": "turn-1"}}})
+            send({"jsonrpc": "2.0", "method": "item/agentMessage/delta",
+                  "params": {"delta": "Halfway"}})
+            send({"jsonrpc": "2.0", "method": "turn/completed",
+                  "params": {"turn": {"id": "turn-1", "status": "interrupted"}}})
+        elif prompt in ("interactive-approval", "interactive-question", "foreign-request",
+                        "subagent-request"):
             send({"jsonrpc": "2.0", "method": "turn/started",
                   "params": {"threadId": thread, "turn": {"id": "turn-1"}}})
+            if prompt == "subagent-request":
+                # The turn names the sub-agent it started, as Codex 0.164 does;
+                # the sub-agent then asks under its own thread and turn.
+                send({"jsonrpc": "2.0", "method": "item/started", "params": {
+                    "threadId": thread, "turnId": "turn-1", "item": {
+                        "type": "subAgentActivity", "id": "activity-1", "kind": "started",
+                        "agentThreadId": "child-thread", "agentPath": "/root/worker",
+                        "model": None, "reasoningEffort": None}}})
             if prompt == "interactive-question":
                 method = "item/tool/requestUserInput"
                 params = {"threadId": thread, "turnId": "turn-1", "questions": [
@@ -141,8 +158,10 @@ for line in sys.stdin:
                     {"id": "region", "question": "Which region?", "options": []}]}
             else:
                 method = "item/commandExecution/requestApproval"
-                params = {"threadId": "other-thread" if prompt == "foreign-request" else thread,
-                          "turnId": "turn-1", "itemId": "command-1", "command": "cargo test", "cwd": "/tmp"}
+                origin = {"foreign-request": ("other-thread", "turn-1"),
+                          "subagent-request": ("child-thread", "child-turn")}.get(prompt, (thread, "turn-1"))
+                params = {"threadId": origin[0], "turnId": origin[1], "itemId": "command-1",
+                          "command": "cargo test", "cwd": "/tmp"}
             send({"jsonrpc": "2.0", "id": "interactive-1", "method": method, "params": params})
         elif prompt == "use-a-tool":
             send({"jsonrpc": "2.0", "method": "turn/started",

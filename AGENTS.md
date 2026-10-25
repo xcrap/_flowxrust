@@ -425,6 +425,11 @@ Two more, for how a turn ends:
 - **Silence is never a failure.** A turn ends on completion, a provider or
   process error, the stream closing, or Stop. A quiet `docker build` or a long
   think is not a hang, and a silence timeout killed exactly those turns.
+- **An interrupted turn was stopped, not completed.** Another client, or Codex
+  itself, can end a turn with `turn/completed` status `interrupted`; read as a
+  completion it showed the Ready check and the unseen-completion dot for a turn
+  that never answered. FlowX's own Stop never sees that status, because it
+  drops the turn first.
 - **Stop ends the tools too.** Each provider runs in its own process group
   (`fx-agent::process`), but its tools do not stay in it: `claude` starts each
   `Bash` call in a session of its own and `codex app-server` gives each command
@@ -487,6 +492,17 @@ message is billions of comparisons. The `scan_offset` field in the Swift origina
 existed for the same reason, and its test asserts a time bound rather than only
 correctness.
 
+A Codex request names its thread and turn, and one that is not the running
+turn's is refused — unless a sub-agent of this thread sent it. A sub-agent is a
+thread of its own, so its approvals carry its own ids; refused as foreign, every
+command it asked to run failed. Codex names each child as it starts it (a
+`subAgentActivity` item's `agentThreadId`, a collab call's `receiverThreadIds`,
+`thread/started`'s `parentThreadId`), and `SpawnedThreads` in `codex/turn.rs`
+accepts only a thread named that way; nothing is guessed. A request that is
+refused still gets a row: the call it asked about, with the refusal as its
+result, because its own item never reaches this transcript and a silent
+refusal failed the call with nothing on screen to say why.
+
 ## The transcript
 
 The transcript carries tool calls as first-class rows, not only as the activity
@@ -514,6 +530,14 @@ server's, and live turns and restored history share one reader
 result for every real tool call, which then looks trivial and is dropped, so the
 transcript silently loses every tool output. An explicit `null` is not output:
 Codex sends `"error": null` on every successful MCP call.
+
+Which items become rows at all is one decision too, `codex::session::item_kind`,
+shared the same way. History once kept a list of its own and wrote every item
+the live turn skipped — sub-agent activity, hook prompts, review markers — as a
+System row of raw JSON, and each compaction as a row the live turn never had, so
+a thread that used sub-agents came back after a restart as hundreds of blobs.
+Plan mode's proposed plan is an item of its own, and both paths show it as
+prose.
 
 Whether a row is prose or a collapsed activity is a *view* decision, made by
 `TranscriptActivityGroupingPolicy` in `fx-core`. It reads content only, never

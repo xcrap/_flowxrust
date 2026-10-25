@@ -16,7 +16,9 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use super::session::{self, ItemKind, item_kind};
 use super::{CodexProvider, ServerEvent, Transport, TransportError};
+use crate::conversation::state::TRIVIAL_TOOL_RESULT;
 use crate::native::{NativeThread, NativeThreadIndex, NativeThreadSummary};
 use crate::{ProviderError, ThreadIdentity, ThreadSummary};
 
@@ -844,8 +846,10 @@ fn convert_turns(
                 messages.push(message);
                 Ok::<(), ProviderError>(())
             };
-            match kind {
-                "userMessage" => {
+            // The live turn's own classification, so a restored thread shows
+            // exactly the rows it showed while it ran.
+            match item_kind(item) {
+                ItemKind::UserMessage => {
                     let mut content = Vec::new();
                     for block in item["content"].as_array().into_iter().flatten() {
                         match block["type"].as_str() {
@@ -868,7 +872,7 @@ fn convert_turns(
                         push(MessageRole::User, content, false)?;
                     }
                 }
-                "agentMessage" | "plan" => {
+                ItemKind::Text => {
                     if let Some(text) = item["text"].as_str().filter(|text| !text.is_empty()) {
                         push(
                             MessageRole::Assistant,
@@ -879,91 +883,42 @@ fn convert_turns(
                         )?;
                     }
                 }
-                "reasoning" => {} // Native internal reasoning is not a visible conversation message.
-                "contextCompaction" => push(
-                    MessageRole::System,
-                    vec![MessageContent::Text {
-                        text: "[Context compacted]".into(),
-                    }],
-                    false,
-                )?,
-                "hookPrompt" | "subAgentActivity" | "enteredReviewMode" | "exitedReviewMode" => {
-                    push(
-                        MessageRole::System,
-                        vec![MessageContent::Text {
-                            text: item.to_string(),
-                        }],
-                        false,
-                    )?
-                }
-                "functionCallOutput" => push(
-                    MessageRole::Tool,
-                    vec![MessageContent::ToolResult {
-                        id: item_id.clone(),
-                        content: value_text(&item["output"]),
-                        is_error: false,
-                    }],
-                    true,
-                )?,
-                _ => {
-                    let is_tool = matches!(
-                        kind,
-                        "toolCall"
-                            | "commandExecution"
-                            | "fileChange"
-                            | "mcpToolCall"
-                            | "dynamicToolCall"
-                            | "collabAgentToolCall"
-                            | "webSearch"
-                            | "imageView"
-                            | "imageGeneration"
-                            | "sleep"
-                    ) || ["tool", "command", "input", "arguments"]
-                        .iter()
-                        .any(|key| !item[*key].is_null());
-                    if !is_tool {
+                kind @ (ItemKind::Tool | ItemKind::ToolOutput) => {
+                    // An output's call never arrived as an item, so it is a
+                    // result with no call row, as it is live.
+                    if kind == ItemKind::Tool {
+                        let input = session::tool_input(item);
                         push(
-                            MessageRole::System,
-                            vec![MessageContent::Text {
-                                text: item.to_string(),
+                            MessageRole::Assistant,
+                            vec![MessageContent::ToolUse {
+                                id: item_id.clone(),
+                                name: session::tool_name(item),
+                                input: value_text(&input),
                             }],
                             false,
                         )?;
-                        continue;
                     }
-                    let name = item["name"]
-                        .as_str()
-                        .or(item["tool"].as_str())
-                        .unwrap_or(kind)
-                        .to_string();
-                    let input = super::session::tool_input(item);
-                    push(
-                        MessageRole::Assistant,
-                        vec![MessageContent::ToolUse {
-                            id: item_id.clone(),
-                            name,
-                            input: value_text(&input),
-                        }],
-                        false,
-                    )?;
-                    let (output, is_error) = super::session::tool_outcome(item);
+                    let (output, is_error) = session::tool_outcome(item);
                     if is_error
                         || output
                             .as_deref()
-                            .is_some_and(|text| text.trim() != "Completed")
+                            .is_some_and(|text| text.trim() != TRIVIAL_TOOL_RESULT)
                     {
                         push(
                             MessageRole::Tool,
                             vec![MessageContent::ToolResult {
                                 id: item_id,
-                                content: output
-                                    .unwrap_or_else(|| super::session::TOOL_FAILED.into()),
+                                content: output.unwrap_or_else(|| session::TOOL_FAILED.into()),
                                 is_error,
                             }],
                             true,
                         )?;
                     }
                 }
+                // A compaction is a phase while the turn runs and leaves no
+                // row; the rest has nothing to show. Written as rows they were
+                // raw JSON, hundreds of them in a thread that used sub-agents.
+                ItemKind::Compaction | ItemKind::Hidden => {}
             }
         }
     }
@@ -1406,6 +1361,72 @@ for line in sys.stdin:
         assert_eq!(messages, again);
         let other = convert_turns("other-thread", turns.as_array().unwrap(), &json!({})).unwrap();
         assert_ne!(messages[0].id, other[0].id);
+    }
+
+    #[test]
+    fn history_shows_exactly_the_rows_the_live_turn_showed() {
+        // Every item a live turn shows nothing for came back after a restart as
+        // a System row, of raw JSON or "[Context compacted]"; two real threads
+        // with sub-agents held 216 `subAgentActivity` items. Shapes from Codex
+        // 0.164's `ThreadItem`, with synthetic values.
+        let items = json!([
+            {"type":"userMessage","id":"user","clientId":null,"content":[{"type":"text","text":"Review the parser"}]},
+            {"type":"hookPrompt","id":"hook","fragments":[{"text":"Injected by a hook","hookRunId":"run"}]},
+            {"type":"reasoning","id":"thinking","summary":["Reading"],"content":[]},
+            {"type":"subAgentActivity","id":"spawn","kind":"started","agentThreadId":"child","agentPath":"/root/worker","model":null,"reasoningEffort":null},
+            {"type":"enteredReviewMode","id":"review-in","review":"current changes"},
+            {"type":"exitedReviewMode","id":"review-out","review":"No findings."},
+            {"type":"contextCompaction","id":"compaction"},
+            {"type":"commandExecution","id":"command","command":"cargo test","cwd":"/project","status":"completed","aggregatedOutput":"all passed","exitCode":0},
+            {"type":"functionCallOutput","id":"output","name":"f","namespace":null,"output":"separate result"},
+            {"type":"plan","id":"plan","text":"1. Fix the parser"},
+            {"type":"somethingNew","id":"future","detail":{"opaque":true}},
+            {"type":"agentMessage","id":"answer","text":"Done.","phase":"final"}
+        ]);
+        let turns = json!([{"id":"turn","items":items}]);
+        let restored = convert_turns("thread", turns.as_array().unwrap(), &json!({})).unwrap();
+        assert!(
+            restored
+                .iter()
+                .all(|message| message.role != MessageRole::System),
+            "{restored:#?}"
+        );
+
+        let mut live = crate::conversation::Conversation::new(Uuid::nil());
+        let mut notifications = session::TurnNotifications::new();
+        for item in items.as_array().unwrap() {
+            for method in ["item/started", "item/completed"] {
+                for event in notifications.parse(method, &json!({ "item": item })) {
+                    live.apply(event);
+                }
+            }
+        }
+        // The live turn has the prompt from FlowX itself, not from an item.
+        let rows = |messages: Vec<&ConversationMessage>| {
+            messages
+                .into_iter()
+                .filter(|message| message.role != MessageRole::User)
+                .map(|message| (message.role, message.content.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            rows(restored.iter().collect()),
+            rows(live.messages().collect())
+        );
+        assert_eq!(
+            restored
+                .iter()
+                .map(|message| message.role)
+                .collect::<Vec<_>>(),
+            [
+                MessageRole::User,
+                MessageRole::Assistant,
+                MessageRole::Tool,
+                MessageRole::Tool,
+                MessageRole::Assistant,
+                MessageRole::Assistant,
+            ]
+        );
     }
 
     #[test]

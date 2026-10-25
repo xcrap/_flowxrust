@@ -433,18 +433,54 @@ pub fn fallback_models() -> Vec<Model> {
     ]
 }
 
-/// Item types that carry no user-visible content and are skipped.
-fn is_ignored_item(item_type: &str) -> bool {
-    matches!(
-        item_type,
-        "reasoning"
-            | "plan"
-            | "contextCompaction"
-            | "hookPrompt"
-            | "subAgentActivity"
-            | "enteredReviewMode"
-            | "exitedReviewMode"
-    )
+/// What one Codex item is to the transcript.
+///
+/// Live notifications and native history both ask [`item_kind`], so a thread
+/// reads the same after a restart as it did while it ran. They used to keep
+/// lists of their own: history wrote every item the live turn skipped as a
+/// System row of raw JSON, and a thread that used sub-agents came back as
+/// hundreds of `subAgentActivity` blobs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ItemKind {
+    /// The user's prompt. A live turn already holds it; history restores it.
+    UserMessage,
+    /// Prose: an agent message, or the plan proposed in plan mode, which Codex
+    /// carries as an item of its own rather than in the message.
+    Text,
+    /// A tool call, carrying its outcome once it completes.
+    Tool,
+    /// The output of a call that has no item of its own.
+    ToolOutput,
+    /// A compaction: a phase change while it runs, and no row afterwards.
+    Compaction,
+    /// Nothing to show: reasoning, hook prompts, sub-agent activity, the
+    /// review-mode markers, and a type this build does not know that names no
+    /// tool.
+    Hidden,
+}
+
+/// Classify one item. See [`ItemKind`].
+pub(super) fn item_kind(item: &Value) -> ItemKind {
+    let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+    match item_type {
+        "userMessage" => ItemKind::UserMessage,
+        "agentMessage" | "plan" => ItemKind::Text,
+        "functionCallOutput" => ItemKind::ToolOutput,
+        "contextCompaction" => ItemKind::Compaction,
+        "reasoning" | "hookPrompt" | "subAgentActivity" | "enteredReviewMode"
+        | "exitedReviewMode" => ItemKind::Hidden,
+        _ if is_tool_item(item_type) => ItemKind::Tool,
+        // A type newer than this build is still a call if it names one, as
+        // every tool item does. Anything else it says is not this build's to
+        // show, and shown raw it is only noise.
+        _ if ["tool", "command", "input", "arguments"]
+            .iter()
+            .any(|key| item.get(*key).is_some_and(|value| !value.is_null())) =>
+        {
+            ItemKind::Tool
+        }
+        _ => ItemKind::Hidden,
+    }
 }
 
 /// Whether an item type is a tool invocation.
@@ -549,6 +585,19 @@ pub(super) fn tool_outcome(item: &Value) -> (Option<String>, bool) {
     (output, is_error)
 }
 
+/// A tool row's name, shared by live items and native history.
+///
+/// A tool item usually names itself in `name` or `tool`, but a bare
+/// `commandExecution` does neither. Falling back to the type keeps the row
+/// identifiable instead of blank.
+pub(super) fn tool_name(item: &Value) -> String {
+    ["name", "tool", "type"]
+        .iter()
+        .find_map(|key| item.get(*key).and_then(Value::as_str))
+        .unwrap_or("unknown")
+        .to_string()
+}
+
 /// Preserve the tool arguments shared by live items and native history.
 ///
 /// Command items carry their command at the top level, whereas MCP and dynamic
@@ -610,6 +659,9 @@ pub(super) fn tool_input(item: &Value) -> Value {
     input
 }
 
+/// The status `turn/completed` reports for a turn stopped before it finished.
+pub(super) const INTERRUPTED: &str = "interrupted";
+
 /// Translate one notification into zero or more events.
 ///
 /// Returns a list because several Codex notifications map to more than one
@@ -628,76 +680,63 @@ pub fn parse_notification(method: &str, params: &Value) -> Vec<ProviderEvent> {
             let Some(item) = params.get("item") else {
                 return Vec::new();
             };
-            let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
-            if is_ignored_item(item_type) {
-                // A compaction item is the one exception worth surfacing, and
-                // its completion has to end the phase its start began: mapping
-                // both to `Compacting` left a finished compaction on screen for
-                // the rest of the turn.
-                return match (item_type, method) {
-                    ("contextCompaction", "item/started") => {
-                        vec![ProviderEvent::Lifecycle(Lifecycle::Compacting)]
-                    }
-                    ("contextCompaction", _) => {
-                        vec![ProviderEvent::Lifecycle(Lifecycle::Compacted)]
-                    }
-                    _ => Vec::new(),
-                };
-            }
-            let id = item
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            // A tool item usually names itself in `name`, but a bare
-            // `commandExecution` does not. Falling back to the type keeps the
-            // row identifiable instead of blank.
-            let name = item
-                .get("name")
-                .or_else(|| item.get("tool"))
-                .and_then(Value::as_str)
-                .unwrap_or(item_type)
-                .to_string();
-
-            if is_tool_item(item_type) {
-                if method == "item/started" {
+            let started = method == "item/started";
+            let id = || {
+                item.get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            match item_kind(item) {
+                // A compaction's completion has to end the phase its start
+                // began: mapping both to `Compacting` left a finished
+                // compaction on screen for the rest of the turn.
+                ItemKind::Compaction if started => {
+                    vec![ProviderEvent::Lifecycle(Lifecycle::Compacting)]
+                }
+                ItemKind::Compaction => vec![ProviderEvent::Lifecycle(Lifecycle::Compacted)],
+                ItemKind::Tool if started => {
                     let input = tool_input(item);
-                    return vec![ProviderEvent::ToolUse {
-                        id,
-                        name,
+                    vec![ProviderEvent::ToolUse {
+                        id: id(),
+                        name: tool_name(item),
                         input: input
                             .as_str()
                             .map(str::to_owned)
                             .unwrap_or_else(|| input.to_string()),
-                    }];
+                    }]
                 }
-                // Completed: the output is the result.
-                let (output, is_error) = tool_outcome(item);
-                let content = output.unwrap_or_else(|| {
-                    if is_error {
-                        TOOL_FAILED.to_string()
-                    } else {
-                        // Defaulting to `Completed` is what lets the conversation's
-                        // trivial-result rule recognise a tool that said nothing.
-                        TRIVIAL_TOOL_RESULT.to_string()
-                    }
-                });
-                return vec![ProviderEvent::ToolResult {
-                    id,
-                    content,
-                    is_error,
-                }];
-            }
-
-            if method == "item/completed"
-                && let Some(text) = item
+                // Completed: the output is the result. An output whose call
+                // never arrived as an item has nothing to start, so its
+                // completion is the whole row.
+                ItemKind::Tool | ItemKind::ToolOutput if !started => {
+                    let (output, is_error) = tool_outcome(item);
+                    let content = output.unwrap_or_else(|| {
+                        if is_error {
+                            TOOL_FAILED.to_string()
+                        } else {
+                            // Defaulting to `Completed` is what lets the conversation's
+                            // trivial-result rule recognise a tool that said nothing.
+                            TRIVIAL_TOOL_RESULT.to_string()
+                        }
+                    });
+                    vec![ProviderEvent::ToolResult {
+                        id: id(),
+                        content,
+                        is_error,
+                    }]
+                }
+                ItemKind::Text if !started => item
                     .get("text")
                     .and_then(Value::as_str)
                     .filter(|text| !text.is_empty())
-            {
-                return vec![ProviderEvent::Text(text.to_string())];
+                    .map(|text| ProviderEvent::Text(text.to_string()))
+                    .into_iter()
+                    .collect(),
+                // The conversation recorded the prompt when it was sent, and
+                // everything else waits for its completion or shows nothing.
+                _ => Vec::new(),
             }
-            Vec::new()
         }
 
         "item/tool/call"
@@ -1279,13 +1318,38 @@ mod tests {
 
     #[test]
     fn internal_items_are_not_surfaced() {
-        for item_type in ["reasoning", "plan", "hookPrompt", "subAgentActivity"] {
-            let events = parse_notification(
-                "item/completed",
-                &json!({ "item": { "type": item_type, "text": "internal" } }),
-            );
-            assert!(events.is_empty(), "{item_type} was surfaced");
+        // A type this build does not know is included: it used to become prose
+        // whenever it carried a `text`, where history showed it as raw JSON.
+        for item_type in [
+            "reasoning",
+            "hookPrompt",
+            "subAgentActivity",
+            "enteredReviewMode",
+            "exitedReviewMode",
+            "somethingNew",
+        ] {
+            for method in ["item/started", "item/completed"] {
+                let events = parse_notification(
+                    method,
+                    &json!({ "item": { "type": item_type, "text": "internal" } }),
+                );
+                assert!(events.is_empty(), "{item_type} was surfaced");
+            }
         }
+    }
+
+    #[test]
+    fn a_proposed_plan_reads_as_prose() {
+        // Plan mode reports the plan it proposes as an item of its own. History
+        // always showed it, so the live turn does too.
+        let events = parse_notification(
+            "item/completed",
+            &json!({ "item": { "type": "plan", "id": "p1", "text": "1. Fix the parser" } }),
+        );
+        assert_eq!(
+            events,
+            vec![ProviderEvent::Text("1. Fix the parser".into())]
+        );
     }
 
     #[test]
