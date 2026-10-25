@@ -89,6 +89,9 @@ pub struct AppState {
     loading: HashSet<Uuid>,
     restored_costs: HashMap<Uuid, f64>,
     last_checkpoint: Instant,
+    /// Approvals and questions the reader has not answered yet. Answering one
+    /// takes it out, so a second click cannot send the provider a second reply;
+    /// its card stays until the provider resolves it.
     pending_interactions: HashMap<Uuid, VecDeque<fx_agent::ProviderEvent>>,
     /// The add-project sheet, while it is open.
     ///
@@ -1673,18 +1676,37 @@ impl AppState {
         }
     }
 
-    pub fn next_interaction(&self) -> Option<(Uuid, fx_agent::ProviderEvent)> {
+    /// The unanswered question the dialog shows, the active thread's first.
+    ///
+    /// Approvals are never here: they are answered on their own card in the
+    /// transcript, and a dialog over that card would hide what it asks about.
+    pub fn next_question(&self) -> Option<(Uuid, fx_agent::provider::UserInputRequest)> {
+        fn first(
+            queue: &VecDeque<fx_agent::ProviderEvent>,
+        ) -> Option<fx_agent::provider::UserInputRequest> {
+            queue.iter().find_map(|event| match event {
+                fx_agent::ProviderEvent::UserInput(request) => Some(request.clone()),
+                _ => None,
+            })
+        }
         if let Some(id) = self.snapshot.active_agent_id
-            && let Some(event) = self
-                .pending_interactions
-                .get(&id)
-                .and_then(|queue| queue.front())
+            && let Some(request) = self.pending_interactions.get(&id).and_then(first)
         {
-            return Some((id, event.clone()));
+            return Some((id, request));
         }
         self.pending_interactions
             .iter()
-            .find_map(|(&id, queue)| queue.front().map(|event| (id, event.clone())))
+            .find_map(|(&id, queue)| first(queue).map(|request| (id, request)))
+    }
+
+    /// Whether a request can still be answered: its turn is running and
+    /// nothing has been sent for it yet.
+    pub fn awaits_answer(&self, agent_id: Uuid, id: &str) -> bool {
+        self.runners.contains_key(&agent_id)
+            && self
+                .pending_interactions
+                .get(&agent_id)
+                .is_some_and(|queue| queue.iter().any(|event| interaction_id(event) == Some(id)))
     }
 
     /// Save how a thread's turn ended. The sidebar reads this for every row,
@@ -1721,14 +1743,33 @@ impl AppState {
         }
     }
 
+    /// Send the reader's answer to a pending request, once.
+    ///
+    /// `false` for a request that is not waiting, including one already
+    /// answered, so a double click reaches the provider as one reply.
     pub fn respond_to_interaction(
-        &self,
+        &mut self,
         agent_id: Uuid,
         response: fx_agent::provider::UserResponse,
     ) -> bool {
-        self.runners
+        let Some(queue) = self.pending_interactions.get_mut(&agent_id) else {
+            return false;
+        };
+        let Some(position) = queue
+            .iter()
+            .position(|event| interaction_id(event) == Some(response.id()))
+        else {
+            return false;
+        };
+        if !self
+            .runners
             .get(&agent_id)
             .is_some_and(|runner| runner.respond(response))
+        {
+            return false;
+        }
+        queue.remove(position);
+        true
     }
 
     /// The conversation for a thread, if it has been loaded.
@@ -4608,7 +4649,7 @@ mod persistence_tests {
                 assert!(!state.retry_drafts.contains_key(&second));
                 assert!(!state.saved_conversations.contains_key(&second));
                 assert!(!state.restored_costs.contains_key(&second));
-                assert!(state.next_interaction().is_none());
+                assert!(state.next_question().is_none());
                 let record = &state.snapshot.projects[0];
                 assert!(record.workspaces.is_empty());
                 assert!(record.native_bindings.is_empty());
@@ -4622,7 +4663,7 @@ mod persistence_tests {
                     reason: "late failure".into(),
                 });
                 state.drain_updates();
-                assert!(state.next_interaction().is_none());
+                assert!(state.next_question().is_none());
                 assert!(state.last_error.is_none());
                 state.save_all(cx);
                 assert!(
@@ -6049,23 +6090,67 @@ mod persistence_tests {
                 state.select_agent(second);
                 state.drain_updates();
                 assert_eq!(state.pending_interactions[&first].len(), 1);
-                assert_eq!(state.next_interaction().unwrap().0, second);
+                assert_eq!(state.next_question().unwrap().0, second);
                 second_updates(SessionUpdate::InteractionResolved {
                     id: "second-question".into(),
                 });
                 state.drain_updates();
-                assert_eq!(state.next_interaction().unwrap().0, first);
+                assert_eq!(state.next_question().unwrap().0, first);
                 first_updates(SessionUpdate::Failed {
                     reason: "process exited".into(),
                 });
                 state.drain_updates();
-                assert!(state.next_interaction().is_none());
+                assert!(state.next_question().is_none());
                 assert!(!state.respond_to_interaction(
                     first,
                     fx_agent::provider::UserResponse::CancelQuestions {
                         id: "first-question".into()
                     }
                 ));
+            })
+        });
+    }
+
+    #[test]
+    fn an_approval_is_answered_once_and_never_through_the_question_dialog() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, _, agent, _) = test.update(|cx| workspace(cx, &paths));
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                let approval = |approved| fx_agent::provider::UserResponse::Approval {
+                    id: "approval".into(),
+                    approved,
+                };
+                let updates = state.update_sender_for(agent);
+                updates(SessionUpdate::Interaction {
+                    event: fx_agent::ProviderEvent::Approval(fx_agent::provider::ApprovalRequest {
+                        id: "approval".into(),
+                        tool_name: "Bash".into(),
+                        input: serde_json::json!({ "command": "cargo test" }),
+                        risk: fx_agent::provider::RiskLevel::Moderate,
+                    }),
+                });
+                state.drain_updates();
+                assert!(state.next_question().is_none(), "approvals have no dialog");
+                assert!(
+                    !state.awaits_answer(agent, "approval"),
+                    "with no turn running, nothing would hear the answer"
+                );
+
+                let (runner, mut received) = crate::session::TurnRunner::detached();
+                state.runners.insert(agent, runner);
+                assert!(state.awaits_answer(agent, "approval"));
+                assert!(!state.awaits_answer(agent, "another"));
+                assert!(state.respond_to_interaction(agent, approval(true)));
+                assert!(!state.awaits_answer(agent, "approval"));
+                assert!(
+                    !state.respond_to_interaction(agent, approval(false)),
+                    "a second click reached the provider"
+                );
+                assert_eq!(received.try_recv().ok(), Some(approval(true)));
+                assert!(received.try_recv().is_err());
             })
         });
     }

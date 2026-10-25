@@ -305,6 +305,18 @@ impl TurnRunner {
         self.responses.send(response).is_ok()
     }
 
+    /// A runner with no turn behind it, and the receiver its answers reach.
+    #[cfg(test)]
+    pub(crate) fn detached() -> (Self, tokio::sync::mpsc::UnboundedReceiver<UserResponse>) {
+        let (responses, received) = tokio::sync::mpsc::unbounded_channel();
+        let runner = Self {
+            interrupt: tokio::sync::mpsc::unbounded_channel().0,
+            responses,
+            steers: tokio::sync::mpsc::unbounded_channel().0,
+        };
+        (runner, received)
+    }
+
     /// Send guidance into the running turn. `false` once the runner has gone.
     ///
     /// The answer arrives later as [`SessionUpdate::Steered`] with this `id`:

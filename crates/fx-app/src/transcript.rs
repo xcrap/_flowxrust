@@ -108,7 +108,13 @@ const LIVE_STEP_SELECTOR: &str = "transcript.live-step";
 /// The turn's task list.
 const PLAN_SELECTOR: &str = "transcript.plan";
 const TASKS_SELECTOR: &str = "transcript.background-tasks";
+/// An approval's button, followed by the request id and the button's label.
+const APPROVAL_ACTION_PREFIX: &str = "transcript.approval:";
 const ACTIVITY_PAGE_SIZE: usize = 20;
+
+/// The most of the window the tray of pending requests takes before it
+/// scrolls, leaving the transcript above it in view.
+const PENDING_PROMPTS_MAX_SHARE: f32 = 0.5;
 
 /// How often a running background task's clock is redrawn: once a second,
 /// which is the resolution it shows, rather than once a frame.
@@ -1612,7 +1618,7 @@ fn render(mut snapshot: Snapshot, window: &mut Window, cx: &mut App) -> AnyEleme
             Some(document),
             viewport,
         ))
-        .child(pending_prompts(&snapshot))
+        .child(pending_prompts(&snapshot, window, cx))
         .into_any_element()
 }
 
@@ -4127,41 +4133,57 @@ fn parse_questions(input: &str) -> Vec<RecordedQuestion> {
 ///
 /// Not a transcript row. An approval and a question are addressed to the person
 /// looking at the window, and they have to be reachable without scrolling back
-/// through the turn that raised them.
-fn pending_prompts(snapshot: &Snapshot) -> AnyElement {
+/// through the turn that raised them. An approval is answered here, on its
+/// card; a question opens a dialog, which has the fields to type an answer in.
+fn pending_prompts(snapshot: &Snapshot, window: &Window, cx: &App) -> AnyElement {
     let approvals = &snapshot.approvals;
     let questions = &snapshot.questions;
     if approvals.is_empty() && questions.is_empty() {
         return div().w(px(0.0)).h(px(0.0)).into_any_element();
     }
     let theme = global::current();
+    let state = crate::AppHandle::get(cx);
 
     let mut cards = div().flex().flex_col().gap(px_len(Spacing::MD));
     if !approvals.is_empty() {
         cards = cards.child(tray_title(
             Icon::HAND_RAISED_FILL,
-            "approval required",
+            ("Approval required", "approvals required"),
             approvals.len(),
         ));
         for approval in approvals {
-            cards = cards.child(approval_card(approval));
+            let answerable = state.as_ref().is_some_and(|handle| {
+                handle
+                    .0
+                    .read(cx)
+                    .awaits_answer(snapshot.agent_id, &approval.id)
+            });
+            cards = cards.child(approval_card(approval, snapshot.agent_id, answerable));
         }
     }
     if !questions.is_empty() {
         cards = cards.child(tray_title(
             Icon::QUESTIONMARK_BUBBLE_FILL,
-            "question",
+            ("Question", "questions"),
             questions.len(),
         ));
         for question in questions {
             cards = cards.child(pending_question_card(question));
         }
+        cards = cards.child(awaiting_response_note());
     }
-    cards = cards.child(awaiting_response_note());
 
     div()
+        // Scrolls rather than grows past a share of the window: a long command
+        // would otherwise push the transcript, and the buttons, out of reach.
+        .id(SharedString::from(format!(
+            "pending-prompts:{}",
+            snapshot.id
+        )))
         .flex_shrink_0()
         .w_full()
+        .max_h(window.viewport_size().height * PENDING_PROMPTS_MAX_SHARE)
+        .overflow_y_scroll()
         .flex()
         .flex_col()
         // Centred on the same measure as the transcript above it, so a card in
@@ -4182,7 +4204,9 @@ fn pending_prompts(snapshot: &Snapshot) -> AnyElement {
         .into_any_element()
 }
 
-fn tray_title(icon: Icon, label: &str, count: usize) -> AnyElement {
+/// The tray's heading for a kind of request: the singular alone, the plural
+/// after its count.
+fn tray_title(icon: Icon, (one, many): (&str, &str), count: usize) -> AnyElement {
     let theme = global::current();
     div()
         .flex()
@@ -4195,8 +4219,8 @@ fn tray_title(icon: Icon, label: &str, count: usize) -> AnyElement {
                 .fx_role(TextRole::CaptionMedium)
                 .text_color(Colors::fg_secondary(&theme))
                 .child(SharedString::from(match count {
-                    1 => label.to_string(),
-                    other => format!("{other} {label}"),
+                    1 => one.to_string(),
+                    other => format!("{other} {many}"),
                 })),
         )
         .child(
@@ -4209,7 +4233,7 @@ fn tray_title(icon: Icon, label: &str, count: usize) -> AnyElement {
         .into_any_element()
 }
 
-fn approval_card(approval: &PendingApproval) -> AnyElement {
+fn approval_card(approval: &PendingApproval, agent: Uuid, answerable: bool) -> AnyElement {
     let theme = global::current();
     let tone = match approval.risk {
         RiskLevelSerde::Safe => BadgeTone::Success,
@@ -4258,6 +4282,38 @@ fn approval_card(approval: &PendingApproval) -> AnyElement {
             SharedString::from(format!("approval:{}", approval.id)),
             false,
         ))
+        .child(approval_actions(approval, agent, answerable))
+        .into_any_element()
+}
+
+/// Deny and Allow once, answered straight to the provider.
+///
+/// Disabled once an answer is on its way, and for a request whose turn is
+/// gone: a button that cannot reach the provider looks live and does nothing.
+fn approval_actions(approval: &PendingApproval, agent: Uuid, answerable: bool) -> AnyElement {
+    let action = |label: &'static str, style: ButtonStyle, approved: bool| {
+        let id = approval.id.clone();
+        let selector = format!("{APPROVAL_ACTION_PREFIX}{id}:{label}");
+        div().debug_selector(move || selector.clone()).child(button(
+            label,
+            style,
+            answerable,
+            move |_, _, cx| crate::answer_approval(agent, id.clone(), approved, cx),
+        ))
+    };
+    div()
+        // Scopes the buttons' own ids, so two cards' Deny buttons do not
+        // share hover and press state.
+        .id(SharedString::from(format!(
+            "approval-actions:{}",
+            approval.id
+        )))
+        .flex()
+        .flex_row()
+        .justify_end()
+        .gap(px_len(Spacing::SM))
+        .child(action("Deny", ButtonStyle::Secondary, false))
+        .child(action("Allow once", ButtonStyle::Primary, true))
         .into_any_element()
 }
 
@@ -4324,7 +4380,7 @@ fn pretty_arguments(input: &serde_json::Value) -> String {
     serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string())
 }
 
-/// Direct the reader to the dialog that owns the provider response.
+/// Direct the reader to the dialog that answers a question.
 fn awaiting_response_note() -> AnyElement {
     let theme = global::current();
     div()
@@ -5324,6 +5380,64 @@ mod tests {
             risk: RiskLevelSerde::Safe,
         });
         paint(conversation);
+    }
+
+    #[test]
+    fn an_approval_is_answered_from_its_card() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = fx_store::AppPaths::at(temp.path().join("state"));
+        let mut test = TestAppContext::single();
+        let agent = Uuid::new_v4();
+        let mut received = test.update(|cx| {
+            let state = cx.new(|cx| crate::AppState::restore(paths, cx));
+            crate::AppHandle::install(state.clone(), cx);
+            state.update(cx, |state, _| {
+                state.update_sender_for(agent)(crate::session::SessionUpdate::Interaction {
+                    event: ProviderEvent::Approval(fx_agent::provider::ApprovalRequest {
+                        id: "a1".into(),
+                        tool_name: "Bash".into(),
+                        input: serde_json::json!({ "command": "cargo test" }),
+                        risk: fx_agent::provider::RiskLevel::Moderate,
+                    }),
+                });
+                state.drain_updates();
+                let (runner, received) = crate::session::TurnRunner::detached();
+                state.runners.insert(agent, runner);
+                received
+            })
+        });
+        let mut conversation = Conversation::new(agent);
+        conversation.add_approval(PendingApproval {
+            id: "a1".into(),
+            tool_name: "Bash".into(),
+            input: serde_json::json!({ "command": "cargo test" }),
+            risk: RiskLevelSerde::Moderate,
+        });
+        let window = test.add_window(move |_, _| Harness { conversation });
+        let mut visual = VisualTestContext::from_window(*window.deref(), &test);
+        visual.simulate_resize(size(px(900.0), px(600.0)));
+        test.refresh().unwrap();
+
+        assert!(drew(&mut visual, "transcript.approval:a1:Deny"));
+        let allow = visual
+            .debug_bounds("transcript.approval:a1:Allow once")
+            .expect("the card has an Allow button")
+            .center();
+        visual.simulate_click(allow, Default::default());
+        test.refresh().unwrap();
+        visual.simulate_click(allow, Default::default());
+
+        assert_eq!(
+            received.try_recv().ok(),
+            Some(fx_agent::provider::UserResponse::Approval {
+                id: "a1".into(),
+                approved: true,
+            })
+        );
+        assert!(
+            received.try_recv().is_err(),
+            "the second click answered too"
+        );
     }
 
     #[test]

@@ -2,9 +2,9 @@
 
 use std::sync::mpsc;
 
-use fx_agent::provider::{ProviderEvent, UserResponse};
+use fx_agent::provider::{UserInputRequest, UserResponse};
 use fx_core::services::runtime::{BinaryHealth, BinarySpec, RuntimeDiscovery, all_specs};
-use fx_design::components::{ButtonStyle, button, card, choice_row, divider, panel};
+use fx_design::components::{ButtonStyle, button, choice_row, divider, panel};
 use fx_design::icon::Icon;
 use fx_design::styled::{FxStyled, px_len};
 use fx_design::theme::{Colors, IconSize, Layout, Shadow, Spacing, global};
@@ -361,10 +361,10 @@ impl WorkspaceUi {
         {
             return;
         }
-        let pending = state.read(cx).next_interaction();
+        let pending = state.read(cx).next_question();
         let key = pending
             .as_ref()
-            .and_then(|(agent, event)| request_id(event).map(|id| (*agent, id.to_string())));
+            .map(|(agent, request)| (*agent, request.id.clone()));
         if key == self.request_key {
             return;
         }
@@ -376,22 +376,16 @@ impl WorkspaceUi {
         }
         self.request_key = key;
         self.request =
-            pending.map(|(agent, event)| RequestPanel::new(state.clone(), agent, event, cx));
+            pending.map(|(agent, request)| RequestPanel::new(state.clone(), agent, request, cx));
     }
 }
 
-fn request_id(event: &ProviderEvent) -> Option<&str> {
-    match event {
-        ProviderEvent::Approval(request) => Some(&request.id),
-        ProviderEvent::UserInput(request) => Some(&request.id),
-        _ => None,
-    }
-}
-
+/// The dialog for a provider's question. Approvals are answered on their card
+/// in the transcript instead.
 pub struct RequestPanel {
     state: Entity<AppState>,
     agent: Uuid,
-    event: ProviderEvent,
+    request: UserInputRequest,
     fields: Vec<Entity<TextField>>,
     _observations: Vec<Subscription>,
     sent: bool,
@@ -403,25 +397,22 @@ impl RequestPanel {
     fn new(
         state: Entity<AppState>,
         agent: Uuid,
-        event: ProviderEvent,
+        request: UserInputRequest,
         cx: &mut App,
     ) -> Entity<Self> {
         cx.new(|cx| {
-            let fields = match &event {
-                ProviderEvent::UserInput(request) => request
-                    .questions
-                    .iter()
-                    .map(|question| {
-                        cx.new(|cx| {
-                            TextField::new(cx)
-                                .placeholder("Your answer")
-                                .max_len(16_000)
-                                .secret(question.is_secret)
-                        })
+            let fields: Vec<_> = request
+                .questions
+                .iter()
+                .map(|question| {
+                    cx.new(|cx| {
+                        TextField::new(cx)
+                            .placeholder("Your answer")
+                            .max_len(16_000)
+                            .secret(question.is_secret)
                     })
-                    .collect(),
-                _ => Vec::new(),
-            };
+                })
+                .collect();
             let observations = fields
                 .iter()
                 .map(|field| cx.observe(field, |_, _, cx| cx.notify()))
@@ -429,7 +420,7 @@ impl RequestPanel {
             Self {
                 state,
                 agent,
-                event,
+                request,
                 fields,
                 _observations: observations,
                 sent: false,
@@ -452,9 +443,7 @@ impl RequestPanel {
     }
 
     fn answers(&self, cx: &App) -> Option<UserResponse> {
-        let ProviderEvent::UserInput(request) = &self.event else {
-            return None;
-        };
+        let request = &self.request;
         let answers: Vec<_> = request
             .questions
             .iter()
@@ -505,13 +494,13 @@ impl Render for RequestPanel {
             .find(|agent| agent.id == self.agent)
             .map(|agent| agent.title.clone())
             .unwrap_or_else(|| "Conversation".into());
-        let (heading, icon) = match &self.event {
-            ProviderEvent::Approval(_) => ("Allow this action?", Icon::LOCK_SHIELD_FILL),
-            ProviderEvent::UserInput(request) if request.questions.len() > 1 => {
-                ("A few questions", Icon::QUESTIONMARK_BUBBLE_FILL)
-            }
-            _ => ("A quick question", Icon::QUESTIONMARK_BUBBLE_FILL),
+        let request = &self.request;
+        let heading = if request.questions.len() > 1 {
+            "A few questions"
+        } else {
+            "A quick question"
         };
+        let icon = Icon::QUESTIONMARK_BUBBLE_FILL;
         let header = div()
             .w_full()
             .flex()
@@ -551,131 +540,75 @@ impl Render for RequestPanel {
             .px(px_len(Spacing::XXL))
             .py(px_len(Spacing::LG))
             .flex_shrink_0();
-        match &self.event {
-            ProviderEvent::Approval(request) => {
-                body = body
-                    .child(
+        for (index, question) in request.questions.iter().enumerate() {
+            let mut section = div().w_full().flex().flex_col().gap(px_len(Spacing::MD));
+            if request.questions.len() > 1 || !question.header.is_empty() {
+                section = section.child(
+                    div()
+                        .fx_caption()
+                        .text_color(Colors::fg_tertiary(&theme))
+                        .child(SharedString::from(if question.header.is_empty() {
+                            format!("Question {}", index + 1)
+                        } else {
+                            question.header.clone()
+                        })),
+                );
+            }
+            section = section.child(
+                div()
+                    .fx_body_medium()
+                    .child(SharedString::from(question.question.clone())),
+            );
+            for option in &question.options {
+                let field = self.fields[index].clone();
+                let value = option.label.clone();
+                let selected = field.read(cx).value() == option.label;
+                section = section.child(choice_row(
+                    SharedString::from(option.label.clone()),
+                    SharedString::from(option.description.clone()),
+                    selected,
+                    !self.sent,
+                    move |_, _, cx| {
+                        field.update(cx, |field, cx| field.set_value(value.clone(), cx))
+                    },
+                ));
+            }
+            section = section
+                .when(!question.options.is_empty(), |section| {
+                    section.child(
                         div()
-                            .flex()
-                            .flex_col()
-                            .gap(px_len(Spacing::XS))
-                            .child(div().fx_body_medium().child(SharedString::from(request.tool_name.clone())))
-                            .child(
-                                div()
-                                    .fx_caption()
-                                    .text_color(Colors::fg_secondary(&theme))
-                                    .child("Review the request before allowing the conversation to continue."),
-                            ),
-                    )
-                    .child(card(
-                        div()
-                            .id("approval-details")
-                            .w_full()
-                            .min_w_0()
-                            .overflow_x_scroll()
-                            .fx_mono()
+                            .fx_caption()
                             .text_color(Colors::fg_secondary(&theme))
-                            .child(SharedString::from(
-                                serde_json::to_string_pretty(&request.input)
-                                    .unwrap_or_else(|_| request.input.to_string()),
-                            )),
-                        Spacing::MD,
-                    ));
-                let allow = UserResponse::Approval {
-                    id: request.id.clone(),
-                    approved: true,
-                };
-                let deny = UserResponse::Approval {
-                    id: request.id.clone(),
-                    approved: false,
-                };
-                footer = footer
-                    .child(button(
-                        "Deny",
-                        ButtonStyle::Secondary,
-                        !self.sent,
-                        cx.listener(move |this, _, _, cx| this.respond(deny.clone(), cx)),
-                    ))
-                    .child(button(
-                        "Allow once",
-                        ButtonStyle::Primary,
-                        !self.sent,
-                        cx.listener(move |this, _, _, cx| this.respond(allow.clone(), cx)),
-                    ));
+                            .child("Choose an option above or enter your answer."),
+                    )
+                })
+                .child(self.fields[index].clone());
+            body = body.child(section);
+            if index + 1 < request.questions.len() {
+                body = body.child(divider());
             }
-            ProviderEvent::UserInput(request) => {
-                for (index, question) in request.questions.iter().enumerate() {
-                    let mut section = div().w_full().flex().flex_col().gap(px_len(Spacing::MD));
-                    if request.questions.len() > 1 || !question.header.is_empty() {
-                        section = section.child(
-                            div()
-                                .fx_caption()
-                                .text_color(Colors::fg_tertiary(&theme))
-                                .child(SharedString::from(if question.header.is_empty() {
-                                    format!("Question {}", index + 1)
-                                } else {
-                                    question.header.clone()
-                                })),
-                        );
-                    }
-                    section = section.child(
-                        div()
-                            .fx_body_medium()
-                            .child(SharedString::from(question.question.clone())),
-                    );
-                    for option in &question.options {
-                        let field = self.fields[index].clone();
-                        let value = option.label.clone();
-                        let selected = field.read(cx).value() == option.label;
-                        section = section.child(choice_row(
-                            SharedString::from(option.label.clone()),
-                            SharedString::from(option.description.clone()),
-                            selected,
-                            !self.sent,
-                            move |_, _, cx| {
-                                field.update(cx, |field, cx| field.set_value(value.clone(), cx))
-                            },
-                        ));
-                    }
-                    section = section
-                        .when(!question.options.is_empty(), |section| {
-                            section.child(
-                                div()
-                                    .fx_caption()
-                                    .text_color(Colors::fg_secondary(&theme))
-                                    .child("Choose an option above or enter your answer."),
-                            )
-                        })
-                        .child(self.fields[index].clone());
-                    body = body.child(section);
-                    if index + 1 < request.questions.len() {
-                        body = body.child(divider());
-                    }
-                }
-                let answers = self.answers(cx);
-                let cancel = UserResponse::CancelQuestions {
-                    id: request.id.clone(),
-                };
-                footer = footer
-                    .child(button(
-                        "Cancel",
-                        ButtonStyle::Secondary,
-                        !self.sent,
-                        cx.listener(move |this, _, _, cx| this.respond(cancel.clone(), cx)),
-                    ))
-                    .child(button(
-                        "Send answers",
-                        ButtonStyle::Primary,
-                        !self.sent && answers.is_some(),
-                        cx.listener(move |this, _, _, cx| {
-                            if let Some(answer) = this.answers(cx) {
-                                this.respond(answer, cx);
-                            }
-                        }),
-                    ));
-            }
-            _ => {}
         }
+        let answers = self.answers(cx);
+        let cancel = UserResponse::CancelQuestions {
+            id: request.id.clone(),
+        };
+        footer = footer
+            .child(button(
+                "Cancel",
+                ButtonStyle::Secondary,
+                !self.sent,
+                cx.listener(move |this, _, _, cx| this.respond(cancel.clone(), cx)),
+            ))
+            .child(button(
+                "Send answers",
+                ButtonStyle::Primary,
+                !self.sent && answers.is_some(),
+                cx.listener(move |this, _, _, cx| {
+                    if let Some(answer) = this.answers(cx) {
+                        this.respond(answer, cx);
+                    }
+                }),
+            ));
         let content = div()
             .w_full()
             .flex()
@@ -721,7 +654,7 @@ impl Render for RequestPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fx_agent::provider::{Question, UserInputRequest};
+    use fx_agent::provider::{ProviderEvent, Question};
     use fx_design::theme::{AccentColor, AppearanceMode, BaseTone, TextSizePreset};
     use fx_store::{AppPaths, PersistedPreferences};
 
@@ -841,7 +774,7 @@ mod tests {
     }
 
     #[test]
-    fn a_mounted_approval_blocks_typing_into_the_covered_composer() {
+    fn an_approval_opens_no_dialog_and_leaves_the_composer_typing() {
         let temp = tempfile::tempdir().unwrap();
         let mut test = gpui::TestAppContext::single();
         let (state, ui, composer) =
@@ -874,15 +807,17 @@ mod tests {
             );
         });
         window.update(&mut test, |_, _, cx| cx.notify()).unwrap();
-        test.refresh().expect("the approval overlay painted");
+        test.refresh().expect("the workspace repainted");
         window
             .update(&mut test, |_, window, cx| {
-                assert!(ui.read(cx).request.is_some());
-                assert!(!composer.read(cx).focus_handle().is_focused(window));
+                // Answered on its card in the transcript, not in a dialog.
+                assert!(ui.read(cx).request.is_none());
+                assert!(!has_modal(&state, cx));
+                assert!(composer.read(cx).focus_handle().is_focused(window));
             })
             .unwrap();
-        test.simulate_input(window.into(), "should-not-be-a-draft");
-        test.update(|cx| assert_eq!(composer.read(cx).value(), "draft"));
+        test.simulate_input(window.into(), " more");
+        test.update(|cx| assert_eq!(composer.read(cx).value(), "draft more"));
     }
 
     #[test]
@@ -946,10 +881,10 @@ mod tests {
             let panel = RequestPanel::new(
                 state,
                 Uuid::new_v4(),
-                ProviderEvent::UserInput(UserInputRequest {
+                UserInputRequest {
                     id: "request-envelope".into(),
                     questions: vec![question("database", false), question("region", false)],
-                }),
+                },
                 cx,
             );
             assert!(panel.read(cx).answers(cx).is_none());
@@ -983,10 +918,10 @@ mod tests {
             let panel = RequestPanel::new(
                 state,
                 Uuid::new_v4(),
-                ProviderEvent::UserInput(UserInputRequest {
+                UserInputRequest {
                     id: "auth-request".into(),
                     questions: vec![question("password", true)],
-                }),
+                },
                 cx,
             );
             let field = panel.read(cx).fields[0].clone();

@@ -1535,6 +1535,19 @@ pub(crate) fn recover_turn(
     start_turn_with(&state, &root, agent, prompt, attachments, cx);
 }
 
+/// Answer an approval from its card in the transcript.
+pub(crate) fn answer_approval(agent_id: uuid::Uuid, id: String, approved: bool, cx: &mut App) {
+    let Some(handle) = AppHandle::get(cx) else {
+        return;
+    };
+    handle.0.update(cx, |state, cx| {
+        let response = fx_agent::provider::UserResponse::Approval { id, approved };
+        if state.respond_to_interaction(agent_id, response) {
+            cx.notify();
+        }
+    });
+}
+
 /// The app-wide menu.
 pub fn app_menu() -> MenuModel {
     MenuModel::new(vec![
