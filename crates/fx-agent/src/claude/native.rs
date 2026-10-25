@@ -679,7 +679,16 @@ fn parse_file(
                 parsed.last_prompt = nonempty(&object["lastPrompt"]);
             }
             "user" | "assistant" => {
-                if object["isMeta"].as_bool() == Some(true) {
+                // A background task's notification is recorded as a user
+                // message, but it is Claude's own bookkeeping: nobody wrote
+                // it, FlowX never shows it, and it is not the thread's latest
+                // prompt. Kept, it split the replies around it into separate
+                // turns, so FlowX's copy of the thread never matched this
+                // history and the sync warned on every pass.
+                if object["isMeta"].as_bool() == Some(true)
+                    || object["origin"]["kind"].as_str() == Some("task-notification")
+                    || is_claude_bookkeeping(&object)
+                {
                     continue;
                 }
                 let assistant = object["type"] == "assistant";
@@ -883,6 +892,30 @@ fn content_string(value: &Value) -> String {
             .join("\n");
     }
     value.to_string()
+}
+
+/// What Claude Code writes for itself when a turn is interrupted: the
+/// `[Request interrupted by user…]` marker as a user message, and a synthetic
+/// "No response requested." reply. FlowX shows neither — Stop is its own
+/// state — and both split the turn around them, so FlowX's copy of a thread
+/// that was ever interrupted could not be found in its history. A synthetic
+/// API error is kept: it is what the turn said when it failed.
+fn is_claude_bookkeeping(record: &Value) -> bool {
+    let message = &record["message"];
+    if record["type"] == "assistant" {
+        return message["model"].as_str() == Some("<synthetic>")
+            && record["isApiErrorMessage"].as_bool() != Some(true);
+    }
+    let text = match &message["content"] {
+        Value::String(text) => Some(text.as_str()),
+        Value::Array(blocks) => match blocks.as_slice() {
+            [block] if block["type"] == "text" => block["text"].as_str(),
+            _ => None,
+        },
+        _ => None,
+    };
+    text.map(str::trim)
+        .is_some_and(|text| text.starts_with("[Request interrupted by user") && text.ends_with(']'))
 }
 
 fn prompt_text(value: &Value) -> Option<String> {
@@ -1141,6 +1174,77 @@ mod tests {
             self.desktop
                 .join("account/organization/local_desktop-id.json")
         }
+    }
+
+    #[test]
+    fn a_task_notification_is_not_a_message_or_a_prompt() {
+        // The shape Claude Code 2.1.283 writes: a user record whose origin is
+        // the notification, between the replies FlowX shows as one.
+        let fixture = Fixture::new();
+        let mut notification = fixture.record(
+            "user",
+            "<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n</task-notification>",
+            Uuid::new_v4(),
+        );
+        notification["origin"] = json!({ "kind": "task-notification" });
+        notification["promptSource"] = json!("system");
+        fixture.write(&[
+            fixture.record("user", "Run the reviewers", Uuid::new_v4()),
+            fixture.record("assistant", "Started them.", Uuid::new_v4()),
+            notification,
+            fixture.record("assistant", "One is back.", Uuid::new_v4()),
+        ]);
+        let thread = fixture.store().read(fixture.root(), SESSION).unwrap();
+        let texts: Vec<_> = thread
+            .messages
+            .iter()
+            .map(|message| (message.role, message.text_content()))
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                (MessageRole::User, "Run the reviewers".to_string()),
+                (MessageRole::Assistant, "Started them.".to_string()),
+                (MessageRole::Assistant, "One is back.".to_string()),
+            ]
+        );
+        assert_eq!(thread.entry.summary.title, "Run the reviewers");
+    }
+
+    #[test]
+    fn an_interruptions_markers_are_not_messages() {
+        // What Claude Code 2.1.283 wrote when a turn was interrupted and the
+        // user then said "continue...".
+        let fixture = Fixture::new();
+        let marker = fixture.record(
+            "user",
+            "[Request interrupted by user for tool use]",
+            Uuid::new_v4(),
+        );
+        let mut synthetic = fixture.record("assistant", "No response requested.", Uuid::new_v4());
+        synthetic["message"]["model"] = json!("<synthetic>");
+        synthetic["isApiErrorMessage"] = json!(false);
+        let mut failure = fixture.record("assistant", "API Error: overloaded", Uuid::new_v4());
+        failure["message"]["model"] = json!("<synthetic>");
+        failure["isApiErrorMessage"] = json!(true);
+        fixture.write(&[
+            fixture.record("user", "fix them all", Uuid::new_v4()),
+            marker,
+            synthetic,
+            fixture.record("user", "continue...", Uuid::new_v4()),
+            failure,
+        ]);
+        let thread = fixture.store().read(fixture.root(), SESSION).unwrap();
+        let texts: Vec<_> = thread
+            .messages
+            .iter()
+            .map(|message| message.text_content())
+            .collect();
+        assert_eq!(
+            texts,
+            ["fix them all", "continue...", "API Error: overloaded"],
+            "an API error is what the turn said, and stays"
+        );
     }
 
     #[test]

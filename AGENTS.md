@@ -456,6 +456,13 @@ what "completion" means, and each rule here was a lost result first:
   `init` plus a zero-turn `result` per batch, before the prompt is read. Those
   neither end the turn nor prove the prompt was read; only tasks started in this
   process are tracked.
+- **Claude's history file holds bookkeeping FlowX never shows.** A task
+  notification is a user record (`origin.kind` `task-notification`), and an
+  interruption writes a `[Request interrupted by user…]` user record and a
+  `<synthetic>` "No response requested." reply. The history reader drops all
+  three. Kept, they split the turns around them, FlowX's copy of an
+  interrupted or task-heavy thread was never found in its history, and the
+  sidebar said "Thread sync needs attention" on every pass.
 
 Read-only command checks for both providers go through one classifier,
 `fx-agent::shell`, which fails closed on control operators, substitutions and
