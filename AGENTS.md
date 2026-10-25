@@ -456,13 +456,20 @@ Two more, for how a turn ends:
   `Bash` call in a session of its own and `codex app-server` gives each command
   a group of its own. So Stop works on the provider's *tree* — its
   descendants, and every group and session one of them leads, which still
-  finds a tool's children once launchd has adopted them. The tree is taken
-  before the provider is asked to exit. Stop sends the provider's interrupt,
-  then SIGTERM to the tree, a short grace, then SIGKILL. A turn that finished
-  normally only stops the server, so a dev server the agent started on purpose
-  keeps running. The fakes start their tools the same way; a fake whose child
-  stayed in the provider's group passed against a Stop that reached no real
-  tool.
+  finds a tool's children once launchd has adopted them. Stop sends the
+  provider's interrupt, then SIGTERM to the tree, a short grace, then SIGKILL.
+  A turn that finished normally only stops the server, so a dev server the
+  agent started on purpose keeps running. The fakes start their tools the same
+  way; a fake whose child stayed in the provider's group passed against a Stop
+  that reached no real tool.
+- **The tree is watched, not taken at Stop.** Taken at Stop, it missed every
+  tool of a Claude that had already died, or been killed for an oversized
+  line: with Claude gone, nothing in the table leads to a session it started.
+  `process::Watched` records Claude's tree from spawn and re-reads it every
+  500 ms and at each `task_started`, and Stop, a failed turn and Quit all end
+  what it last saw joined with what the table shows now. A group or session is
+  forgotten once empty, because a record that lives for hours would otherwise
+  claim the next unrelated process to be handed its id.
 - **Quit cannot await any of that.** GPUI waits a tenth of a second for quit
   handlers, so every transport registers its provider while it runs, and the
   quit handler calls `fx_agent::stop_all_now`, which ends every registered tree
@@ -480,9 +487,28 @@ what "completion" means, and each rule here was a lost result first:
   and the turn then reads to the process's exit. A zero-turn acknowledgement
   after the prompt was answered counts as that answer. `BackgroundWait` in
   `session.rs` holds the turn's half of these rules.
+- **Only an ending Claude tells the model is owed an answer.** A task that
+  completed or failed is. One that was stopped (TaskStop, KillShell, a
+  Monitor's timeout) is not: Claude marks a shell or monitor told as it kills
+  it, and an agent the turn stopped is told inside that turn. Nor is one
+  whose `task_started` says `owned_by_subagent`: its subagent is told. And one
+  that ends while a turn still works is answered in that turn when a request
+  follows it (`system` `status: requesting`, which Claude sends after gathering
+  what is queued), and as a turn of its own only when none does. Each of those
+  was once owed regardless, and held stdin open for a follow-up that never
+  came: the turn spun until Stop and its finished answer was recorded as
+  cancelled.
+- **A task holds stdin from its patch to its notification.** `task_updated`
+  with a terminal status comes a line before the `task_notification` that owes
+  the answer. Read as the end of the wait, it closed stdin there, and the
+  follow-up's permissions then failed inside Claude ("Stream closed") and a
+  steer was refused. A stopped task's patch holds nothing.
 - **A steer may be answered after the `result` it raced.** Once guidance has
   been written, a `result` reads to the process's exit rather than stopping it,
-  or the answer to a steer reported as accepted is killed 750 ms later.
+  or the answer to a steer reported as accepted is killed 750 ms later. Claude
+  says when it still holds one: every `result` carries `queued_turn_count`,
+  and stdin stays open until a later `result` reports zero. Closed at the
+  first, the steer's answer ran with no way to ask for a permission.
 - **Background tasks run until they end or Stop.** The CLI's
   `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` defaults to 10 minutes because a `-p`
   run has to end unattended; applied by default here, it stopped six working
@@ -502,6 +528,13 @@ what "completion" means, and each rule here was a lost result first:
   three. Kept, they split the turns around them, FlowX's copy of an
   interrupted or task-heavy thread was never found in its history, and the
   sidebar said "Thread sync needs attention" on every pass.
+- **…and records a steer as something other than a user message.** A message
+  sent while a turn runs is read into that turn after the current tool's
+  result and recorded as an `attachment` of type `queued_command`. The reader
+  keeps the user's own — `commandMode` `prompt`, not meta, origin `human` or
+  none — as a user message, between the replies FlowX's live row sits between
+  when the steer went in during a tool call. Read only as user records, a
+  steered thread's history never caught up with FlowX's copy.
 
 Read-only command checks for both providers go through one classifier,
 `fx-agent::shell`, which fails closed on control operators, substitutions and

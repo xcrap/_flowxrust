@@ -25,15 +25,19 @@
 //!   afterwards. The Swift original failed a turn whose exit status was non-zero
 //!   *after* a complete answer, discarding a finished response over a status
 //!   code.
-//! - **stdin closes at a `result` with no background task running.** That is
-//!   not tidiness, it is what makes the process exit: a `-p` run that has
-//!   answered and still holds its input pipe open never terminates, so the turn
-//!   would hang after its own answer. Every write after that point is refused
-//!   rather than dropped into a closed pipe, where it would vanish with no error
-//!   anywhere. While a task runs the input stays open: Claude answers the task's
-//!   notification as a turn of its own, and an open input is what lets the user
-//!   steer meanwhile. Once it closes, Claude still runs any follow-up it has
-//!   queued, waits for tasks a follow-up started, and then exits.
+//! - **stdin closes at a `result` with nothing still to answer.** That is not
+//!   tidiness, it is what makes the process exit: a `-p` run that has answered
+//!   and still holds its input pipe open never terminates, so the turn would
+//!   hang after its own answer. Every write after that point is refused rather
+//!   than dropped into a closed pipe, where it would vanish with no error
+//!   anywhere. The input stays open while a background task runs, while one
+//!   that ended is still owed its answer, and while Claude holds a message of
+//!   the user's it has yet to answer: each of those is a turn still to come,
+//!   and an open input is what lets it be steered and its permissions
+//!   answered. Held for an answer that never comes, it is a turn that spins
+//!   until Stop, so the parser owes one only where Claude gives one. Once it
+//!   closes, Claude still runs any follow-up it has queued, waits for tasks a
+//!   follow-up started, and then exits.
 //! - **stderr is captured, not inherited.** A CLI that cannot start says why
 //!   there, and that text is the only useful diagnostic for a turn that failed
 //!   before saying anything.
@@ -92,6 +96,13 @@ const CLOSE_GRACE: Duration = Duration::from_millis(750);
 /// How long a stopped turn's process group gets to exit on SIGTERM before it
 /// is killed.
 const TERMINATE_GRACE: Duration = Duration::from_millis(500);
+
+/// How often a running Claude's tree is read again.
+///
+/// Nothing in the stream says when a foreground tool's process starts, so a
+/// refresh is the only way to see it before Claude can die and leave it
+/// behind. Reading the whole process table takes about half a millisecond.
+const TREE_REFRESH: Duration = Duration::from_millis(500);
 
 /// The id FlowX gives its interrupt control request. One process serves one
 /// turn, so one id is enough.
@@ -472,9 +483,14 @@ enum Write {
 struct Inner {
     /// The process, taken once it is reaped.
     child: Mutex<Option<Child>>,
-    /// The process's own group, which the tools it runs inherit. Kept apart
-    /// from `child` because the group outlives a reaped leader.
-    group: Option<crate::process::Group>,
+    /// Everything the process has started, from its own group out, kept
+    /// current while it runs. Kept apart from `child` because it outlives a
+    /// reaped leader.
+    ///
+    /// Taken at Stop, the tree missed every tool of a Claude that had already
+    /// died or been killed: Claude starts each `Bash` call in a session of
+    /// its own, and with Claude gone nothing in the table leads back to it.
+    tree: Option<crate::process::Watched>,
     /// The process's place in the list Quit ends, until it closes.
     running: std::sync::Mutex<Option<crate::process::Running>>,
     /// The parser, shared so an approval can be answered from a task other than
@@ -570,14 +586,19 @@ impl ClaudeTransport {
             let _ = stderr_tx.send(crate::process::decode(&buffer));
         });
 
+        let tree = group.map(crate::process::Watched::new);
+        let running = group
+            .zip(tree.clone())
+            .map(|(group, tree)| crate::process::Running::watching(group, tree));
         let inner = Arc::new(Inner {
             child: Mutex::new(Some(child)),
-            group,
-            running: std::sync::Mutex::new(group.map(crate::process::Running::register)),
+            tree,
+            running: std::sync::Mutex::new(running),
             parser: Mutex::new(ClaudeStreamParser::new()),
             input: Mutex::new(TurnInput::new()),
             exited: Mutex::new(None),
         });
+        watch_tree(&inner);
         let (events_tx, events_rx) = mpsc::channel::<StreamItem>(EVENT_QUEUE_DEPTH);
 
         let reader = tokio::spawn(read_stdout(ReadParts {
@@ -830,13 +851,18 @@ impl ClaudeTransport {
     /// The input is closed first, for the reason `close` gives, and the
     /// process gets the same moment to end on its own. Then the whole tree
     /// gets SIGTERM, a grace period, and SIGKILL — whether or not Claude itself
-    /// has gone, because a tool it started can outlive it. The tree is taken
-    /// before any of that: Claude starts each `Bash` call in a session of its
-    /// own, outside its group, and once Claude has exited nothing but that
-    /// record still leads to the tool. A caller stopping a turn sends
-    /// [`Self::interrupt`] before this.
+    /// has gone, because a tool it started can outlive it. The tree is the one
+    /// watched since Claude started, read once more before any of that:
+    /// Claude starts each `Bash` call in a session of its own, outside its
+    /// group, and once Claude has exited — or died before anyone pressed
+    /// Stop — nothing but that record still leads to the tool. A caller
+    /// stopping a turn sends [`Self::interrupt`] before this.
     pub async fn terminate(&self) {
-        let tree = self.inner.group.map(crate::process::Group::tree);
+        let tree = self
+            .inner
+            .tree
+            .as_ref()
+            .map(crate::process::Watched::snapshot);
         self.close_input().await;
         let mut slot = self.inner.child.lock().await;
         if let Some(child) = slot.as_mut() {
@@ -970,6 +996,32 @@ async fn write_stdin_loop(
     }
 }
 
+/// Keep the process's tree current until it has ended.
+///
+/// Stops when the transport is gone or the process has been reaped. What it
+/// left behind stays in the record, which only a stop reads from then on.
+fn watch_tree(inner: &Arc<Inner>) {
+    let Some(tree) = inner.tree.clone() else {
+        return;
+    };
+    let transport = Arc::downgrade(inner);
+    tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(TREE_REFRESH);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticks.tick().await;
+            let Some(inner) = transport.upgrade() else {
+                break;
+            };
+            if inner.exited.lock().await.is_some() {
+                break;
+            }
+            drop(inner);
+            tree.refresh();
+        }
+    });
+}
+
 /// Wait for the process, so its exit status is known.
 ///
 /// Bounded, and a process still running after the grace period is killed:
@@ -977,8 +1029,13 @@ async fn write_stdin_loop(
 /// that never leaves reports nothing at all. `None` when the transport has
 /// already waited for the process itself, which is what `close` does: the status
 /// was collected there and there is nothing left to take.
-async fn reap(child: &Mutex<Option<Child>>) -> Option<i32> {
-    let mut slot = child.lock().await;
+///
+/// Only the leader is killed here. Whether its tools go too is the turn's
+/// decision — a turn that failed terminates the tree, one that finished leaves
+/// what the agent meant to keep running — so the tree is read once more first,
+/// while Claude is still alive to lead to everything it started.
+async fn reap(inner: &Inner) -> Option<i32> {
+    let mut slot = inner.child.lock().await;
     let mut process = slot.take()?;
     match tokio::time::timeout(SHUTDOWN_GRACE, process.wait()).await {
         Ok(Ok(status)) => status.code(),
@@ -987,6 +1044,9 @@ async fn reap(child: &Mutex<Option<Child>>) -> Option<i32> {
             None
         }
         Err(_) => {
+            if let Some(tree) = &inner.tree {
+                tree.refresh();
+            }
             let _ = process.start_kill();
             None
         }
@@ -1088,7 +1148,7 @@ async fn read_stdout(parts: ReadParts) {
 
     // Reaped before stderr is read, because the process's death is what closes
     // that pipe — and the kill on timeout is what guarantees it closes.
-    let code = reap(&inner.child).await;
+    let code = reap(&inner).await;
     let captured = match tokio::time::timeout(SHUTDOWN_GRACE, stderr).await {
         Ok(Ok(captured)) => captured,
         Ok(Err(_)) => {
@@ -1129,8 +1189,9 @@ async fn deliver_line(
     if line.trim().is_empty() {
         return;
     }
-    let (produced, refusal, finished) = {
+    let (produced, refusal, finished, started_task) = {
         let mut parser = inner.parser.lock().await;
+        let tasks_before = parser.tasks_started();
         let produced = parser.events(line);
         // A control request this parser cannot serve must be *answered*, not
         // merely recorded. Claude blocks on every one of them, so a refusal that
@@ -1138,14 +1199,22 @@ async fn deliver_line(
         // error and no way for the user to tell.
         let refusal = parser.take_refusal();
         // Completion is the parser's flag and nothing else. A background task
-        // still running will be reported as a turn of its own, and one that
-        // has ended is still owed an answer: the input is what lets those
-        // turns be steered and their permissions answered, so it stays open
-        // until a `result` leaves nothing outstanding. Closing is idempotent,
-        // so every line after that may ask again.
+        // still running will be reported as a turn of its own, one that has
+        // ended may still be owed an answer, and a message Claude has queued
+        // is answered next: the input is what lets those turns be steered and
+        // their permissions answered, so it stays open until nothing is
+        // outstanding. Closing is idempotent, so every line after a `result`
+        // asks again, and the line that settles the last of them closes it.
         let finished = parser.did_finish() && !parser.holds_input_open();
-        (produced, refusal, finished)
+        let started_task = parser.tasks_started() != tasks_before;
+        (produced, refusal, finished, started_task)
     };
+    // A task's process exists by the time Claude reports it started. Read
+    // into the tree now, while Claude still leads to it, rather than at the
+    // next refresh — which a Claude that dies first never gets.
+    if started_task && let Some(tree) = &inner.tree {
+        tree.refresh();
+    }
     if let Some(envelope) = refusal {
         // Encoded inline rather than through the transport's own `write`, which
         // needs `&self`; the reader task only has `Inner`.
@@ -1704,6 +1773,30 @@ mod process {
                     panic!("the turn ended without a result: {}", exit.reason());
                 }
                 None => panic!("the stream closed before the turn ended"),
+            }
+        }
+    }
+
+    /// Every event up to and including the first that `wanted` accepts.
+    async fn next_matching(
+        reader: &StreamReader,
+        wanted: impl Fn(&ProviderEvent) -> bool,
+    ) -> Vec<ProviderEvent> {
+        let mut events = Vec::new();
+        loop {
+            let item = tokio::time::timeout(Duration::from_secs(5), reader.next_event())
+                .await
+                .expect("the fake server said it in time")
+                .expect("the stream was open");
+            match item {
+                StreamItem::Event(event) => {
+                    let done = wanted(&event);
+                    events.push(event);
+                    if done {
+                        return events;
+                    }
+                }
+                StreamItem::Exited(exit) => panic!("the process ended first: {}", exit.reason()),
             }
         }
     }
@@ -2349,7 +2442,37 @@ mod process {
         );
         assert!(transport.inner.input.lock().await.is_open());
 
+        // The patch that says the task finished comes a line before the
+        // notification that owes the answer. The input used to close at the
+        // patch, so the follow-up's permissions failed inside Claude.
         server.release_background();
+        let patched = next_matching(&reader, |event| {
+            matches!(event, ProviderEvent::Task(task)
+                if task.status == crate::provider::TaskStatus::Completed && task.summary.is_none())
+        })
+        .await;
+        assert!(!patched.is_empty());
+        assert!(
+            transport.input_open().await,
+            "the input closed at the patch, before the notification"
+        );
+        transport
+            .send_prompt("between the two", &[] as &[&Path])
+            .await
+            .expect("a steer is written after the patch");
+        let between = tokio::time::timeout(Duration::from_secs(5), run_to_end(&reader))
+            .await
+            .expect("the steer was answered");
+        assert!(
+            between.contains(&ProviderEvent::TextDelta("between the two".into())),
+            "{between:?}"
+        );
+        assert!(
+            transport.input_open().await,
+            "the input closed with the notification still to come"
+        );
+
+        server.release_notification();
         let follow_up = tokio::time::timeout(Duration::from_secs(5), run_to_end(&reader))
             .await
             .expect("the follow-up turn arrived");
@@ -2373,6 +2496,130 @@ mod process {
         assert!(
             server.exited_within(Duration::from_secs(5)).await.is_some(),
             "the process outlived its last task's follow-up"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_task_nothing_answers_lets_the_process_exit_after_the_result() {
+        // Every notification used to be owed an answer. A task the agent
+        // stopped, one a subagent owned, and one whose notification the
+        // turn's own next request carried all held the input open after the
+        // turn's `result`, waiting for a follow-up that never came: the turn
+        // spun until Stop and its finished answer was recorded as cancelled.
+        for how in ["stopped", "subagent", "carried"] {
+            let Some(server) = FakeClaude::new() else {
+                return;
+            };
+            let mut transport = connect(&server).await.expect("started");
+            let reader = transport.reader().await;
+            transport
+                .send_prompt(&format!("!settled {how}"), &[] as &[&Path])
+                .await
+                .expect("written");
+            let events = tokio::time::timeout(Duration::from_secs(5), run_to_end(&reader))
+                .await
+                .expect("the turn ended");
+            assert!(
+                events.iter().any(
+                    |event| matches!(event, ProviderEvent::Task(task) if !task.status.is_running())
+                ),
+                "{how}: {events:?}"
+            );
+            assert!(
+                !transport.input_open().await,
+                "{how}: the input was held for an answer nobody gives"
+            );
+            assert!(
+                server.exited_within(Duration::from_secs(5)).await.is_some(),
+                "{how}: the process outlived a turn with nothing left to answer"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_steer_queued_behind_a_result_can_still_be_given_a_permission() {
+        // A steer written as the turn ended is queued in Claude, which ends
+        // the turn and answers the steer next. The input closed at that
+        // `result`, so the permission the answer asked for could not be
+        // given: Claude failed it with "Stream closed".
+        let Some(server) = FakeClaude::new() else {
+            return;
+        };
+        let mut transport = connect(&server).await.expect("started");
+        let reader = transport.reader().await;
+        transport
+            .send_prompt("!queued", &[] as &[&Path])
+            .await
+            .expect("written");
+        next_matching(&reader, |event| {
+            *event == ProviderEvent::TextDelta("working".into())
+        })
+        .await;
+        transport
+            .send_prompt("one more thing", &[] as &[&Path])
+            .await
+            .expect("the steer was written");
+
+        tokio::time::timeout(Duration::from_secs(5), run_to_end(&reader))
+            .await
+            .expect("the first turn ended");
+        assert!(
+            transport.input_open().await,
+            "the input closed with a steer still queued"
+        );
+        let Control::Approval(id) = next_control(&reader).await else {
+            panic!("expected the steer's answer to ask for a permission");
+        };
+        transport
+            .approve(&id, true)
+            .await
+            .expect("the permission's answer reached Claude");
+        let end = tokio::time::timeout(Duration::from_secs(5), reader.wait_for_end())
+            .await
+            .expect("the steer's turn ended");
+        assert!(end.is_completed(), "{end:?}");
+        assert!(
+            server.exited_within(Duration::from_secs(5)).await.is_some(),
+            "the process outlived the steer's answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_tools_of_a_claude_that_died_are_still_ended() {
+        // The tree used to be taken at Stop. By then a Claude that had died —
+        // or been killed for an oversized line — was gone, and the tool it
+        // started in a session of its own led nowhere and kept running.
+        let Some(server) = FakeClaude::new() else {
+            return;
+        };
+        let mut transport = connect(&server).await.expect("started");
+        let reader = transport.reader().await;
+        transport
+            .send_prompt("!spawn-and-die", &[] as &[&Path])
+            .await
+            .expect("written");
+        let pid = server.child_pid().await.expect("the tool started");
+        let _reap = crate::process::testing::KillOnDrop(pid);
+        next_matching(
+            &reader,
+            |event| matches!(event, ProviderEvent::Task(task) if task.status.is_running()),
+        )
+        .await;
+
+        server.release("release-death");
+        let end = tokio::time::timeout(Duration::from_secs(5), reader.wait_for_end())
+            .await
+            .expect("the death was reported");
+        assert!(matches!(end, TurnEnd::Vanished { .. }), "{end:?}");
+        assert!(
+            !crate::process::testing::gone_within(pid, Duration::from_millis(200)).await,
+            "the tool died with Claude, so this proves nothing"
+        );
+
+        transport.terminate().await;
+        assert!(
+            crate::process::testing::gone_within(pid, Duration::from_secs(5)).await,
+            "the tool outlived the Claude that started it and the stop"
         );
     }
 

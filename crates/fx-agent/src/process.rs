@@ -12,13 +12,19 @@
 //! they have been handed to launchd, where a walk by parent no longer reaches
 //! them.
 //!
+//! A tree taken only when it is needed can be too late. Once the provider has
+//! died or been killed, its tools belong to launchd, in sessions and groups no
+//! walk from a dead pid reaches. A [`Watched`] tree is therefore kept current
+//! while the provider runs, and every stop works from it: what it last saw,
+//! joined with what the table says now.
+//!
 //! Quit cannot wait for a turn to wind down — GPUI gives its quit handlers a
 //! tenth of a second before the process exits — so every transport registers
 //! its provider for as long as it runs, and [`stop_all_now`] ends each
 //! registered tree on the calling thread.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::process::{Child, Command};
@@ -75,9 +81,11 @@ pub(crate) struct Entry {
 /// A provider and everything it started.
 ///
 /// A process belongs when it is the provider, a child of a member, or in a
-/// group or session a member leads. Groups and sessions are kept once seen,
-/// because they are how an orphan is still found after its parent has gone.
-#[derive(Debug)]
+/// group or session a member leads. Groups and sessions are kept while
+/// anything is in them, because they are how an orphan is still found after
+/// its parent has gone. An empty one is forgotten: nothing can join it again,
+/// and its id is free for the next process to lead something unrelated.
+#[derive(Debug, Clone)]
 pub(crate) struct Tree {
     root: libc::pid_t,
     groups: BTreeSet<libc::pid_t>,
@@ -136,6 +144,19 @@ impl Tree {
                 break;
             }
         }
+        // A group or session ends with its last process, and a process can
+        // join only one that exists, so an empty one stays empty until its id
+        // is reused. Kept for as long as a watched tree lives, a reused id
+        // would put an unrelated process in the tree, and Stop would end it.
+        // A table that could not be read at all (FlowX is always in a real
+        // one) says nothing about what is empty.
+        if table.is_empty() {
+            return;
+        }
+        self.groups
+            .retain(|group| table.iter().any(|entry| entry.pgid == *group));
+        self.sessions
+            .retain(|session| table.iter().any(|entry| entry.sid == *session));
     }
 
     /// The pids that belong, as of the last refresh.
@@ -207,6 +228,48 @@ impl Tree {
     }
 }
 
+/// A provider's tree, remembered from the moment it starts and kept current
+/// while it runs.
+///
+/// Shared, because the transport refreshes it as the provider works while
+/// Stop and Quit read it from elsewhere. A refresh only adds what the table
+/// shows and drops what has gone, so the record is always the union of what
+/// was seen and what is there now.
+#[derive(Debug, Clone)]
+pub(crate) struct Watched(Arc<Mutex<Tree>>);
+
+impl Watched {
+    /// Start watching what `group`'s leader starts, from what it has now.
+    pub(crate) fn new(group: Group) -> Self {
+        Self(Arc::new(Mutex::new(group.tree())))
+    }
+
+    /// Re-read the tree from the process table.
+    ///
+    /// The table is read before the lock is taken, so a stop reading the tree
+    /// never waits on the table.
+    pub(crate) fn refresh(&self) {
+        let table = process_table();
+        self.refresh_from(&table, own_pid());
+    }
+
+    fn refresh_from(&self, table: &[Entry], parent: libc::pid_t) {
+        self.lock().refresh(table, parent);
+    }
+
+    /// The tree as of now, to stop.
+    pub(crate) fn snapshot(&self) -> Tree {
+        self.refresh();
+        self.lock().clone()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Tree> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 /// End several trees on this thread, sharing one grace period.
 fn end_blocking(trees: &mut [Tree], grace: Duration) {
     for tree in trees.iter() {
@@ -232,8 +295,9 @@ fn end_blocking(trees: &mut [Tree], grace: Duration) {
     }
 }
 
-/// The providers running now, by the pid that leads each one's group.
-static RUNNING: Mutex<BTreeSet<libc::pid_t>> = Mutex::new(BTreeSet::new());
+/// The providers running now, by the pid that leads each one's group, each
+/// with its tree as last seen.
+static RUNNING: Mutex<BTreeMap<libc::pid_t, Watched>> = Mutex::new(BTreeMap::new());
 
 /// A provider's entry in the list Quit ends. Dropping it removes the entry.
 ///
@@ -244,8 +308,15 @@ static RUNNING: Mutex<BTreeSet<libc::pid_t>> = Mutex::new(BTreeSet::new());
 pub(crate) struct Running(libc::pid_t);
 
 impl Running {
+    /// List a provider whose tree nothing else keeps current.
     pub(crate) fn register(group: Group) -> Self {
-        running().insert(group.0);
+        Self::watching(group, Watched::new(group))
+    }
+
+    /// List a provider with the tree its transport keeps current, so Quit
+    /// still finds a tool whose provider has already gone.
+    pub(crate) fn watching(group: Group, tree: Watched) -> Self {
+        running().insert(group.0, tree);
         Self(group.0)
     }
 }
@@ -256,7 +327,7 @@ impl Drop for Running {
     }
 }
 
-fn running() -> std::sync::MutexGuard<'static, BTreeSet<libc::pid_t>> {
+fn running() -> std::sync::MutexGuard<'static, BTreeMap<libc::pid_t, Watched>> {
     RUNNING
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -270,23 +341,23 @@ pub const QUIT_GRACE: Duration = Duration::from_millis(500);
 /// For Quit, which cannot wait for a turn's own teardown: SIGTERM to every
 /// tree at once, up to `grace` for them to exit, then SIGKILL.
 pub fn stop_all_now(grace: Duration) {
-    let roots: Vec<libc::pid_t> = running().iter().copied().collect();
-    stop_now(&roots, grace);
+    // Taken out first, so the list is not locked while the trees are read.
+    let watched: Vec<Watched> = running().values().cloned().collect();
+    stop_now(&watched, grace);
 }
 
-/// [`stop_all_now`] for the providers led by `roots`.
-fn stop_now(roots: &[libc::pid_t], grace: Duration) {
-    if roots.is_empty() {
+/// [`stop_all_now`] for the `watched` providers.
+fn stop_now(watched: &[Watched], grace: Duration) {
+    if watched.is_empty() {
         return;
     }
     let table = process_table();
     let own = own_pid();
-    let mut trees: Vec<Tree> = roots
+    let mut trees: Vec<Tree> = watched
         .iter()
-        .map(|root| {
-            let mut tree = Tree::new(*root);
-            tree.refresh(&table, own);
-            tree
+        .map(|tree| {
+            tree.refresh_from(&table, own);
+            tree.lock().clone()
         })
         .collect();
     end_blocking(&mut trees, grace);
@@ -551,6 +622,44 @@ mod tests {
         assert_eq!(tree.members(), [200]);
     }
 
+    #[test]
+    fn an_emptied_session_is_forgotten_so_its_reused_id_is_never_claimed() {
+        // A watched tree lives as long as its provider, hours if need be. A
+        // session kept after its last process had gone made the next process
+        // to lead one under that id a member, and Stop would have ended it.
+        let mut tree = tree_over(&[
+            entry(FLOWX, 1, FLOWX, FLOWX),
+            entry(200, FLOWX, 200, FLOWX),
+            entry(300, 200, 300, 300),
+        ]);
+        assert_eq!(tree.members(), [200, 300]);
+        // The tool exits, and with it its session.
+        tree.refresh(
+            &[entry(FLOWX, 1, FLOWX, FLOWX), entry(200, FLOWX, 200, FLOWX)],
+            FLOWX,
+        );
+        assert_eq!(tree.members(), [200]);
+        // An unrelated program is handed the same id and leads a session.
+        tree.refresh(
+            &[
+                entry(FLOWX, 1, FLOWX, FLOWX),
+                entry(200, FLOWX, 200, FLOWX),
+                entry(300, 1, 300, 300),
+            ],
+            FLOWX,
+        );
+        assert_eq!(tree.members(), [200]);
+    }
+
+    #[test]
+    fn a_table_that_could_not_be_read_forgets_nothing() {
+        // Where there is no table the provider's own group is still the one
+        // signalled, so an empty read must not empty the record.
+        let mut tree = tree_over(&[entry(FLOWX, 1, FLOWX, FLOWX), entry(200, FLOWX, 200, FLOWX)]);
+        tree.refresh(&[], FLOWX);
+        assert!(tree.groups.contains(&200));
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn the_process_table_reads_this_process() {
@@ -660,9 +769,10 @@ time.sleep(60)
         };
         let _reap: Vec<_> = pids.iter().map(|pid| testing::KillOnDrop(*pid)).collect();
         let registration = Running::register(group);
-        assert!(running().contains(&group.0), "a running provider is listed");
+        let watched = running().get(&group.0).cloned();
+        let watched = watched.expect("a running provider is listed");
         // Only this provider: the list is shared by every test in the process.
-        stop_now(&[group.0], Duration::from_millis(500));
+        stop_now(&[watched], Duration::from_millis(500));
         for pid in pids {
             assert!(
                 testing::gone_within(pid, Duration::from_secs(1)).await,
@@ -671,7 +781,10 @@ time.sleep(60)
         }
         let _ = child.wait().await;
         drop(registration);
-        assert!(!running().contains(&group.0), "a closed provider is listed");
+        assert!(
+            !running().contains_key(&group.0),
+            "a closed provider is listed"
+        );
     }
 
     #[test]

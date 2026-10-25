@@ -21,7 +21,13 @@ import json, os, sys, threading, time
 
 RECEIVED = "RECEIVED_LOG"
 EXITED = "EXITED_LOG"
-RELEASE = os.path.join(os.path.dirname(RECEIVED), "release-background")
+
+def gate(name):
+    return os.path.join(os.path.dirname(RECEIVED), name)
+
+def wait_for(name):
+    while not os.path.exists(gate(name)):
+        time.sleep(0.01)
 
 # Background tasks write from their own threads, so a line is never split.
 LOCK = threading.Lock()
@@ -75,16 +81,16 @@ def die(code, message):
 def background_task():
     # The shape Claude Code 2.1.283 writes: the task's end, then a turn of its
     # own that answers the notification, closed by a `result` whose origin says
-    # so. Held until the test releases it, so what happens in between is
-    # observable rather than a race.
-    while not os.path.exists(RELEASE):
-        time.sleep(0.01)
+    # so. Held until the test releases it, and again between the patch and the
+    # notification, so what happens in between is observable rather than a race.
+    wait_for("release-background")
     send({"type": "system", "subtype": "task_progress", "task_id": "task-1",
           "tool_use_id": "tool-bg", "description": "sleep 6; echo done",
           "usage": {"total_tokens": 0, "tool_uses": 1, "duration_ms": 50},
           "last_tool_name": "Bash"})
     send({"type": "system", "subtype": "task_updated", "task_id": "task-1",
           "patch": {"status": "completed", "end_time": 1}})
+    wait_for("release-notification")
     send({"type": "system", "subtype": "task_notification", "task_id": "task-1",
           "tool_use_id": "tool-bg", "status": "completed", "output_file": "/tmp/task-1",
           "summary": "Background command \"sleep 6; echo done\" completed (exit code 0)"})
@@ -111,6 +117,39 @@ def start_background():
     workers.append(worker)
     emit_result("started")
 
+def settled(how):
+    # Background work that ends inside the turn and that nothing answers after
+    # the turn's `result`: a task the agent stopped itself (Claude marks it
+    # told as it kills it), one a subagent owns (its notification goes to the
+    # subagent), and one whose notification the turn's next request carried.
+    emit_init()
+    send({"type": "assistant", "message": {"content": [{"type": "tool_use",
+          "id": "tool-s", "name": "Bash",
+          "input": {"command": "npm run watch", "run_in_background": True}}]}})
+    send({"type": "system", "subtype": "task_started", "task_id": "task-s",
+          "tool_use_id": "tool-s", "description": "npm run watch",
+          "is_backgrounded": True, "task_type": "local_bash",
+          "owned_by_subagent": how == "subagent"})
+    send({"type": "user", "message": {"content": [{"type": "tool_result",
+          "tool_use_id": "tool-s", "content": "Command running in background with ID: task-s."}]}})
+    if how == "stopped":
+        send({"type": "system", "subtype": "task_updated", "task_id": "task-s",
+              "patch": {"status": "killed", "end_time": 1}})
+        send({"type": "system", "subtype": "task_notification", "task_id": "task-s",
+              "tool_use_id": "tool-s", "status": "stopped", "summary": "npm run watch"})
+    else:
+        send({"type": "system", "subtype": "task_updated", "task_id": "task-s",
+              "patch": {"status": "completed", "end_time": 1}})
+        send({"type": "system", "subtype": "task_notification", "task_id": "task-s",
+              "tool_use_id": "tool-s", "status": "completed",
+              "summary": "Background command \"npm run watch\" completed (exit code 0)"})
+        if how == "carried":
+            send({"type": "system", "subtype": "status", "status": "requesting"})
+    emit_result("settled")
+
+# A turn whose `result` waits for the next user message, which then races it.
+held = []
+
 for line in sys.stdin:
     line = line.strip()
     if not line:
@@ -118,7 +157,17 @@ for line in sys.stdin:
     message = json.loads(line)
     record(message)
 
-    if message.get("type") == "user":
+    if message.get("type") == "user" and held:
+        # The steer arrived before the turn ended, so Claude ends the turn
+        # with it still queued and answers it next as a turn of its own, which
+        # asks for a permission.
+        held.pop()
+        send({"type": "result", "subtype": "success", "num_turns": 1,
+              "queued_turn_count": 1, "usage": {"input_tokens": 4, "output_tokens": 1}})
+        emit_init()
+        request_control("req-q", "Bash", "tool-q", {"command": "cargo test"})
+        waiting.append("req-q")
+    elif message.get("type") == "user":
         prompt = prompt_of(message)
         if prompt.startswith("!"):
             # A prompt may be a bare "!die" with nothing after it, so the verb
@@ -132,6 +181,29 @@ for line in sys.stdin:
             emit_result(rest or "hello from the fake server")
         elif behaviour == "background":
             start_background()
+        elif behaviour == "settled":
+            settled(rest)
+        elif behaviour == "queued":
+            emit_init()
+            send({"type": "stream_event", "event": {"type": "content_block_delta",
+                 "delta": {"type": "text_delta", "text": "working"}}})
+            held.append(True)
+        elif behaviour == "spawn-and-die":
+            # A background tool, in a session of its own and writing to its own
+            # output as the real CLI starts them, and then Claude dies before
+            # anybody presses Stop.
+            import subprocess
+            child = subprocess.Popen(["sleep", "60"], start_new_session=True,
+                                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL)
+            with open(gate("child.pid"), "w") as handle:
+                handle.write(str(child.pid))
+            emit_init()
+            send({"type": "system", "subtype": "task_started", "task_id": "task-d",
+                  "tool_use_id": "tool-d", "description": "sleep 60",
+                  "is_backgrounded": True, "task_type": "local_bash"})
+            wait_for("release-death")
+            die(9, "fake claude died with a tool running")
         elif behaviour == "ask-tool":
             emit_init()
             request_control("req-1", "Bash", "tool-1", {"command": "cargo test"})
@@ -302,11 +374,21 @@ impl FakeClaude {
             .unwrap_or_default()
     }
 
-    /// Let the task `!background` started finish, which is what produces its
-    /// notification and the follow-up turn that answers it.
+    /// Let the task `!background` started finish. It stops again after the
+    /// patch that says so, until [`Self::release_notification`].
     pub fn release_background(&self) {
-        std::fs::write(self.received.with_file_name("release-background"), "go")
-            .expect("the release file");
+        self.release("release-background");
+    }
+
+    /// Let the finished task's notification, and the follow-up turn that
+    /// answers it, through.
+    pub fn release_notification(&self) {
+        self.release("release-notification");
+    }
+
+    /// Open a gate the script is waiting at.
+    pub fn release(&self, gate: &str) {
+        std::fs::write(self.received.with_file_name(gate), "go").expect("the release file");
     }
 
     /// The pid of the tool `!spawn-and-hang` started, once it has started.

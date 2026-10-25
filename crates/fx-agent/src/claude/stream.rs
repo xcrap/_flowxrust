@@ -30,6 +30,14 @@
 //! answers each such batch with an `init` and a zero-turn `result` whose origin
 //! is `task-notification` — before it reads the prompt — and neither of those is
 //! the turn the user asked for.
+//!
+//! Not every ending is answered. A task that completed or failed tells the
+//! model, which answers as a turn of its own, unless a turn is running and
+//! makes another request, which carries the notification instead. A stopped
+//! task is not answered after the turn: Claude marks a shell or a monitor told
+//! as it kills it, and an agent the turn stopped is told within that turn. One
+//! a subagent owns tells that subagent. Waiting for an answer to any of those
+//! held the input open with nothing left to come.
 
 use std::collections::VecDeque;
 
@@ -99,11 +107,24 @@ pub struct ClaudeStreamParser {
     last_refusal: Option<Value>,
     /// Tasks this process started and has not heard the last of, oldest first.
     tasks: VecDeque<TrackedTask>,
+    /// How many tasks this process has seen start, so the transport can tell
+    /// a line that started one.
+    tasks_started: u64,
     /// A background task's notification has arrived and Claude has not yet
     /// answered it. The answer is a turn of its own, and may ask for a
     /// permission, so the input stays open until it comes: closed at the
     /// `result` before it, the permission's answer could not be written.
     follow_up_owed: bool,
+    /// A notification that is owed an answer arrived while a turn was
+    /// running. The turn's next request carries it, and then it is answered
+    /// there; if the turn makes none, it is answered as a turn of its own
+    /// after this one's `result`. Owed outright, a notification the turn had
+    /// already taken held the input open for a follow-up that never came.
+    notified_in_turn: bool,
+    /// How many of the user's messages Claude still had queued at the last
+    /// `result`. Each is a turn of its own that follows without more input,
+    /// and may ask for a permission.
+    queued_turns: u64,
     /// This process has answered a prompt. A zero-turn acknowledgement after
     /// that is the end of a task this process started; before it, one of a
     /// task the last process lost.
@@ -125,9 +146,33 @@ struct TrackedTask {
     /// Only these are reported or waited for: a foreground subagent is already
     /// its own tool row, and its call does not return until it is done.
     background: bool,
-    /// A terminal status arrived. The notification that follows still carries
-    /// the summary, so the task is kept until it does.
-    finished: bool,
+    /// Started by a subagent, which is told when it ends. The main session
+    /// gives no answer for it.
+    owned_by_subagent: bool,
+    /// How it ended, once a terminal status arrived. The notification that
+    /// follows still carries the summary, so the task is kept until it does.
+    ended: Option<TaskStatus>,
+}
+
+impl TrackedTask {
+    /// Running in the background, which is what holds the input open.
+    fn is_running(&self) -> bool {
+        self.background && self.ended.is_none()
+    }
+
+    /// Ended in a way Claude answers, with its notification still to come.
+    ///
+    /// The patch arrives a line before the notification. Read as the end of
+    /// the wait, it closed the input at the patch, and the follow-up's
+    /// permissions then had no way back to Claude.
+    fn awaits_notification(&self) -> bool {
+        self.background && self.ended.is_some_and(|status| self.answered_when(status))
+    }
+
+    /// Whether Claude answers an ending like this as a turn of its own.
+    fn answered_when(&self, status: TaskStatus) -> bool {
+        !self.owned_by_subagent && matches!(status, TaskStatus::Completed | TaskStatus::Failed)
+    }
 }
 
 /// What a pending control is waiting for.
@@ -345,6 +390,15 @@ impl ClaudeStreamParser {
             {
                 vec![ProviderEvent::Lifecycle(Lifecycle::Compacting)]
             }
+            // A request is going out. Claude gathers what it has queued just
+            // before, so a notification that arrived earlier in the turn goes
+            // with it and is answered in this turn.
+            Some("status")
+                if envelope.get("status").and_then(Value::as_str) == Some("requesting") =>
+            {
+                self.notified_in_turn = false;
+                Vec::new()
+            }
             Some("compact_boundary") => vec![ProviderEvent::Lifecycle(Lifecycle::Compacted)],
             Some("task_started") => self.task_started(envelope),
             Some("task_progress") => self.task_progress(envelope),
@@ -380,8 +434,11 @@ impl ClaudeStreamParser {
         self.tasks.push_back(TrackedTask {
             started: started.clone(),
             background,
-            finished: false,
+            owned_by_subagent: envelope.get("owned_by_subagent").and_then(Value::as_bool)
+                == Some(true),
+            ended: None,
         });
+        self.tasks_started += 1;
         while self.tasks.len() > MAX_TRACKED_TASKS {
             self.tasks.pop_front();
         }
@@ -397,7 +454,7 @@ impl ClaudeStreamParser {
         let Some(task) = self.tracked(envelope) else {
             return Vec::new();
         };
-        if !task.background || task.finished {
+        if !task.is_running() {
             return Vec::new();
         }
         let mut update = self.task_update(envelope, TaskStatus::Running);
@@ -427,13 +484,14 @@ impl ClaudeStreamParser {
             .get("status")
             .and_then(Value::as_str)
             .filter(|status| *status != "running" && *status != "pending")
-            && !task.finished
+            && task.ended.is_none()
         {
-            task.finished = true;
+            let status = TaskStatus::from_notification(status);
+            task.ended = Some(status);
             if task.background {
                 events.push(ProviderEvent::Task(TaskUpdate {
                     id,
-                    status: TaskStatus::from_notification(status),
+                    status,
                     ..TaskUpdate::default()
                 }));
             }
@@ -448,18 +506,28 @@ impl ClaudeStreamParser {
             // the last one lost, and nothing here is waiting for them.
             return Vec::new();
         };
-        let background = task.background;
-        let id = task.started.id.clone();
-        self.tasks.retain(|task| task.started.id != id);
-        if !background {
-            return Vec::new();
-        }
-        self.follow_up_owed = true;
         let status = envelope
             .get("status")
             .and_then(Value::as_str)
             .map(TaskStatus::from_notification)
             .unwrap_or(TaskStatus::Stopped);
+        let background = task.background;
+        let answered = task.answered_when(status);
+        let id = task.started.id.clone();
+        self.tasks.retain(|task| task.started.id != id);
+        if !background {
+            return Vec::new();
+        }
+        // Owed only for an ending Claude tells the model about. Between turns
+        // the answer is a turn of its own; during one, it is that turn's
+        // unless the turn makes no further request.
+        if answered {
+            if self.did_finish {
+                self.follow_up_owed = true;
+            } else {
+                self.notified_in_turn = true;
+            }
+        }
         let mut update = self.task_update(envelope, status);
         // A failure may explain itself only in `reason`.
         if update.summary.is_none() {
@@ -496,15 +564,24 @@ impl ClaudeStreamParser {
     /// This is what keeps stdin open past a `result`: Claude reports the task's
     /// end as a new turn, and only an open input can still be steered.
     pub fn has_running_tasks(&self) -> bool {
-        self.tasks
-            .iter()
-            .any(|task| task.background && !task.finished)
+        self.tasks.iter().any(TrackedTask::is_running)
     }
 
     /// Whether the input has to stay open past a `result`: a background task
-    /// is running, or one has ended and Claude still owes its answer.
+    /// is running, one has ended and Claude still owes its answer, or Claude
+    /// holds a message of the user's it has yet to answer. Each of those is a
+    /// turn still to come, and its permissions are answered through the input.
     pub fn holds_input_open(&self) -> bool {
-        self.has_running_tasks() || self.follow_up_owed
+        self.has_running_tasks()
+            || self.tasks.iter().any(TrackedTask::awaits_notification)
+            || self.follow_up_owed
+            || self.queued_turns > 0
+    }
+
+    /// How many tasks this process has seen start. A change is a line that
+    /// started one, which is when its process can first be found.
+    pub fn tasks_started(&self) -> u64 {
+        self.tasks_started
     }
 
     /// A streamed frame. Only text deltas are meaningful here.
@@ -618,6 +695,17 @@ impl ClaudeStreamParser {
         if answers_notification(envelope) {
             self.follow_up_owed = false;
         }
+        // A notification this turn never sent on is answered by the next.
+        if std::mem::take(&mut self.notified_in_turn) {
+            self.follow_up_owed = true;
+        }
+        // Every `result` says how many of the user's messages are still
+        // queued, so the latest one is the count. Absent on older versions,
+        // which is none.
+        self.queued_turns = envelope
+            .get("queued_turn_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
         if acknowledges_notification(envelope) {
             // Nothing was asked and nothing answered. Before this process has
             // answered anything, that is a task the last process lost, and the
@@ -712,6 +800,8 @@ impl ClaudeStreamParser {
         self.last_refusal = None;
         self.tasks.clear();
         self.follow_up_owed = false;
+        self.notified_in_turn = false;
+        self.queued_turns = 0;
     }
 
     /// Take a refusal produced by the last line, if any.
@@ -2489,6 +2579,168 @@ mod tests {
             "no usage: the acknowledgement asked the model nothing"
         );
         assert!(parser.did_finish());
+        assert!(!parser.holds_input_open());
+    }
+
+    /// What Claude Code 2.1.283 writes when a task is stopped — by TaskStop,
+    /// KillShell, or a Monitor's timeout: the patch, then a `stopped`
+    /// notification. A shell or monitor is marked told as it is killed, so
+    /// nothing is answered after either.
+    fn task_stopped(id: &str) -> [Value; 2] {
+        [
+            json!({"type": "system", "subtype": "task_updated", "task_id": id,
+                   "patch": {"status": "killed", "end_time": 1}}),
+            json!({"type": "system", "subtype": "task_notification", "task_id": id,
+                   "tool_use_id": format!("toolu_{id}"), "status": "stopped",
+                   "summary": format!("review {id}")}),
+        ]
+    }
+
+    #[test]
+    fn a_stopped_task_owes_no_answer() {
+        // Every notification used to be owed an answer, so a task the agent
+        // stopped itself held the input open after the turn's `result`, and
+        // the turn spun until Stop recorded the finished answer as cancelled.
+        let mut parser = ClaudeStreamParser::new();
+        parser.events(&line(json!({"type": "system", "subtype": "init"})));
+        parser.events(&line(task_started("t1", true)));
+        for frame in task_stopped("t1") {
+            parser.events(&line(frame));
+        }
+        parser.events(&line(
+            json!({"type": "result", "subtype": "success", "num_turns": 3, "usage": {}}),
+        ));
+        assert!(parser.did_finish());
+        assert!(!parser.holds_input_open(), "a stopped task was waited on");
+
+        // And stopped between turns, the same.
+        let mut parser = ClaudeStreamParser::new();
+        for frame in [
+            json!({"type": "system", "subtype": "init"}),
+            task_started("t1", true),
+            json!({"type": "result", "subtype": "success", "num_turns": 1, "usage": {}}),
+        ] {
+            parser.events(&line(frame));
+        }
+        assert!(parser.holds_input_open(), "the task is still running");
+        let [patch, notification] = task_stopped("t1");
+        parser.events(&line(patch));
+        assert!(!parser.holds_input_open(), "the stop was waited on");
+        let ended = parser.events(&line(notification));
+        assert!(
+            matches!(ended.as_slice(), [ProviderEvent::Task(task)] if task.status == TaskStatus::Stopped),
+            "{ended:?}"
+        );
+        assert!(!parser.holds_input_open());
+    }
+
+    #[test]
+    fn a_subagents_task_owes_the_main_session_no_answer() {
+        // A task a subagent started tells that subagent when it ends. While
+        // it runs it still holds the input, as any background work does.
+        let mut parser = ClaudeStreamParser::new();
+        let mut started = task_started("t1", true);
+        started["owned_by_subagent"] = json!(true);
+        for frame in [
+            json!({"type": "system", "subtype": "init"}),
+            started,
+            json!({"type": "result", "subtype": "success", "num_turns": 1, "usage": {}}),
+        ] {
+            parser.events(&line(frame));
+        }
+        assert!(parser.holds_input_open());
+        parser.events(&line(json!({"type": "system", "subtype": "task_updated",
+            "task_id": "t1", "patch": {"status": "completed"}})));
+        assert!(
+            !parser.holds_input_open(),
+            "a subagent's answer was waited on"
+        );
+        let ended = parser.events(&line(task_ended("t1")));
+        assert!(
+            matches!(ended.as_slice(), [ProviderEvent::Task(task)] if task.status == TaskStatus::Completed),
+            "{ended:?}"
+        );
+        assert!(!parser.holds_input_open());
+    }
+
+    #[test]
+    fn a_finished_task_holds_the_input_until_its_notification() {
+        // The patch comes a line before the notification that owes the
+        // answer. The input used to close at the patch, so the follow-up's
+        // permissions failed inside Claude and a steer was refused.
+        let mut parser = ClaudeStreamParser::new();
+        for frame in [
+            json!({"type": "system", "subtype": "init"}),
+            task_started("t1", true),
+            json!({"type": "result", "subtype": "success", "num_turns": 1, "usage": {}}),
+            json!({"type": "system", "subtype": "task_updated", "task_id": "t1",
+                   "patch": {"status": "completed", "end_time": 1}}),
+        ] {
+            parser.events(&line(frame));
+        }
+        assert!(!parser.has_running_tasks());
+        assert!(parser.holds_input_open(), "the input closed at the patch");
+        parser.events(&line(task_ended("t1")));
+        assert!(parser.holds_input_open(), "the follow-up is owed");
+        for frame in [
+            json!({"type": "system", "subtype": "init"}),
+            json!({"type": "result", "subtype": "success", "num_turns": 1, "usage": {},
+                   "origin": {"kind": "task-notification"}}),
+        ] {
+            parser.events(&line(frame));
+        }
+        assert!(!parser.holds_input_open());
+    }
+
+    #[test]
+    fn a_notification_the_turn_sends_on_is_answered_in_that_turn() {
+        // A task that ends while the turn still works is told to the model
+        // in the turn's next request, and no turn of its own follows. Owed
+        // regardless, it held the input open after the turn's `result`.
+        // Claude Code 2.1.283 gathers what is queued just before each request
+        // and reports the request as `status: requesting`.
+        let mut parser = ClaudeStreamParser::new();
+        for frame in [
+            json!({"type": "system", "subtype": "init"}),
+            task_started("t1", true),
+            json!({"type": "system", "subtype": "task_updated", "task_id": "t1",
+                   "patch": {"status": "completed", "end_time": 1}}),
+            task_ended("t1"),
+            json!({"type": "system", "subtype": "status", "status": "requesting"}),
+            json!({"type": "assistant", "message": {"content": [{"type": "text", "text": "both done"}]}}),
+            json!({"type": "result", "subtype": "success", "num_turns": 2, "usage": {}}),
+        ] {
+            parser.events(&line(frame));
+        }
+        assert!(parser.did_finish());
+        assert!(
+            !parser.holds_input_open(),
+            "an answer this turn gave was waited for"
+        );
+    }
+
+    #[test]
+    fn queued_user_messages_hold_the_input_until_they_are_answered() {
+        // A steer that raced the `result` is still queued in Claude, which
+        // answers it next as a turn of its own. The input closed at that
+        // `result`, so the answer's permission requests never reached FlowX.
+        let mut parser = ClaudeStreamParser::new();
+        for frame in [
+            json!({"type": "system", "subtype": "init"}),
+            json!({"type": "result", "subtype": "success", "num_turns": 1, "usage": {},
+                   "queued_turn_count": 1}),
+        ] {
+            parser.events(&line(frame));
+        }
+        assert!(parser.did_finish());
+        assert!(parser.holds_input_open(), "a queued message was abandoned");
+        for frame in [
+            json!({"type": "system", "subtype": "init"}),
+            json!({"type": "result", "subtype": "success", "num_turns": 1, "usage": {},
+                   "queued_turn_count": 0}),
+        ] {
+            parser.events(&line(frame));
+        }
         assert!(!parser.holds_input_open());
     }
 

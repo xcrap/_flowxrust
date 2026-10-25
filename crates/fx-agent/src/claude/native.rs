@@ -678,36 +678,46 @@ fn parse_file(
             "last-prompt" => {
                 parsed.last_prompt = nonempty(&object["lastPrompt"]);
             }
-            "user" | "assistant" => {
-                // A background task's notification is recorded as a user
-                // message, but it is Claude's own bookkeeping: nobody wrote
-                // it, FlowX never shows it, and it is not the thread's latest
-                // prompt. Kept, it split the replies around it into separate
-                // turns, so FlowX's copy of the thread never matched this
-                // history and the sync warned on every pass.
-                if object["isMeta"].as_bool() == Some(true)
-                    || object["origin"]["kind"].as_str() == Some("task-notification")
-                    || is_claude_bookkeeping(&object)
-                {
-                    continue;
-                }
-                let assistant = object["type"] == "assistant";
-                let message = &object["message"];
-                if !message.is_object()
-                    || !(message["content"].is_string() || message["content"].is_array())
-                {
-                    return Err(protocol(format!(
-                        "Invalid Claude message content at record {line_number}"
-                    )));
-                }
-                if assistant {
-                    if message.get("model").is_some() {
-                        parsed.defaults.model_id = nonempty(&message["model"]);
+            kind @ ("user" | "assistant" | "attachment") => {
+                let assistant = kind == "assistant";
+                let content = if kind == "attachment" {
+                    let Some(prompt) = steer_prompt(&object) else {
+                        continue;
+                    };
+                    prompt
+                } else {
+                    // A background task's notification is recorded as a user
+                    // message, but it is Claude's own bookkeeping: nobody
+                    // wrote it, FlowX never shows it, and it is not the
+                    // thread's latest prompt. Kept, it split the replies
+                    // around it into separate turns, so FlowX's copy of the
+                    // thread never matched this history and the sync warned
+                    // on every pass.
+                    if object["isMeta"].as_bool() == Some(true)
+                        || object["origin"]["kind"].as_str() == Some("task-notification")
+                        || is_claude_bookkeeping(&object)
+                    {
+                        continue;
                     }
-                    if let Some(usage) = context_usage(&message["usage"]) {
-                        parsed.current_context_tokens = Some(usage);
+                    let message = &object["message"];
+                    if !message.is_object()
+                        || !(message["content"].is_string() || message["content"].is_array())
+                    {
+                        return Err(protocol(format!(
+                            "Invalid Claude message content at record {line_number}"
+                        )));
                     }
-                } else if let Some(prompt) = prompt_text(&message["content"]) {
+                    if assistant {
+                        if message.get("model").is_some() {
+                            parsed.defaults.model_id = nonempty(&message["model"]);
+                        }
+                        if let Some(usage) = context_usage(&message["usage"]) {
+                            parsed.current_context_tokens = Some(usage);
+                        }
+                    }
+                    &message["content"]
+                };
+                if !assistant && let Some(prompt) = prompt_text(content) {
                     if parsed.first_prompt.is_none() {
                         parsed.first_prompt = Some(prompt.clone());
                     }
@@ -716,7 +726,7 @@ fn parse_file(
                 if !include_messages {
                     continue;
                 }
-                let content = contents(&message["content"], assistant)?;
+                let content = contents(content, assistant)?;
                 if content.is_empty() {
                     continue;
                 }
@@ -916,6 +926,28 @@ fn is_claude_bookkeeping(record: &Value) -> bool {
     };
     text.map(str::trim)
         .is_some_and(|text| text.starts_with("[Request interrupted by user") && text.ends_with(']'))
+}
+
+/// The prompt of a message the user sent while a turn was running.
+///
+/// Claude reads such a message into the running turn, between one tool call's
+/// result and the next request, and records it as a `queued_command`
+/// attachment rather than a user message — a string, or blocks with any
+/// images first. Read only as user records, the history had no turn for a
+/// steer, so FlowX's copy of a steered thread could never be found in it and
+/// "the provider's history has not caught up" never cleared. Only what the
+/// user typed counts: a task notification is queued the same way, and a meta
+/// or relayed entry is not anything FlowX shows.
+fn steer_prompt(record: &Value) -> Option<&Value> {
+    let attachment = &record["attachment"];
+    let origin = &attachment["origin"];
+    let typed = attachment["type"] == "queued_command"
+        && attachment["commandMode"] == "prompt"
+        && record["isMeta"].as_bool() != Some(true)
+        && attachment["isMeta"].as_bool() != Some(true)
+        && (origin.is_null() || origin["kind"] == "human");
+    let prompt = &attachment["prompt"];
+    (typed && (prompt.is_string() || prompt.is_array())).then_some(prompt)
 }
 
 fn prompt_text(value: &Value) -> Option<String> {
@@ -1209,6 +1241,85 @@ mod tests {
             ]
         );
         assert_eq!(thread.entry.summary.title, "Run the reviewers");
+    }
+
+    #[test]
+    fn a_steer_folded_into_a_running_turn_is_the_users_message() {
+        // The shape Claude Code 2.1.283 writes for a message sent while a
+        // turn runs: a `queued_command` attachment after the tool result it
+        // arrived behind, a string or blocks with the images first. Skipped,
+        // the steer was missing from the history, and FlowX's copy of the
+        // thread never matched it.
+        let fixture = Fixture::new();
+        let queued = |prompt: Value, extra: Value| {
+            let mut record = json!({"type": "attachment", "uuid": Uuid::new_v4(),
+                "parentUuid": Uuid::new_v4(), "isSidechain": false, "sessionId": SESSION,
+                "cwd": fixture.root(), "timestamp": "2026-10-12T12:00:01.000Z",
+                "attachment": {"type": "queued_command", "prompt": prompt,
+                    "commandMode": "prompt", "origin": {"kind": "human"}, "humanTurn": true,
+                    "source_uuid": Uuid::new_v4(), "timestamp": "2026-10-12T12:00:00.900Z"}});
+            for (key, value) in extra.as_object().unwrap() {
+                record["attachment"][key] = value.clone();
+            }
+            record
+        };
+        let mut tool_result = fixture.record("user", "", Uuid::new_v4());
+        tool_result["message"]["content"] =
+            json!([{"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"}]);
+        fixture.write(&[
+            fixture.record("user", "Fix the parser", Uuid::new_v4()),
+            fixture.record("assistant", "Looking at it.", Uuid::new_v4()),
+            tool_result,
+            queued(json!("also check the tests"), json!({})),
+            fixture.record("assistant", "Both done.", Uuid::new_v4()),
+            queued(
+                json!([{"type": "image", "source": {"type": "base64",
+                        "media_type": "image/png", "data": "iVBORw0KGgo="}},
+                       {"type": "text", "text": "and this screenshot"}]),
+                json!({}),
+            ),
+            // Queued the same way, and none of them anything the user typed.
+            queued(
+                json!("<task-notification>\n<status>completed</status>\n</task-notification>"),
+                json!({"commandMode": "task-notification", "origin": null}),
+            ),
+            queued(
+                json!("forwarded context"),
+                json!({"isMeta": true,
+                "origin": {"kind": "unclassified"}}),
+            ),
+            queued(
+                json!("a peer's message"),
+                json!({"origin": {"kind": "peer"}}),
+            ),
+            fixture.record("assistant", "Seen it.", Uuid::new_v4()),
+        ]);
+        let thread = fixture.store().read(fixture.root(), SESSION).unwrap();
+        let texts: Vec<_> = thread
+            .messages
+            .iter()
+            .filter(|message| message.role != MessageRole::Tool)
+            .map(|message| (message.role, message.text_content()))
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                (MessageRole::User, "Fix the parser".to_string()),
+                (MessageRole::Assistant, "Looking at it.".to_string()),
+                (MessageRole::User, "also check the tests".to_string()),
+                (MessageRole::Assistant, "Both done.".to_string()),
+                (MessageRole::User, "and this screenshot".to_string()),
+                (MessageRole::Assistant, "Seen it.".to_string()),
+            ]
+        );
+        let screenshot = &thread.messages[5];
+        assert!(
+            matches!(&screenshot.content[0], MessageContent::Image { data, mime_type }
+                if data.starts_with(b"\x89PNG") && mime_type == "image/png"),
+            "{:?}",
+            screenshot.content
+        );
+        assert_eq!(thread.entry.summary.title, "Fix the parser");
     }
 
     #[test]
