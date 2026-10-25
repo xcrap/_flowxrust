@@ -72,12 +72,26 @@ pub(super) struct CommitComposer {
     pub(super) field: Entity<TextField>,
     pub(super) choice: CommitChoice,
     pub(super) chosen: BTreeSet<String>,
-    pub(super) running: Option<Operation>,
+    /// How the last write in the project shown ended.
     pub(super) outcome: Option<Outcome>,
     /// Unsent messages, by project, so switching projects does not lose one.
     drafts: HashMap<String, String>,
-    task: Option<Task<()>>,
+    /// Writes in flight, by the project they write to.
+    ///
+    /// A switch keeps them. Dropping the task cancelled it, and git went on
+    /// to commit without anyone hearing: back in its project the committed
+    /// message sat in the field as a draft, with no banner, and Commit was
+    /// enabled again, so a second press made a duplicate commit.
+    writes: HashMap<String, Write>,
+    /// How writes ended in a project that was not shown then, until it is.
+    unseen: HashMap<String, Outcome>,
     _field_observation: Subscription,
+}
+
+/// A write in flight, and the task that reports how it ends.
+struct Write {
+    operation: Operation,
+    _task: Task<()>,
 }
 
 impl CommitComposer {
@@ -101,12 +115,17 @@ impl CommitComposer {
             field,
             choice: CommitChoice::All,
             chosen: BTreeSet::new(),
-            running: None,
             outcome: None,
             drafts: HashMap::new(),
-            task: None,
+            writes: HashMap::new(),
+            unseen: HashMap::new(),
             _field_observation: observation,
         }
+    }
+
+    /// The write in flight in `project`, if any.
+    pub(super) fn writing(&self, project: Option<&str>) -> Option<Operation> {
+        Some(self.writes.get(project?)?.operation)
     }
 
     /// Put the current project's draft away and bring the next one's back.
@@ -131,11 +150,9 @@ impl CommitComposer {
         self.visible = false;
         self.choice = CommitChoice::All;
         self.chosen.clear();
-        self.outcome = None;
-        // A write already running keeps running; its result is dropped by
-        // the generation check, and the next poll shows what it did.
-        self.running = None;
-        self.task = None;
+        // A write still running in either project keeps running, and is
+        // reported in its own project when it ends.
+        self.outcome = to.and_then(|to| self.unseen.remove(to));
     }
 }
 
@@ -157,7 +174,7 @@ pub(super) fn commit_scope(
             let chosen = files.iter().map(|file| file.path.clone()).collect();
             let sources = files
                 .iter()
-                .filter_map(|file| file.original_path.clone())
+                .filter_map(|file| file.rename_source().map(str::to_string))
                 .collect();
             CommitScope::Paths { chosen, sources }
         }
@@ -165,6 +182,11 @@ pub(super) fn commit_scope(
 }
 
 impl Inspector {
+    /// The write in flight in the project shown.
+    pub(super) fn running(&self) -> Option<Operation> {
+        self.composer.writing(self.project.as_deref())
+    }
+
     pub(super) fn toggle_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.composer.visible = !self.composer.visible;
         self.composer.outcome = None;
@@ -185,12 +207,12 @@ impl Inspector {
     }
 
     pub(super) fn commit(&mut self, message: String, cx: &mut Context<Self>) {
-        if self.composer.running.is_some() {
-            return;
-        }
         let Some((root, repository, project)) = self.repository_target(cx) else {
             return;
         };
+        if self.composer.writing(Some(&project)).is_some() {
+            return;
+        }
         let scope = commit_scope(self.composer.choice, &self.composer.chosen, &repository);
         let plan = match CommitPlan::new(message.trim(), &scope) {
             Ok(plan) => plan,
@@ -206,12 +228,12 @@ impl Inspector {
     }
 
     pub(super) fn push(&mut self, cx: &mut Context<Self>) {
-        if self.composer.running.is_some() {
-            return;
-        }
         let Some((root, _, project)) = self.repository_target(cx) else {
             return;
         };
+        if self.composer.writing(Some(&project)).is_some() {
+            return;
+        }
         self.start(Operation::Push, project, cx, move || async move {
             fx_core::git::operations::push(&root).await
         });
@@ -241,26 +263,31 @@ impl Inspector {
         F: FnOnce() -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<String, String>> + Send + 'static,
     {
-        self.composer.running = Some(operation);
         self.composer.outcome = None;
         let job = repository::spawn_git(job);
-        self.composer.task = Some(cx.spawn(async move |this, cx| {
+        let target = project.clone();
+        let task = cx.spawn(async move |this, cx| {
             let result = repository::finish_git(job).await;
             let _ = this.update(cx, |this, cx| {
-                this.finish_operation(operation, &project, result, cx)
+                this.finish_operation(operation, &target, result, cx)
             });
-        }));
+        });
+        self.composer.writes.insert(
+            project,
+            Write {
+                operation,
+                _task: task,
+            },
+        );
         cx.notify();
     }
 
-    /// Record how a write ended.
+    /// Record how a write to `project` ended, whichever project is shown.
     ///
-    /// The running flag is cleared whatever is showing now. Only this task
-    /// could clear it — switching projects drops the task — and it used to
-    /// return early on any change of the monitor's generation. Hidden, the
-    /// inspector never saw a switch from A to B and back, so it kept the task,
-    /// the generation had moved, and "Committing…" stayed up for good. The
-    /// result itself is only shown in the project it was written to.
+    /// Hidden, the inspector never hears of a switch from A to B and back, so
+    /// a check of the monitor's generation here kept "Committing…" up for
+    /// good. A commit's message is spent either way: its draft is removed, and
+    /// the field cleared only while the field is that project's.
     pub(super) fn finish_operation(
         &mut self,
         operation: Operation,
@@ -268,34 +295,40 @@ impl Inspector {
         result: Result<String, String>,
         cx: &mut Context<Self>,
     ) {
-        self.composer.running = None;
-        self.composer.task = None;
-        if self.monitor.read(cx).project() != Some(project) {
-            cx.notify();
-            return;
-        }
-        match result {
+        self.composer.writes.remove(project);
+        let shown = self.project.as_deref() == Some(project);
+        let outcome = match result {
             Ok(summary) => {
                 if operation == Operation::Commit {
-                    self.composer
-                        .field
-                        .update(cx, |field, cx| field.set_value("", cx));
-                    self.composer.visible = false;
-                    self.composer.chosen.clear();
+                    self.composer.drafts.remove(project);
+                    if shown {
+                        self.composer
+                            .field
+                            .update(cx, |field, cx| field.set_value("", cx));
+                        self.composer.visible = false;
+                        self.composer.chosen.clear();
+                    }
                 }
-                self.composer.outcome = Some(Outcome::Succeeded(summary));
+                Outcome::Succeeded(summary)
             }
-            Err(error) => self.composer.outcome = Some(Outcome::Failed(operation, error)),
+            Err(error) => Outcome::Failed(operation, error),
+        };
+        if shown {
+            self.composer.outcome = Some(outcome);
+        } else {
+            self.composer.unseen.insert(project.to_string(), outcome);
         }
-        // Either way the tree may have changed; read it now, not in 5 s.
-        self.monitor.update(cx, |monitor, cx| monitor.refresh(cx));
+        if self.monitor.read(cx).project() == Some(project) {
+            // Either way the tree may have changed; read it now, not in 5 s.
+            self.monitor.update(cx, |monitor, cx| monitor.refresh(cx));
+        }
         cx.notify();
     }
 
     /// Progress, or how the last commit or push ended.
     pub(super) fn operation_status(&self, cx: &Context<Self>) -> Option<AnyElement> {
         let theme = global::current();
-        if let Some(operation) = self.composer.running {
+        if let Some(operation) = self.running() {
             return Some(
                 div()
                     .debug_selector(|| "git-operation-progress".into())
@@ -414,7 +447,7 @@ impl Inspector {
         let Some(repository) = self.repository(cx) else {
             return div().into_any_element();
         };
-        let running = self.composer.running.is_some();
+        let running = self.running().is_some();
         let message_empty = self.composer.field.read(cx).value().trim().is_empty();
         let choice = self.composer.choice;
         let chosen = self.composer.chosen.len();
@@ -530,7 +563,7 @@ impl Inspector {
                         .debug_selector(|| "commit-button".into())
                         .flex_shrink_0()
                         .child(button_with_icon(
-                            if self.composer.running == Some(Operation::Commit) {
+                            if self.running() == Some(Operation::Commit) {
                                 "Committing…"
                             } else {
                                 "Commit"
@@ -562,24 +595,35 @@ mod tests {
     fn choosing_files_stages_only_what_needs_it_and_commits_a_renames_source() {
         let mut renamed = GitFileStatus::new("new.rs", "R", " ");
         renamed.original_path = Some("old.rs".into());
+        // `status.renames=copies` reports a copy with its source, which is
+        // still there and must not be committed as removed.
+        let mut copied = GitFileStatus::new("copy.rs", "C", " ");
+        copied.original_path = Some("source.rs".into());
         let repository = GitRepositoryInfo {
             is_git_repo: true,
             files: vec![
                 renamed,
+                copied,
                 GitFileStatus::new("edited.rs", " ", "M"),
                 GitFileStatus::new("fresh.rs", "?", "?"),
                 GitFileStatus::new("left-alone.rs", "M", " "),
+                GitFileStatus::new("source.rs", "M", " "),
             ],
             ..Default::default()
         };
-        let chosen: BTreeSet<String> = ["new.rs", "edited.rs", "fresh.rs"]
+        let chosen: BTreeSet<String> = ["new.rs", "copy.rs", "edited.rs", "fresh.rs"]
             .into_iter()
             .map(String::from)
             .collect();
         assert_eq!(
             commit_scope(CommitChoice::Chosen, &chosen, &repository),
             CommitScope::Paths {
-                chosen: vec!["new.rs".into(), "edited.rs".into(), "fresh.rs".into()],
+                chosen: vec![
+                    "new.rs".into(),
+                    "copy.rs".into(),
+                    "edited.rs".into(),
+                    "fresh.rs".into()
+                ],
                 sources: vec!["old.rs".into()],
             }
         );

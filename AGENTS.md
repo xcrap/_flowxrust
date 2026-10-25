@@ -695,7 +695,7 @@ diff viewer (`diff_view.rs`) and the commit composer (`commit_composer.rs`).
 The pure halves live in `fx-core::git`: `diff` parses, `operations` plans
 commits and pushes, `revision` hashes a snapshot.
 
-Five rules, each of which is a bug that was written first:
+Six rules, each of which is a bug that was written first:
 
 - **One poller.** The title-bar count and the inspector both observe the one
   `RepositoryMonitor`, which reads every five seconds and notifies only when
@@ -705,7 +705,11 @@ Five rules, each of which is a bug that was written first:
   the index. A constant revision made every poll look like a change.
 - **Diff lines are classified by hunk state, never by prefix.** Inside a hunk
   the `@@` counts say how many lines follow, and every one is content: a
-  removed `-- comment` arrives as `--- comment`, an added `++i` as `+++i`.
+  removed `-- comment` arrives as `--- comment`, an added `++i` as `+++i`. A
+  conflicted file's combined diff (`diff --cc`) has a marker column per
+  parent, and each is stripped. `git diff --cached` prints only
+  `* Unmerged path <path>` for one, which opens a section of its own; read as
+  metadata, it joined the previous file's section.
 - **A refresh never blanks the diff.** The selection is a path, not a status
   record (its line counts change on every edit). The shown document stays
   until its replacement is parsed, which is then scrolled back to the same
@@ -714,6 +718,11 @@ Five rules, each of which is a bug that was written first:
 - **Untracked directories are not files.** A nested repository is reported as
   `?? vendor/lib/`; counting its lines always failed, which pinned "Line totals
   are partial" on forever.
+- **A write outlives a project switch.** Writes in flight are held per project
+  and report to the project they wrote: its draft is removed on success, and
+  the banner waits until it is shown. Dropping the task on a switch cancelled
+  it after git had already committed, so the message came back as a draft,
+  with no banner, and Commit was enabled for a duplicate.
 
 Every Git job runs on one shared multi-thread runtime whose workers have an
 8 MiB stack. Jobs are *built* there (`spawn_git` takes a closure), because
@@ -725,7 +734,14 @@ git's whole combined output. A chosen-files commit is built in a temporary index
 beside the repository's own: chosen paths from the working tree, a rename's
 source as removed, then the user's index is reset to the commit for those
 paths only. `--only` took the source from the working tree too, so after
-`git mv old new` and a fresh `old`, the unchosen file was committed. Push
+`git mv old new` and a fresh `old`, the unchosen file was committed. Only a
+rename has a source to remove: a copy (`status.renames=copies`) names one
+too, and treating it as a rename committed the source as deleted. That commit
+names no pathspec, so git's own "cannot do a partial commit during a merge"
+never runs; FlowX refuses first, in git's words, while `MERGE_HEAD`,
+`CHERRY_PICK_HEAD` or `REVERT_HEAD` resolves or any index entry is unmerged.
+Unchecked, a merge became a two-parent commit of `HEAD` plus the chosen
+files, and the other branch counted as merged with its changes dropped. Push
 runs plain `git push` when `branch.<name>.merge` is set (it survives a gone
 upstream, which is how an empty clone starts) and otherwise
 `push --set-upstream -- <remote> HEAD`.

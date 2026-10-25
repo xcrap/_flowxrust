@@ -133,6 +133,9 @@ async fn commit_chosen(
     commit: &[String],
     chosen: &ChosenFiles,
 ) -> Result<String, String> {
+    if let Some(refusal) = partial_commit_refusal(root).await {
+        return Err(refusal);
+    }
     const PREPARE: &str = "Preparing the commit failed.";
     let index = TemporaryIndex::beside(root).await.ok_or(PREPARE)?;
     let index_path = Some(index.0.as_path());
@@ -185,6 +188,38 @@ async fn commit_chosen(
         ));
     }
     Ok(summary)
+}
+
+/// Why a chosen-files commit cannot be made now, in git's words.
+///
+/// The commit in [`commit_chosen`] names no pathspec, so git's own refusal of
+/// a partial commit mid-merge never runs. Made anyway, it was a two-parent
+/// merge commit holding `HEAD` plus the chosen files: `MERGE_HEAD` was
+/// consumed, and the other branch counted as merged with its changes dropped.
+/// A cherry-pick lent the commit the picked commit's author, and a revert
+/// ended with only the chosen files reverted. Git itself allows the last, and
+/// a partial commit beside unmerged files, which commits conflict markers if
+/// one of them is chosen; both are refused here, as a plain `git commit`
+/// refuses them.
+async fn partial_commit_refusal(root: &Path) -> Option<String> {
+    for (head, operation) in [
+        ("MERGE_HEAD", "a merge"),
+        ("CHERRY_PICK_HEAD", "a cherry-pick"),
+        ("REVERT_HEAD", "a revert"),
+    ] {
+        if read(root, &["rev-parse", "--quiet", "--verify", head])
+            .await
+            .is_some()
+        {
+            return Some(format!("cannot do a partial commit during {operation}."));
+        }
+    }
+    read(root, &["ls-files", "--unmerged"]).await.map(|_| {
+        "Committing is not possible because you have unmerged files.\n\
+         Fix them up in the work tree, and then use 'git add/rm <file>' as \
+         appropriate to mark resolution and make a commit."
+            .to_string()
+    })
 }
 
 /// An index file beside the repository's own, removed when dropped.
@@ -712,6 +747,135 @@ mod tests {
             "first.txt\n"
         );
         assert_eq!(status(root), "?? later.txt\n");
+    }
+
+    /// Run git where failing is the point, as a conflicted merge does.
+    fn git_may_fail(root: &Path, args: &[&str]) {
+        std::process::Command::new(GIT)
+            .args(args)
+            .current_dir(root)
+            .envs(command::hardened_environment())
+            .output()
+            .unwrap();
+    }
+
+    /// `tracked.txt` changed one way on `side` and another on `main`, so
+    /// bringing `side` in conflicts. Returns `side`'s commit.
+    fn diverge(root: &Path) -> String {
+        git(root, &["checkout", "-q", "-b", "side"]);
+        std::fs::write(root.join("tracked.txt"), "theirs\n").unwrap();
+        git(root, &["commit", "-qam", "theirs"]);
+        git(root, &["checkout", "-q", "main"]);
+        std::fs::write(root.join("tracked.txt"), "ours\n").unwrap();
+        git(root, &["commit", "-qam", "ours"]);
+        git(root, &["rev-parse", "side"]).trim().to_string()
+    }
+
+    fn chosen_old_txt() -> CommitPlan {
+        CommitPlan::new(
+            "Only this",
+            &CommitScope::Paths {
+                chosen: vec!["old.txt".into()],
+                sources: vec![],
+            },
+        )
+        .unwrap()
+    }
+
+    fn resolves(root: &Path, name: &str) -> bool {
+        std::process::Command::new(GIT)
+            .args(["rev-parse", "--quiet", "--verify", name])
+            .current_dir(root)
+            .envs(command::hardened_environment())
+            .output()
+            .unwrap()
+            .status
+            .success()
+    }
+
+    #[test]
+    fn a_chosen_commit_is_refused_mid_merge_and_the_merge_survives() {
+        // Made anyway, it was a merge commit of HEAD plus `old.txt`: the
+        // conflict and `side`'s changes were dropped, and `side` counted as
+        // merged.
+        let temp = repository();
+        let root = temp.path();
+        let side = diverge(root);
+        git_may_fail(root, &["merge", "--no-edit", "side"]);
+        std::fs::write(root.join("old.txt"), "an unrelated edit\n").unwrap();
+        let head = git(root, &["rev-parse", "HEAD"]);
+        let before = status(root);
+        assert!(before.contains("UU tracked.txt"), "{before}");
+
+        let error = run(commit(root, &chosen_old_txt())).unwrap_err();
+        assert_eq!(error, "cannot do a partial commit during a merge.");
+        assert_eq!(git(root, &["rev-parse", "MERGE_HEAD"]).trim(), side);
+        assert_eq!(git(root, &["rev-parse", "HEAD"]), head);
+        assert_eq!(status(root), before, "the index is untouched");
+        assert_no_temporary_index(root);
+
+        // Resolved, the merge is still in progress and still refused.
+        git(root, &["add", "tracked.txt"]);
+        let error = run(commit(root, &chosen_old_txt())).unwrap_err();
+        assert_eq!(error, "cannot do a partial commit during a merge.");
+        assert!(resolves(root, "MERGE_HEAD"));
+    }
+
+    #[test]
+    fn a_chosen_commit_is_refused_during_a_cherry_pick_or_a_revert() {
+        let temp = repository();
+        let root = temp.path();
+        diverge(root);
+        git_may_fail(root, &["cherry-pick", "side"]);
+        // Resolved, so only the cherry-pick itself stands in the way.
+        git(root, &["add", "tracked.txt"]);
+        std::fs::write(root.join("old.txt"), "an unrelated edit\n").unwrap();
+        let error = run(commit(root, &chosen_old_txt())).unwrap_err();
+        assert_eq!(error, "cannot do a partial commit during a cherry-pick.");
+        assert!(resolves(root, "CHERRY_PICK_HEAD"));
+        git(root, &["cherry-pick", "--abort"]);
+
+        // `ours` reverted onto a later edit of the same line conflicts.
+        std::fs::write(root.join("tracked.txt"), "later\n").unwrap();
+        git(root, &["commit", "-qam", "later"]);
+        git_may_fail(root, &["revert", "--no-edit", "HEAD~1"]);
+        git(root, &["add", "tracked.txt"]);
+        std::fs::write(root.join("old.txt"), "an unrelated edit\n").unwrap();
+        let error = run(commit(root, &chosen_old_txt())).unwrap_err();
+        assert_eq!(error, "cannot do a partial commit during a revert.");
+        assert!(
+            resolves(root, "REVERT_HEAD"),
+            "a commit would have ended the revert"
+        );
+        assert_no_temporary_index(root);
+    }
+
+    #[test]
+    fn a_chosen_commit_is_refused_beside_unmerged_files() {
+        // A conflicted `stash pop` leaves unmerged entries and no merge.
+        let temp = repository();
+        let root = temp.path();
+        std::fs::write(root.join("tracked.txt"), "stashed\n").unwrap();
+        git(root, &["stash", "-q"]);
+        std::fs::write(root.join("tracked.txt"), "committed\n").unwrap();
+        git(root, &["commit", "-qam", "committed"]);
+        git_may_fail(root, &["stash", "pop"]);
+        let head = git(root, &["rev-parse", "HEAD"]);
+        let plan = CommitPlan::new(
+            "Markers",
+            &CommitScope::Paths {
+                chosen: vec!["tracked.txt".into()],
+                sources: vec![],
+            },
+        )
+        .unwrap();
+        let error = run(commit(root, &plan)).unwrap_err();
+        assert!(
+            error.starts_with("Committing is not possible because you have unmerged files."),
+            "{error}"
+        );
+        assert_eq!(git(root, &["rev-parse", "HEAD"]), head);
+        assert_eq!(status(root), "UU tracked.txt\n");
     }
 
     fn assert_no_temporary_index(root: &Path) {

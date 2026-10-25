@@ -125,7 +125,7 @@ impl Inspector {
     fn header(&self, cx: &Context<Self>) -> AnyElement {
         let theme = global::current();
         let repository = self.repository(cx);
-        let running = self.composer.running;
+        let running = self.running();
         let mut header = div()
             .h(px(INSPECTOR_HEADER_HEIGHT))
             .debug_selector(|| "inspector-header".into())
@@ -868,12 +868,12 @@ mod tests {
                 .field
                 .update(cx, |field, cx| field.set_value("Ship it", cx));
             inspector.commit("Ship it".into(), cx);
-            assert_eq!(inspector.composer.running, Some(Operation::Commit));
+            assert_eq!(inspector.running(), Some(Operation::Commit));
         });
         test.refresh().unwrap();
         assert!(visual.debug_bounds("git-operation-progress").is_some());
         let reads = test.read(|cx| inspector.read(cx).monitor.read(cx).reads());
-        wait_until(&mut test, &inspector, |i| i.composer.running.is_none());
+        wait_until(&mut test, &inspector, |i| i.running().is_none());
         test.read(|cx| {
             let inspector = inspector.read(cx);
             assert!(
@@ -919,13 +919,13 @@ mod tests {
         });
         inspector.update(&mut test, |inspector, cx| {
             inspector.commit("Ship it".into(), cx);
-            assert_eq!(inspector.composer.running, Some(Operation::Commit));
+            assert_eq!(inspector.running(), Some(Operation::Commit));
         });
         for project in [second_id, first_id] {
             state.update(&mut test, |state, _| state.select_project(project));
             monitor.update(&mut test, |monitor, cx| monitor.sync(cx));
         }
-        wait_until(&mut test, &inspector, |i| i.composer.running.is_none());
+        wait_until(&mut test, &inspector, |i| i.running().is_none());
         test.read(|cx| {
             assert!(
                 matches!(
@@ -942,6 +942,151 @@ mod tests {
     }
 
     #[test]
+    fn a_commit_outlives_a_switch_and_is_reported_in_its_own_project() {
+        // A switch used to drop the task, which cancelled it. Git committed
+        // anyway, and back in the project the message sat in the field as a
+        // draft, nothing said it was committed, and Commit was enabled again.
+        let first = repo();
+        let second = repo();
+        std::fs::write(first.path().join("sample.txt"), "after the edit\n").unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let mut test = gpui::TestAppContext::single();
+        let (inspector, _window) = mount(&mut test, data.path(), Some(first.path()), 360.0);
+        let state = test.read(|cx| inspector.read(cx).state.clone());
+        let first_key = test.read(|cx| inspector.read(cx).project.clone().unwrap());
+        let first_id = state.update(&mut test, |state, _| {
+            state
+                .project_with_root(&first.path().to_string_lossy())
+                .unwrap()
+        });
+        let second_id = state.update(&mut test, |state, _| {
+            state.add_project(&second.path().to_string_lossy())
+        });
+        // What rendering a visible inspector does after a switch.
+        let show = |test: &mut gpui::TestAppContext, project| {
+            state.update(test, |state, _| state.select_project(project));
+            inspector.update(test, |inspector, cx| inspector.sync(cx));
+        };
+        let field = |test: &gpui::TestAppContext| {
+            test.read(|cx| {
+                inspector
+                    .read(cx)
+                    .composer
+                    .field
+                    .read(cx)
+                    .value()
+                    .to_string()
+            })
+        };
+        inspector.update(&mut test, |inspector, cx| {
+            inspector
+                .composer
+                .field
+                .update(cx, |field, cx| field.set_value("Ship it", cx));
+            inspector.commit("Ship it".into(), cx);
+        });
+
+        // Nothing has been polled, so the commit is still in flight.
+        show(&mut test, second_id);
+        test.read(|cx| {
+            let inspector = inspector.read(cx);
+            assert_eq!(inspector.running(), None, "the other project is not busy");
+            assert_eq!(
+                inspector.composer.writing(Some(&first_key)),
+                Some(Operation::Commit)
+            );
+        });
+        assert_eq!(field(&test), "");
+        show(&mut test, first_id);
+        test.read(|cx| assert_eq!(inspector.read(cx).running(), Some(Operation::Commit)));
+        assert_eq!(field(&test), "Ship it");
+
+        show(&mut test, second_id);
+        wait_until(&mut test, &inspector, |i| {
+            i.composer.writing(Some(&first_key)).is_none()
+        });
+        test.read(|cx| {
+            assert_eq!(
+                inspector.read(cx).composer.outcome,
+                None,
+                "the other project's commit is not reported here"
+            );
+        });
+        show(&mut test, first_id);
+        test.read(|cx| {
+            let inspector = inspector.read(cx);
+            assert!(
+                matches!(&inspector.composer.outcome, Some(Outcome::Succeeded(summary)) if summary.contains("Ship it")),
+                "{:?}",
+                inspector.composer.outcome
+            );
+            assert_eq!(inspector.running(), None);
+        });
+        assert_eq!(field(&test), "", "a committed message is no draft");
+        assert_eq!(
+            git(first.path(), &["log", "-1", "--format=%s"]).trim(),
+            "Ship it"
+        );
+        assert_eq!(
+            git(second.path(), &["log", "--format=%s"]).trim(),
+            "Initial fixture"
+        );
+    }
+
+    #[test]
+    fn choosing_a_copy_commits_it_without_removing_its_source() {
+        // With `status.renames=copies`, status reports `C  copy.txt` with
+        // `sample.txt` as its source. Read as a rename, the source was
+        // committed as deleted and its staged edit dropped from the index.
+        let root = repo();
+        git(root.path(), &["config", "status.renames", "copies"]);
+        let lines: String = (0..40).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(root.path().join("sample.txt"), &lines).unwrap();
+        git(root.path(), &["commit", "-qam", "Longer sample"]);
+        std::fs::write(root.path().join("copy.txt"), &lines).unwrap();
+        std::fs::write(root.path().join("sample.txt"), format!("{lines}one more\n")).unwrap();
+        git(root.path(), &["add", "copy.txt", "sample.txt"]);
+        let data = tempfile::tempdir().unwrap();
+        let mut test = gpui::TestAppContext::single();
+        let (inspector, _window) = mount(&mut test, data.path(), Some(root.path()), 360.0);
+        test.read(|cx| {
+            let repository = inspector.read(cx).repository(cx).unwrap();
+            let copy = repository.files.iter().find(|f| f.path == "copy.txt");
+            assert_eq!(
+                copy.map(|f| (f.staged_status.as_str(), f.original_path.as_deref())),
+                Some(("C", Some("sample.txt"))),
+                "the fixture should be read as a copy: {:?}",
+                repository.files
+            );
+        });
+        inspector.update(&mut test, |inspector, cx| {
+            inspector.composer.choice = CommitChoice::Chosen;
+            inspector.composer.chosen = ["copy.txt".to_string()].into();
+            inspector.commit("Copy".into(), cx);
+        });
+        wait_until(&mut test, &inspector, |i| i.running().is_none());
+        test.read(|cx| {
+            let outcome = &inspector.read(cx).composer.outcome;
+            assert!(
+                matches!(outcome, Some(Outcome::Succeeded(_))),
+                "{outcome:?}"
+            );
+        });
+        assert_eq!(
+            git(
+                root.path(),
+                &["show", "--name-status", "--no-renames", "--format=", "HEAD"]
+            ),
+            "A\tcopy.txt\n"
+        );
+        assert_eq!(
+            git(root.path(), &["status", "--porcelain=v1", "--no-renames"]),
+            "M  sample.txt\n",
+            "the source's staged edit stays staged"
+        );
+    }
+
+    #[test]
     fn a_failed_push_shows_gits_own_explanation() {
         let root = repo();
         let data = tempfile::tempdir().unwrap();
@@ -954,7 +1099,7 @@ mod tests {
         let (inspector, window) = mount(&mut test, data.path(), Some(root.path()), 360.0);
         test.read(|cx| assert!(inspector.read(cx).repository(cx).unwrap().can_push()));
         inspector.update(&mut test, |inspector, cx| inspector.push(cx));
-        wait_until(&mut test, &inspector, |i| i.composer.running.is_none());
+        wait_until(&mut test, &inspector, |i| i.running().is_none());
         test.read(|cx| match &inspector.read(cx).composer.outcome {
             Some(Outcome::Failed(Operation::Push, text)) => {
                 assert!(text.contains("/nonexistent/flowx/remote.git"), "{text}");

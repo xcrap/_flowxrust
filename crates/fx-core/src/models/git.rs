@@ -20,8 +20,8 @@ pub struct GitFileStatus {
     pub unstaged_additions: usize,
     #[serde(rename = "unstagedDeletions", default)]
     pub unstaged_deletions: usize,
-    /// Where a rename or copy came from. Committing only the destination would
-    /// leave the source's deletion behind.
+    /// Where a rename or copy came from. Only a rename's source is gone; see
+    /// [`Self::rename_source`].
     #[serde(
         rename = "originalPath",
         default,
@@ -83,6 +83,18 @@ impl GitFileStatus {
         // An untracked file counts as unstaged work: it is not in the index and
         // not committed, so it is exactly what `git commit` would not pick up.
         self.is_untracked() || (self.unstaged_status != " " && self.unstaged_status != "?")
+    }
+
+    /// The path a rename moved this file from, which committing the
+    /// destination alone would leave behind as a deletion.
+    ///
+    /// A copy, which `status.renames=copies` reports, carries a source too,
+    /// but that source is still there and is a file of its own. Read as a
+    /// rename's, choosing only the copy committed the source as deleted.
+    pub fn rename_source(&self) -> Option<&str> {
+        (self.staged_status == "R" || self.unstaged_status == "R")
+            .then_some(self.original_path.as_deref())
+            .flatten()
     }
 }
 
@@ -196,6 +208,23 @@ mod tests {
         assert!(f.is_untracked());
         assert!(f.has_unstaged_changes(), "untracked work is not staged");
         assert!(!f.has_staged_changes());
+    }
+
+    #[test]
+    fn only_a_rename_names_a_source_that_is_gone() {
+        let mut renamed = GitFileStatus::new("new.rs", "R", " ");
+        renamed.original_path = Some("old.rs".into());
+        assert_eq!(renamed.rename_source(), Some("old.rs"));
+        // Intent-to-add makes a rename in the working tree.
+        renamed.staged_status = " ".into();
+        renamed.unstaged_status = "R".into();
+        assert_eq!(renamed.rename_source(), Some("old.rs"));
+
+        let mut copied = GitFileStatus::new("copy.rs", "C", " ");
+        copied.original_path = Some("source.rs".into());
+        assert_eq!(copied.rename_source(), None, "a copy's source stays");
+        copied.unstaged_status = "M".into();
+        assert_eq!(copied.rename_source(), None);
     }
 
     #[test]

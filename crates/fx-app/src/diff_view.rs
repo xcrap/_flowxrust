@@ -388,16 +388,34 @@ fn inline_row(line: &DiffLine, metrics: RowMetrics, theme: &Theme) -> AnyElement
         .into_any_element()
 }
 
+/// Which column of the split layout a half is drawn in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Column {
+    Old,
+    New,
+}
+
+/// The number a split half shows: each column counts its own file. A context
+/// line has both, and showing the old one on both sides put 10, 11… under
+/// `+12,4`.
+fn split_number(line: &DiffLine, column: Column) -> Option<u32> {
+    match column {
+        Column::Old => line.old_line,
+        Column::New => line.new_line,
+    }
+}
+
 fn split_half(
     section: &DiffSection,
     index: Option<usize>,
+    column: Column,
     metrics: RowMetrics,
     theme: &Theme,
 ) -> AnyElement {
     let side = section.split_side(index);
     let (fg, bg) = side_palette(side, theme);
     let line = index.and_then(|index| section.lines.get(index));
-    let number = line.and_then(|line| line.old_line.or(line.new_line));
+    let number = line.and_then(|line| split_number(line, column));
     let ink = match side {
         SplitSide::Addition => Colors::diff_added_fg(theme),
         SplitSide::Deletion => Colors::diff_removed_fg(theme),
@@ -432,9 +450,9 @@ fn split_row(section: &DiffSection, row: usize, metrics: RowMetrics, theme: &The
             .h(px(metrics.height))
             .w_full()
             .flex()
-            .child(split_half(section, *old, metrics, theme))
+            .child(split_half(section, *old, Column::Old, metrics, theme))
             .child(divider_with_axis(DividerAxis::Vertical))
-            .child(split_half(section, *new, metrics, theme))
+            .child(split_half(section, *new, Column::New, metrics, theme))
             .into_any_element(),
         Some(SplitRow::Annotation(index)) => {
             let line = &section.lines[*index];
@@ -1134,6 +1152,42 @@ mod tests {
         );
         assert_eq!(row_of_inline_line(&section, 3, DiffLayout::Split), 3);
         assert_eq!(row_of_inline_line(&section, 99, DiffLayout::Inline), 4);
+    }
+
+    #[test]
+    fn each_split_column_numbers_its_own_file() {
+        let section = parse_section(
+            Some("a.rs".into()),
+            [
+                "@@ -10,3 +12,4 @@",
+                " keep",
+                "-old",
+                "+new",
+                "+extra",
+                " tail",
+            ],
+        )
+        .unwrap();
+        let numbers: Vec<_> = section
+            .split_rows
+            .iter()
+            .filter_map(|row| match row {
+                SplitRow::Pair { old, new } => Some((
+                    old.and_then(|i| split_number(&section.lines[i], Column::Old)),
+                    new.and_then(|i| split_number(&section.lines[i], Column::New)),
+                )),
+                SplitRow::Annotation(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            numbers,
+            [
+                (Some(10), Some(12)),
+                (Some(11), Some(13)),
+                (None, Some(14)),
+                (Some(12), Some(15)),
+            ]
+        );
     }
 
     #[test]

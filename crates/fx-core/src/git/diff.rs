@@ -29,23 +29,26 @@ pub enum DiffLineKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffLine {
     pub kind: DiffLineKind,
-    /// The line as git printed it, marker included.
+    /// The line as git printed it, markers included.
     pub text: String,
     pub old_line: Option<u32>,
     pub new_line: Option<u32>,
+    /// How many marker columns open `text`: one in a unified diff, one per
+    /// parent in a combined one, and none for metadata and hunk headers.
+    pub markers: u8,
 }
 
 impl DiffLine {
-    /// The source text without its one-character marker. Metadata and hunk
-    /// headers have no marker and are returned whole.
+    /// The source text without its markers. Metadata and hunk headers have
+    /// none and are returned whole.
+    ///
+    /// A conflicted file's combined diff has a marker per parent, so
+    /// stripping one left `+<<<<<<< HEAD` in the split view.
     pub fn content(&self) -> &str {
-        match self.kind {
-            DiffLineKind::Context | DiffLineKind::Addition | DiffLineKind::Deletion => {
-                // The marker is ASCII, so byte 1 is always a boundary.
-                self.text.get(1..).unwrap_or_default()
-            }
-            DiffLineKind::Meta | DiffLineKind::Hunk => &self.text,
-        }
+        // Markers are ASCII, so the byte after them is always a boundary.
+        self.text
+            .get(usize::from(self.markers)..)
+            .unwrap_or_default()
     }
 }
 
@@ -149,15 +152,26 @@ const MAXIMUM_MEASURED_COLUMNS: usize = 16_400;
 /// A file with a merge conflict is a combined diff, headed `diff --cc` rather
 /// than `diff --git`. Only the latter used to start a section, so a conflicted
 /// file showed no diff at all — exactly when one is most needed.
+///
+/// `git diff --cached` has no diff for a conflicted file, only a
+/// `* Unmerged path <path>` notice, which is a section of its own holding
+/// that notice. Read as metadata, it landed in the previous file's section,
+/// or was dropped before the first, and the conflicted file had none.
 pub fn parse_unified_diff(text: &str) -> Vec<DiffSection> {
     let mut sections = Vec::new();
     let mut current: Option<(Option<String>, Vec<&str>)> = None;
     for line in diff_lines(text) {
-        if is_file_header(line) {
+        // Hunk content always carries a marker, so neither can be content.
+        let unmerged = line.strip_prefix(UNMERGED_NOTICE);
+        if is_file_header(line) || unmerged.is_some() {
             if let Some((path, lines)) = current.take() {
                 sections.extend(parse_section(path, lines));
             }
-            current = Some((anchor_path(line), Vec::new()));
+            current = Some(match unmerged {
+                // Git prints the path as it is, unquoted.
+                Some(path) => (Some(path.to_string()), vec![line]),
+                None => (anchor_path(line), Vec::new()),
+            });
             continue;
         }
         if let Some((_, lines)) = current.as_mut() {
@@ -190,12 +204,13 @@ pub fn parse_section<'a>(
     // In a combined hunk, the lines each parent still expects.
     let mut combined: Vec<usize> = Vec::new();
 
-    let mut push = |kind, text: &str, old, new| {
+    let mut push = |kind, text: &str, old, new, markers| {
         lines.push(DiffLine {
             kind,
             text: text.to_string(),
             old_line: old,
             new_line: new,
+            markers,
         })
     };
 
@@ -212,7 +227,7 @@ pub fn parse_section<'a>(
             );
             remaining_old = 0;
             remaining_new = hunk.as_ref().map_or(usize::MAX, |h| h.result.1 as usize);
-            push(DiffLineKind::Hunk, raw, None, None);
+            push(DiffLineKind::Hunk, raw, None, None, 0);
             continue;
         }
 
@@ -238,7 +253,8 @@ pub fn parse_section<'a>(
                     _ => old_line.filter(|_| in_first),
                 };
                 let new = new_line.filter(|_| in_result);
-                push(kind, raw, old, new);
+                let width = u8::try_from(markers.len()).unwrap_or(u8::MAX);
+                push(kind, raw, old, new, width);
                 if in_first {
                     old_line = old_line.map(|n| n + 1);
                 }
@@ -266,20 +282,20 @@ pub fn parse_section<'a>(
             // until the next header.
             remaining_old = hunk.map_or(usize::MAX, |h| h.old_count as usize);
             remaining_new = hunk.map_or(usize::MAX, |h| h.new_count as usize);
-            push(DiffLineKind::Hunk, raw, None, None);
+            push(DiffLineKind::Hunk, raw, None, None, 0);
             continue;
         }
 
         if remaining_old > 0 || remaining_new > 0 {
             match raw.as_bytes().first() {
                 Some(b'+') => {
-                    push(DiffLineKind::Addition, raw, None, new_line);
+                    push(DiffLineKind::Addition, raw, None, new_line, 1);
                     new_line = new_line.map(|n| n + 1);
                     remaining_new = remaining_new.saturating_sub(1);
                     continue;
                 }
                 Some(b'-') => {
-                    push(DiffLineKind::Deletion, raw, old_line, None);
+                    push(DiffLineKind::Deletion, raw, old_line, None, 1);
                     old_line = old_line.map(|n| n + 1);
                     remaining_old = remaining_old.saturating_sub(1);
                     continue;
@@ -287,7 +303,7 @@ pub fn parse_section<'a>(
                 // `diff.suppressBlankEmpty` prints an empty context line with
                 // no marker at all.
                 Some(b' ') | None => {
-                    push(DiffLineKind::Context, raw, old_line, new_line);
+                    push(DiffLineKind::Context, raw, old_line, new_line, 1);
                     old_line = old_line.map(|n| n + 1);
                     new_line = new_line.map(|n| n + 1);
                     remaining_old = remaining_old.saturating_sub(1);
@@ -324,12 +340,15 @@ pub fn parse_section<'a>(
         {
             continue;
         }
-        push(DiffLineKind::Meta, raw, None, None);
+        push(DiffLineKind::Meta, raw, None, None, 0);
     }
 
     let path = path.filter(|path| !path.is_empty())?;
     (!lines.is_empty()).then(|| DiffSection::from_lines(path, lines))
 }
+
+/// What `git diff --cached` prints in place of a conflicted file's diff.
+const UNMERGED_NOTICE: &str = "* Unmerged path ";
 
 /// Whether a line opens a file's section: `diff --git`, or the `diff --cc`
 /// and `diff --combined` of a merge.
@@ -674,6 +693,77 @@ index 1..2 100644\n\
         assert_eq!(conflict.lines[7].old_line, Some(3));
         assert_eq!(sections[1].additions, 1);
         assert_eq!(sections[1].deletions, 1);
+    }
+
+    #[test]
+    fn a_combined_line_loses_one_marker_per_parent() {
+        // Captured from `git diff` with `f.txt` in conflict after a merge.
+        let text = "diff --cc f.txt\n\
+index f4c4712,ed8445c..0000000\n\
+--- a/f.txt\n\
++++ b/f.txt\n\
+@@@ -1,3 -1,3 +1,7 @@@\n  one\n++<<<<<<< HEAD\n +MAIN\n++=======\n+ SIDE\n++>>>>>>> side\n  three\n";
+        let section = &parse_unified_diff(text)[0];
+        let content: Vec<_> = section.lines.iter().map(DiffLine::content).collect();
+        assert_eq!(
+            content,
+            [
+                "@@@ -1,3 -1,3 +1,7 @@@",
+                "one",
+                "<<<<<<< HEAD",
+                "MAIN",
+                "=======",
+                "SIDE",
+                ">>>>>>> side",
+                "three",
+            ]
+        );
+        // An empty line of a combined hunk has no markers left to strip.
+        let blank = parse_section(Some("f".into()), ["@@@ -1 -1 +1 @@@", ""]).unwrap();
+        assert_eq!(blank.lines[1].content(), "");
+    }
+
+    #[test]
+    fn an_unmerged_path_notice_is_a_section_of_its_own() {
+        // Captured from `git diff --cached` during a merge with `f.txt` in
+        // conflict, after or before another staged file.
+        let after = "diff --git a/a-staged.txt b/a-staged.txt\n\
+new file mode 100644\n\
+index 0000000..7898192\n\
+--- /dev/null\n\
++++ b/a-staged.txt\n\
+@@ -0,0 +1 @@\n\
++a\n\
+* Unmerged path f.txt\n\
+diff --git a/other2.txt b/other2.txt\n\
+new file mode 100644\n\
+index 0000000..19d9cc8\n\
+--- /dev/null\n\
++++ b/other2.txt\n\
+@@ -0,0 +1 @@\n\
++staged\n";
+        let sections = parse_unified_diff(after);
+        let paths: Vec<_> = sections.iter().map(|s| s.path.as_str()).collect();
+        assert_eq!(paths, ["a-staged.txt", "f.txt", "other2.txt"]);
+        assert_eq!(
+            kinds(&sections[0]).last(),
+            Some(&(DiffLineKind::Addition, "+a")),
+            "the notice is not the previous file's"
+        );
+        assert_eq!(
+            kinds(&sections[1]),
+            [(DiffLineKind::Meta, "* Unmerged path f.txt")]
+        );
+
+        let before = "* Unmerged path my café.txt\n\
+diff --git a/other2.txt b/other2.txt\n\
+@@ -0,0 +1 @@\n\
++staged\n";
+        let paths: Vec<_> = parse_unified_diff(before)
+            .into_iter()
+            .map(|section| section.path)
+            .collect();
+        assert_eq!(paths, ["my café.txt", "other2.txt"]);
     }
 
     #[test]
