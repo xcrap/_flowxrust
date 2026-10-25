@@ -88,6 +88,8 @@ enum BlockKind {
     Heading(u8),
     Code(String),
     Rule,
+    /// One line of a table, its cells padded into columns.
+    TableRow,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -112,9 +114,84 @@ struct Builder {
     lists: Vec<Option<u64>>,
     marker: Option<String>,
     quote_depth: usize,
+    /// The table being read, cell by cell.
+    table: Option<Table>,
+}
+
+/// A table's cells as plain text, kept until the table ends so its columns
+/// can be measured.
+#[derive(Default)]
+struct Table {
+    rows: Vec<Vec<String>>,
+    header_rows: usize,
 }
 
 impl Builder {
+    /// Draw the table that just ended as aligned lines of monospaced text.
+    ///
+    /// Without the extension a table parsed as one paragraph whose line
+    /// breaks became spaces, so it read and copied as a single run-on line.
+    /// One block per row keeps a copy to one line per row, and the header is
+    /// set apart by a rule.
+    fn finish_table(&mut self) {
+        let Some(table) = self.table.take() else {
+            return;
+        };
+        let columns = table.rows.iter().map(Vec::len).max().unwrap_or(0);
+        let widths: Vec<usize> = (0..columns)
+            .map(|column| {
+                table
+                    .rows
+                    .iter()
+                    .filter_map(|row| row.get(column))
+                    .map(|cell| cell.chars().count())
+                    .max()
+                    .unwrap_or(0)
+            })
+            .collect();
+        let line = |row: &[String]| {
+            widths
+                .iter()
+                .enumerate()
+                .map(|(column, width)| {
+                    let cell = row.get(column).map_or("", String::as_str);
+                    let pad = width.saturating_sub(cell.chars().count());
+                    format!("{cell}{}", " ".repeat(pad))
+                })
+                .collect::<Vec<_>>()
+                .join(" │ ")
+                .trim_end()
+                .to_string()
+        };
+        for (index, row) in table.rows.iter().enumerate() {
+            self.push_table_row(line(row), index < table.header_rows);
+            if index + 1 == table.header_rows {
+                let rule = widths
+                    .iter()
+                    .map(|width| "─".repeat(*width))
+                    .collect::<Vec<_>>()
+                    .join("─┼─");
+                self.push_table_row(rule, false);
+            }
+        }
+    }
+
+    fn push_table_row(&mut self, text: String, header: bool) {
+        self.blocks.push(Block {
+            kind: BlockKind::TableRow,
+            spans: vec![InlineSpan {
+                range: 0..text.len(),
+                style: InlineStyle {
+                    strong: header,
+                    ..InlineStyle::default()
+                },
+            }],
+            text,
+            quote_depth: self.quote_depth,
+            ..Block::default()
+        });
+    }
+
     fn flush(&mut self) {
         // A fence's body arrives with the newline before the closing fence.
         // Kept, it paints an empty last line and is copied as one.
@@ -136,6 +213,13 @@ impl Builder {
 
     fn append(&mut self, text: &str, code: bool) {
         if text.is_empty() {
+            return;
+        }
+        if let Some(table) = &mut self.table {
+            if let Some(cell) = table.rows.last_mut().and_then(|row| row.last_mut()) {
+                // A line break inside a cell would break the row it is in.
+                cell.push_str(&text.replace('\n', " "));
+            }
             return;
         }
         if self.current.text.is_empty() {
@@ -187,7 +271,8 @@ impl Builder {
 
 fn parse(source: &str) -> Vec<Block> {
     let mut builder = Builder::default();
-    let options = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+    let options =
+        Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS | Options::ENABLE_TABLES;
     for event in Parser::new_ext(source, options) {
         match event {
             Event::Start(Tag::Paragraph | Tag::HtmlBlock) => builder.flush(),
@@ -226,6 +311,30 @@ fn parse(source: &str) -> Vec<Block> {
                 builder.flush();
                 builder.quote_depth += 1;
             }
+            Event::Start(Tag::Table(_)) => {
+                builder.flush();
+                builder.table = Some(Table::default());
+            }
+            Event::Start(Tag::TableHead | Tag::TableRow) => {
+                if let Some(table) = &mut builder.table {
+                    table.rows.push(Vec::new());
+                }
+            }
+            Event::Start(Tag::TableCell) => {
+                if let Some(row) = builder
+                    .table
+                    .as_mut()
+                    .and_then(|table| table.rows.last_mut())
+                {
+                    row.push(String::new());
+                }
+            }
+            Event::End(TagEnd::TableHead) => {
+                if let Some(table) = &mut builder.table {
+                    table.header_rows = table.rows.len();
+                }
+            }
+            Event::End(TagEnd::Table) => builder.finish_table(),
             Event::Start(Tag::Strong) => builder.strong += 1,
             Event::Start(Tag::Emphasis) => builder.emphasis += 1,
             Event::Start(Tag::Strikethrough) => builder.strikethrough += 1,
@@ -444,9 +553,12 @@ fn paragraph_key(id: &SharedString, index: usize) -> SharedString {
 }
 
 /// Consecutive list items are lines of one list rather than paragraphs, and
-/// are copied back out that way.
+/// are copied back out that way. So are a table's rows.
 fn is_tight(blocks: &[Block], index: usize) -> bool {
-    index > 0 && blocks[index].list_depth > 0 && blocks[index - 1].list_depth > 0
+    index > 0
+        && ((blocks[index].list_depth > 0 && blocks[index - 1].list_depth > 0)
+            || (blocks[index].kind == BlockKind::TableRow
+                && blocks[index - 1].kind == BlockKind::TableRow))
 }
 
 fn render_block(block: &Block, id: SharedString, tight: bool) -> AnyElement {
@@ -458,7 +570,7 @@ fn render_block(block: &Block, id: SharedString, tight: bool) -> AnyElement {
         BlockKind::Heading(1) => TextRole::Title2,
         BlockKind::Heading(2 | 3) => TextRole::Title3,
         BlockKind::Heading(_) => TextRole::BodyMedium,
-        BlockKind::Code(_) => TextRole::Mono,
+        BlockKind::Code(_) | BlockKind::TableRow => TextRole::Mono,
         _ => TextRole::Body,
     };
     let shown = SharedString::from(block.text.clone());
@@ -621,6 +733,41 @@ mod tests {
         assert!(code.style.strong && code.style.link);
         let italic = block.spans.iter().find(|span| span.style.emphasis).unwrap();
         assert!(italic.style.strong && italic.style.link);
+    }
+
+    #[test]
+    fn a_table_is_drawn_and_copied_as_aligned_rows() {
+        // Without the extension, a table was one paragraph whose line breaks
+        // became spaces: `| File | Change | |---|---| | a.rs | fix |`.
+        let source = "Summary:\n\n| File | Change |\n|---|---|\n| a.rs | **fix** `x` |\n| lib.rs | rename |\n\nDone.";
+        let blocks = parse(source);
+        let rows: Vec<&str> = blocks
+            .iter()
+            .filter(|block| block.kind == BlockKind::TableRow)
+            .map(|block| block.text.as_str())
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                "File   │ Change",
+                "───────┼───────",
+                "a.rs   │ fix x",
+                "lib.rs │ rename",
+            ]
+        );
+        assert!(blocks[1].spans[0].style.strong, "the header is set apart");
+        assert!(!blocks[3].spans[0].style.strong);
+        assert_eq!(blocks.last().unwrap().text, "Done.");
+
+        let copied: Vec<(String, bool)> = paragraphs(source, "table")
+            .into_iter()
+            .map(|paragraph| (paragraph.text.to_string(), paragraph.tight))
+            .collect();
+        assert_eq!(copied[1], ("File   │ Change".into(), false));
+        assert!(
+            copied[2..5].iter().all(|(_, tight)| *tight),
+            "each row is copied as a line of one table"
+        );
     }
 
     #[test]

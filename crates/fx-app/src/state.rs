@@ -74,6 +74,12 @@ pub struct AppState {
     restored_drafts: HashMap<Uuid, String>,
     /// Unacknowledged submissions to restore after startup fails or is cancelled.
     retry_drafts: HashMap<Uuid, String>,
+    /// The user row a prompt with no session behind it was written to, by
+    /// thread: where the session it opens begins, for the binding it gets.
+    session_starts: HashMap<Uuid, Uuid>,
+    /// The banner a turn's failure put up, and whose turn it was. A later turn
+    /// of that thread working takes it down, and nothing else's does.
+    turn_banner: Option<(Uuid, String)>,
     /// The save of a panel toggle, held until the panel has finished moving.
     panel_save: Option<gpui::Task<()>>,
     /// Claude threads whose context has been asked for this launch, so a
@@ -202,6 +208,8 @@ impl AppState {
             deleted_agents: HashSet::new(),
             restored_drafts: HashMap::new(),
             retry_drafts: HashMap::new(),
+            session_starts: HashMap::new(),
+            turn_banner: None,
             panel_save: None,
             context_probed: HashSet::new(),
             saved_conversations: HashMap::new(),
@@ -950,6 +958,7 @@ impl AppState {
         self.protected_conversations.remove(&agent_id);
         self.restored_drafts.remove(&agent_id);
         self.retry_drafts.remove(&agent_id);
+        self.session_starts.remove(&agent_id);
         self.saved_conversations.remove(&agent_id);
         self.restored_costs.remove(&agent_id);
         self.pending_interactions.remove(&agent_id);
@@ -1337,6 +1346,7 @@ impl AppState {
         self.protected_conversations.remove(&agent_id);
         self.restored_drafts.remove(&agent_id);
         self.retry_drafts.remove(&agent_id);
+        self.session_starts.remove(&agent_id);
         self.saved_conversations.remove(&agent_id);
         self.restored_costs.remove(&agent_id);
         self.pending_interactions.remove(&agent_id);
@@ -1409,6 +1419,23 @@ impl AppState {
                         && same_images(&crate::attachments::attachments_in(message), attachments)
                 });
             if !retrying_same_row {
+                // A different prompt replaces one the provider never accepted.
+                // Left in, the old row read as sent, and the provider's history,
+                // which never had it, could never be matched again: every sync
+                // after it kept the thread's warning up.
+                let replaced = conversation.unsent().and_then(|unsent| {
+                    conversation
+                        .messages()
+                        .last()
+                        .filter(|message| {
+                            message.role == fx_core::MessageRole::User
+                                && message.text_content() == unsent.text
+                        })
+                        .map(|message| message.id)
+                });
+                if let Some(replaced) = replaced {
+                    conversation.remove_message(replaced);
+                }
                 conversation.append(crate::attachments::user_message(text, attachments));
             }
             // A new prompt answers the failure before it. Left up, its row
@@ -1416,6 +1443,13 @@ impl AppState {
             // turn had just answered.
             self.release_turn_error(&mut conversation);
             let session_id = conversation.session_id().map(str::to_string);
+            // With no session, this prompt opens one, whose history starts at
+            // this row rather than at the top of the thread.
+            if session_id.is_none()
+                && let Some(row) = conversation.messages().last()
+            {
+                self.session_starts.insert(agent_id, row.id);
+            }
             conversation.hold_unsent(fx_agent::conversation::UnsentPrompt {
                 text: text.to_string(),
                 attachment_count: attachments.len(),
@@ -1653,11 +1687,15 @@ impl AppState {
                 }
                 // A turn that worked clears the previous turn's failure. Leaving
                 // it up would report an error that no longer describes anything.
-                self.last_error = match outcome {
-                    fx_agent::codex::TurnOutcome::Failed { reason, .. } => Some(reason),
+                match outcome {
+                    fx_agent::codex::TurnOutcome::Failed { reason, .. } => {
+                        self.show_turn_error(agent_id, reason)
+                    }
                     fx_agent::codex::TurnOutcome::Completed { .. }
-                    | fx_agent::codex::TurnOutcome::Cancelled { .. } => None,
-                };
+                    | fx_agent::codex::TurnOutcome::Cancelled { .. } => {
+                        self.clear_turn_error(agent_id)
+                    }
+                }
             }
             SessionUpdate::Failed { reason } => {
                 if let Some(agent_id) = agent_id {
@@ -1670,7 +1708,7 @@ impl AppState {
                     self.queue_may_advance(agent_id);
                     self.record_execution_state(agent_id, fx_core::AgentExecutionState::Failure);
                 }
-                self.last_error = Some(reason);
+                self.show_turn_error(agent_id, reason);
             }
             SessionUpdate::Refused { tool, reason } => {
                 tracing::info!(tool, reason, "a tool call was refused");
@@ -1801,6 +1839,29 @@ impl AppState {
     /// Take the turn's failure off the conversation, and off the shell's banner
     /// when that banner is reporting the same failure. An unrelated one, such
     /// as a failed save, stays up.
+    /// Put a turn's failure up as the banner, remembering whose turn it was.
+    fn show_turn_error(&mut self, agent_id: Option<Uuid>, reason: String) {
+        self.turn_banner = agent_id.map(|agent_id| (agent_id, reason.clone()));
+        self.last_error = Some(reason);
+    }
+
+    /// Take down the banner this thread's earlier turn put up, now that a
+    /// later one has ended without failing.
+    ///
+    /// Only that banner. Clearing whatever was up erased a save that failed
+    /// while the turn was being recorded, a few lines after it was reported,
+    /// and any other thread's failure.
+    fn clear_turn_error(&mut self, agent_id: Option<Uuid>) {
+        if let Some((owner, reason)) = &self.turn_banner
+            && Some(*owner) == agent_id
+        {
+            if self.last_error.as_ref() == Some(reason) {
+                self.last_error = None;
+            }
+            self.turn_banner = None;
+        }
+    }
+
     fn release_turn_error(&mut self, conversation: &mut Conversation) {
         let error = conversation.error().map(str::to_owned);
         conversation.dismiss_error();
@@ -2020,14 +2081,24 @@ impl AppState {
                 .get(&agent_id)
                 .cloned()
                 .unwrap_or_default();
-            let revision = conversation
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .revision();
+            let (revision, queued) = {
+                let conversation = conversation
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                let queued: Vec<Uuid> = conversation.queued().map(|prompt| prompt.id).collect();
+                (conversation.revision(), queued)
+            };
             let version = (revision, draft);
             if self.saved_conversations.get(&agent_id) == Some(&version) {
                 continue;
             }
+            let queued_attachments = queued
+                .into_iter()
+                .filter_map(|id| {
+                    let images = self.composer.queued_attachments.get(&id)?;
+                    Some((id, images.clone()))
+                })
+                .collect();
             self.writer.submit(crate::conversation_writer::Job {
                 store: self.store.clone(),
                 project_id,
@@ -2041,6 +2112,7 @@ impl AppState {
                     .get(&agent_id)
                     .copied()
                     .unwrap_or_default(),
+                queued_attachments,
             });
             self.saved_conversations.insert(agent_id, version);
         }
@@ -2545,6 +2617,9 @@ impl AppState {
                     let mut binding = native_binding(id, &entry);
                     if let Some(previous) = previous {
                         binding.local_history_pending = previous.local_history_pending;
+                        if previous.session_id == binding.session_id {
+                            binding.local_start = previous.local_start;
+                        }
                         binding.model = binding.model.or(previous.model);
                         binding.effort = binding.effort.or(previous.effort);
                         binding.agent_access = binding.agent_access.or(previous.agent_access);
@@ -2645,6 +2720,7 @@ impl AppState {
                     return true;
                 }
                 let conversation = self.conversation(ticket.project, agent);
+                let local_start;
                 {
                     let mut conversation = conversation
                         .lock()
@@ -2659,13 +2735,36 @@ impl AppState {
                         self.native_sync.history_warnings.insert(agent, "The provider returned empty history for a cached conversation. The local history is preserved.".into());
                         return true;
                     }
+                    let local: Vec<&fx_core::ConversationMessage> =
+                        conversation.messages().collect();
+                    // The session's own part of the transcript. Restart opens
+                    // a session whose history holds none of the turns before
+                    // it, so those stay as they are and only the rest is
+                    // compared and replaced. Compared whole, the check could
+                    // never pass again.
+                    let start = binding
+                        .local_start
+                        .and_then(|id| local.iter().position(|message| message.id == id))
+                        .unwrap_or(0);
                     if binding.local_history_pending
-                        && !native_contains_local_tail(&conversation, &history.messages)
+                        && !native_contains_local_tail(
+                            local[start..].iter().copied(),
+                            &history.messages,
+                        )
                     {
                         self.native_sync.history_warnings.insert(agent, "The provider's history has not caught up with the latest turn. The local conversation is preserved.".into());
                         return true;
                     }
-                    let messages = carry_turn_plans(conversation.messages(), history.messages);
+                    let own = carry_turn_plans(local[start..].iter().copied(), history.messages);
+                    let own = carry_message_ids(local[start..].iter().copied(), own);
+                    let messages: Vec<fx_core::ConversationMessage> = local[..start]
+                        .iter()
+                        .map(|message| (*message).clone())
+                        .chain(own)
+                        .collect();
+                    local_start = binding
+                        .local_start
+                        .and(messages.get(start).map(|message| message.id));
                     if !conversation.messages().eq(messages.iter()) {
                         conversation.replace_full_history(messages);
                     }
@@ -2687,6 +2786,9 @@ impl AppState {
                     .filter(|binding| binding.agent_id == agent)
                 {
                     binding.local_history_pending = false;
+                    if binding.session_id == session {
+                        binding.local_start = local_start;
+                    }
                     binding.model = history
                         .entry
                         .defaults
@@ -2777,6 +2879,7 @@ impl AppState {
             revision: String::new(),
             context_window_size: None,
             local_history_pending: false,
+            local_start: self.session_starts.remove(&agent_id),
         });
     }
 
@@ -2868,7 +2971,8 @@ pub struct ComposerStore {
     /// Images of an unaccepted prompt, put back with its text.
     retry_attachments: HashMap<Uuid, Vec<fx_core::Attachment>>,
     /// Images travelling with a queued prompt, by the queued prompt's id.
-    queued_attachments: HashMap<Uuid, Vec<fx_core::Attachment>>,
+    /// Shared, so every save of the queue does not copy them.
+    queued_attachments: HashMap<Uuid, Arc<Vec<fx_core::Attachment>>>,
     steers: HashMap<Uuid, PendingSteer>,
     accepted_steers: Vec<(Uuid, PendingSteer)>,
     goals: HashMap<Uuid, fx_core::models::ConversationGoal>,
@@ -3054,7 +3158,7 @@ impl AppState {
         let queued_bytes: usize = queued
             .iter()
             .filter_map(|id| self.composer.queued_attachments.get(id))
-            .flatten()
+            .flat_map(|attachments| attachments.iter())
             .map(|attachment| attachment.data.len())
             .sum();
         let bytes: usize = attachments
@@ -3077,7 +3181,9 @@ impl AppState {
             });
         }
         if !attachments.is_empty() {
-            self.composer.queued_attachments.insert(id, attachments);
+            self.composer
+                .queued_attachments
+                .insert(id, Arc::new(attachments));
         }
         self.release_sent_attachments(agent_id, &sent);
         if let Some(field) = self.drafts.get(&agent_id).cloned()
@@ -3193,6 +3299,15 @@ impl AppState {
         std::mem::take(&mut self.composer.dispatch)
     }
 
+    /// Whether a queue is waiting to move.
+    ///
+    /// The poller is what sends a ready queue, so this keeps it running. A
+    /// queue released by closing its editor arrives after the turn ended and
+    /// the poller stopped, and nothing else would come back for it.
+    pub fn has_ready_queues(&self) -> bool {
+        !self.composer.dispatch.is_empty()
+    }
+
     /// The next queued prompt for a thread, with its images.
     pub fn dequeue_prompt(&mut self, agent_id: Uuid) -> Option<(String, Vec<fx_core::Attachment>)> {
         if self.runners.contains_key(&agent_id) {
@@ -3221,6 +3336,7 @@ impl AppState {
             .composer
             .queued_attachments
             .remove(&queued.id)
+            .map(Arc::unwrap_or_clone)
             .unwrap_or_default();
         Some((queued.text, attachments))
     }
@@ -3582,7 +3698,53 @@ fn native_binding(
         revision: entry.revision.clone(),
         context_window_size: entry.defaults.context_window_size,
         local_history_pending: false,
+        local_start: None,
     }
+}
+
+/// Keep the ids of the messages a provider's history shares with FlowX's.
+///
+/// A live turn's messages carry ids FlowX made, and the provider's copy of
+/// the same turn has ids of its own. Taking the history as it came changed
+/// every id in the turn just finished, so the transcript lost the reader's
+/// place in it, sending them to the top of the thread, and every disclosure
+/// keyed by those ids closed. Matched in order, by role and by tool id or
+/// text, so a repeated "Done." cannot take a later turn's id; a message with
+/// neither keeps the provider's.
+fn carry_message_ids<'a>(
+    local: impl Iterator<Item = &'a fx_core::ConversationMessage>,
+    mut native: Vec<fx_core::ConversationMessage>,
+) -> Vec<fx_core::ConversationMessage> {
+    fn key(message: &fx_core::ConversationMessage) -> Option<(fx_core::MessageRole, String)> {
+        let tool = message.content.iter().find_map(|block| match block {
+            fx_core::MessageContent::ToolUse { id, .. }
+            | fx_core::MessageContent::ToolResult { id, .. } => Some(id.as_str()),
+            _ => None,
+        });
+        let key = match tool {
+            Some(id) => format!("tool:{id}"),
+            None => message
+                .text_content()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
+        };
+        (!key.is_empty()).then_some((message.role, key))
+    }
+    let local: Vec<_> = local
+        .filter_map(|message| Some((key(message)?, message.id)))
+        .collect();
+    let mut from = 0;
+    for message in &mut native {
+        let Some(wanted) = key(message) else {
+            continue;
+        };
+        if let Some(offset) = local[from..].iter().position(|(key, _)| *key == wanted) {
+            message.id = local[from + offset].1;
+            from += offset + 1;
+        }
+    }
+    native
 }
 
 /// Put each turn's plan back into a provider's history.
@@ -3658,8 +3820,8 @@ fn carry_turn_plans<'a>(
 
 /// Native files may lag a successfully completed pipe turn. Do not exchange a
 /// known good local tail for an older file merely because a cooldown elapsed.
-fn native_contains_local_tail(
-    conversation: &Conversation,
+fn native_contains_local_tail<'a>(
+    local: impl Iterator<Item = &'a fx_core::ConversationMessage>,
     messages: &[fx_core::ConversationMessage],
 ) -> bool {
     // Providers may combine or split assistant prose around tools differently.
@@ -3698,13 +3860,9 @@ fn native_contains_local_tail(
     }
 
     let mut native = prose_blocks(messages.iter()).into_iter();
-    prose_blocks(conversation.messages())
-        .into_iter()
-        .all(|(role, text)| {
-            native.any(|(native_role, native_text)| {
-                native_role == role && native_text.contains(&text)
-            })
-        })
+    prose_blocks(local).into_iter().all(|(role, text)| {
+        native.any(|(native_role, native_text)| native_role == role && native_text.contains(&text))
+    })
 }
 
 /// The images of a conversation's unsent prompt, read back from its user row.
@@ -3761,6 +3919,15 @@ pub fn persisted_from(conversation: &Conversation) -> PersistedConversation {
             prompt.session_id.clone(),
         )
     });
+    // The images are the composer's; the writer adds them.
+    persisted.queued = conversation
+        .queued()
+        .map(|prompt| fx_store::PersistedQueuedPrompt {
+            id: prompt.id,
+            text: prompt.text.clone(),
+            attachments: Vec::new(),
+        })
+        .collect();
     persisted
 }
 
@@ -3824,11 +3991,33 @@ fn read_conversation(store: &Store, project_id: Uuid, agent_id: Uuid) -> LoadedC
                     && (persisted.draft_text.trim().is_empty()
                         || persisted.draft_text.trim() == prompt.text.trim())
             });
+            // A queue saved at quit comes back in the composer rather than
+            // as a queue: nothing is running for it to wait behind, and a
+            // relaunch must not send prompts on its own.
+            let draft = std::iter::once(draft)
+                .chain(persisted.queued.iter().map(|prompt| prompt.text.clone()))
+                .filter(|text| !text.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            let queued_images: Vec<fx_core::Attachment> = persisted
+                .queued
+                .iter()
+                .flat_map(|prompt| prompt.attachments.iter().cloned())
+                .collect();
             loaded.goal = persisted.goal.clone();
             loaded.restored = Some((persisted.total_cost_usd, draft));
             restore_conversation(&mut loaded.conversation, persisted);
             if recover_images {
                 loaded.attachments = unsent_attachments(&loaded.conversation);
+            }
+            if !queued_images.is_empty() {
+                crate::attachments::admit(
+                    &mut loaded.attachments,
+                    crate::attachments::Prepared {
+                        attachments: queued_images,
+                        errors: Vec::new(),
+                    },
+                );
             }
         }
         Ok(None) => {}
@@ -4729,6 +4918,7 @@ mod persistence_tests {
                     revision: String::new(),
                     context_window_size: None,
                     local_history_pending: false,
+                    local_start: None,
                 });
                 record
                     .native_presentation_ids
@@ -5174,6 +5364,44 @@ mod persistence_tests {
                 assert_eq!(state.draft(agent, cx).read(cx).value(), "look at this");
                 assert_eq!(state.attachments(agent).len(), 1, "lost across a restart");
                 assert_eq!(state.attachments(agent)[0].data, sent.data);
+            })
+        });
+    }
+
+    #[test]
+    fn a_queue_left_at_quit_comes_back_in_the_composer_with_its_images() {
+        // Queuing clears the composer, and the queue lived only in memory: a
+        // quit took every queued prompt and its images with it.
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, project, agent, _) = test.update(|cx| workspace(cx, &paths));
+        let shot = image(3);
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                state.conversation(project, agent);
+                state
+                    .enqueue_prompt(agent, "Then run the tests", vec![shot.clone()], cx)
+                    .unwrap();
+                state
+                    .enqueue_prompt(agent, "And commit", Vec::new(), cx)
+                    .unwrap();
+                state.save_all(cx);
+            })
+        });
+        let reopened = test.update(|cx| cx.new(|cx| AppState::restore(paths, cx)));
+        test.update(|cx| {
+            reopened.update(cx, |state, cx| {
+                let conversation = state.conversation(project, agent);
+                assert_eq!(
+                    state.draft(agent, cx).read(cx).value(),
+                    "Then run the tests\n\nAnd commit",
+                    "the queue was lost across a restart"
+                );
+                assert_eq!(state.attachments(agent).len(), 1, "its image was lost");
+                assert_eq!(state.attachments(agent)[0].data, shot.data);
+                // Back as a draft, not a queue: nothing runs for it to follow.
+                assert_eq!(conversation.lock().unwrap().queued_count(), 0);
             })
         });
     }
@@ -7296,6 +7524,168 @@ mod native_sync_tests {
     }
 
     #[test]
+    fn a_restarted_session_syncs_its_own_turns_and_keeps_the_ones_before_it() {
+        // Restart opens a new session, whose history holds only the turns
+        // after it. Compared with the whole transcript, the check never
+        // passed again, and the thread warned on every sync.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_string_lossy().to_string();
+        let paths = AppPaths::at(temp.path().join("store"));
+        let test = gpui::TestAppContext::single();
+        let (state, project) = test.update(|cx| setup(cx, paths.clone(), &root));
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                let agent = state.create_thread().unwrap();
+                let conversation = state.conversation(project, agent);
+                {
+                    let mut conversation = conversation.lock().unwrap();
+                    conversation.replace_full_history(vec![
+                        ConversationMessage::text(MessageRole::User, "Old question"),
+                        ConversationMessage::text(MessageRole::Assistant, "Old answer"),
+                    ]);
+                    conversation.set_session_id("old-session");
+                }
+                state.restart_session(agent);
+                assert!(state.prepare_prompt(agent, "New question", cx));
+                let answer = ConversationMessage::text(MessageRole::Assistant, "New answer");
+                let answer_id = answer.id;
+                {
+                    let mut conversation = conversation.lock().unwrap();
+                    conversation.clear_unsent();
+                    conversation.set_session_id("new-session");
+                    conversation.append(answer);
+                }
+                state.mark_native_local_turn(agent);
+
+                let ticket = history_ticket(state, project, agent);
+                history(
+                    state,
+                    ticket,
+                    entry(&root, "codex", "new-session", "Restarted"),
+                    vec![
+                        ConversationMessage::text(MessageRole::User, "New question"),
+                        ConversationMessage::text(MessageRole::Assistant, "New answer"),
+                    ],
+                );
+                assert!(
+                    !state
+                        .native_status(project)
+                        .warnings
+                        .iter()
+                        .any(|warning| warning.contains("caught up")),
+                    "the turns before the restart blocked the sync"
+                );
+                let binding = &state.snapshot.projects[0].native_bindings[0];
+                assert!(!binding.local_history_pending);
+                let texts: Vec<String> = conversation
+                    .lock()
+                    .unwrap()
+                    .messages()
+                    .map(|message| message.text_content())
+                    .collect();
+                assert_eq!(
+                    texts,
+                    ["Old question", "Old answer", "New question", "New answer"]
+                );
+                // The turn keeps the ids it was drawn with.
+                assert_eq!(
+                    conversation.lock().unwrap().messages().last().unwrap().id,
+                    answer_id
+                );
+                // And the start moves with the history, so the next sync
+                // finds it again.
+                let start = binding.local_start.expect("the session's start");
+                assert_eq!(
+                    conversation.lock().unwrap().messages().nth(2).unwrap().id,
+                    start
+                );
+            })
+        });
+    }
+
+    #[test]
+    fn a_prompt_replacing_an_unaccepted_one_takes_its_row() {
+        // The provider never saw the first prompt, so its row read as sent
+        // and the provider's history, which never had it, could not be
+        // matched again.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_string_lossy().to_string();
+        let paths = AppPaths::at(temp.path().join("store"));
+        let test = gpui::TestAppContext::single();
+        let (state, project) = test.update(|cx| setup(cx, paths.clone(), &root));
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                let agent = state.create_thread().unwrap();
+                assert!(state.prepare_prompt(agent, "First try", cx));
+                assert!(state.prepare_prompt(agent, "Edited try", cx));
+                let conversation = state.conversation(project, agent);
+                let conversation = conversation.lock().unwrap();
+                let texts: Vec<String> = conversation
+                    .messages()
+                    .map(|message| message.text_content())
+                    .collect();
+                assert_eq!(texts, ["Edited try"]);
+                assert_eq!(
+                    conversation.unsent().map(|unsent| unsent.text.as_str()),
+                    Some("Edited try")
+                );
+            })
+        });
+    }
+
+    #[test]
+    fn message_ids_carry_over_in_order_and_only_onto_the_same_message() {
+        let local = [
+            ConversationMessage::text(MessageRole::User, "continue"),
+            ConversationMessage::text(MessageRole::Assistant, "Done."),
+            ConversationMessage::new(
+                MessageRole::Assistant,
+                vec![fx_core::MessageContent::ToolUse {
+                    id: "call-1".into(),
+                    name: "Bash".into(),
+                    input: "{}".into(),
+                }],
+            ),
+            ConversationMessage::text(MessageRole::User, "continue"),
+            ConversationMessage::text(MessageRole::Assistant, "Done."),
+        ];
+        let native = vec![
+            ConversationMessage::text(MessageRole::User, "continue"),
+            ConversationMessage::text(MessageRole::Assistant, "Done."),
+            ConversationMessage::new(
+                MessageRole::Assistant,
+                vec![fx_core::MessageContent::ToolUse {
+                    id: "call-1".into(),
+                    name: "Bash".into(),
+                    input: "{\"command\":\"ls\"}".into(),
+                }],
+            ),
+            ConversationMessage::text(MessageRole::Assistant, "Only the provider has this."),
+            ConversationMessage::text(MessageRole::User, "continue"),
+            ConversationMessage::text(MessageRole::Assistant, "Done."),
+        ];
+        let provider_only = native[3].id;
+        let carried = carry_message_ids(local.iter(), native);
+        let ids: Vec<Uuid> = carried.iter().map(|message| message.id).collect();
+        assert_eq!(
+            ids,
+            [
+                local[0].id,
+                local[1].id,
+                local[2].id,
+                provider_only,
+                local[3].id,
+                local[4].id
+            ]
+        );
+        // The provider's content wins; only the id is carried.
+        assert!(matches!(
+            &carried[2].content[0],
+            fx_core::MessageContent::ToolUse { input, .. } if input.contains("ls")
+        ));
+    }
+
+    #[test]
     fn native_catchup_preserves_role_order_and_normalizes_split_prose() {
         let mut conversation = Conversation::new(Uuid::new_v4());
         conversation.replace_full_history(vec![
@@ -7305,14 +7695,14 @@ mod native_sync_tests {
             ConversationMessage::text(MessageRole::Assistant, "Done."),
         ]);
         assert!(native_contains_local_tail(
-            &conversation,
+            conversation.messages(),
             &[
                 ConversationMessage::text(MessageRole::User, "Check this"),
                 ConversationMessage::text(MessageRole::Assistant, "Checking the file.\n\nDone."),
             ]
         ));
         assert!(!native_contains_local_tail(
-            &conversation,
+            conversation.messages(),
             &[
                 ConversationMessage::text(MessageRole::Assistant, "Checking the file. Done."),
                 ConversationMessage::text(MessageRole::User, "Check this"),
@@ -7325,7 +7715,7 @@ mod native_sync_tests {
         ]);
         assert!(
             !native_contains_local_tail(
-                &conversation,
+                conversation.messages(),
                 &[
                     ConversationMessage::text(MessageRole::User, "continue"),
                     ConversationMessage::text(MessageRole::Assistant, "Done."),

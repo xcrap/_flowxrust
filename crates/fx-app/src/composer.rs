@@ -429,6 +429,11 @@ const PRIMARY_SELECTOR: &str = "composer.primary";
 
 // ── Entry point ────────────────────────────────────────────────────────────
 
+/// Whether the queued prompt's editor is the field that has focus.
+fn editing_here(editor: Option<&Entity<TextField>>, window: &Window, cx: &App) -> bool {
+    editor.is_some_and(|editor| editor.read(cx).focus_handle().is_focused(window))
+}
+
 /// Render the composer around a caller-owned text field.
 pub fn view(
     field: &Entity<TextField>,
@@ -463,6 +468,13 @@ pub fn view_with_controls(
         .clone()
         .filter(|_| chrome.attachments_enabled && chrome.enabled && !chrome.steering);
     let for_paste_key = for_paste.clone();
+    // A queued prompt open for editing takes its own paste. Caught here, an
+    // image pasted there was attached to the draft below it instead.
+    let editor = chrome
+        .editing_queued
+        .as_ref()
+        .map(|(_, editor)| editor.clone());
+    let editor_for_key = editor.clone();
 
     div()
         .w_full()
@@ -489,6 +501,7 @@ pub fn view_with_controls(
         // a key-down check never ran. The Edit menu's Paste arrives here too.
         .capture_action(move |_: &text_field::Paste, window, cx| {
             if let Some(handler) = &for_paste
+                && !editing_here(editor.as_ref(), window, cx)
                 && let Some(image) = clipboard_image(cx)
             {
                 cx.stop_propagation();
@@ -500,6 +513,7 @@ pub fn view_with_controls(
         .capture_key_down(move |event, window, cx| {
             if let Some(handler) = &for_paste_key
                 && is_paste_key(&event.keystroke)
+                && !editing_here(editor_for_key.as_ref(), window, cx)
                 && let Some(image) = clipboard_image(cx)
             {
                 cx.stop_propagation();
@@ -1909,6 +1923,49 @@ mod tests {
         test.update(|cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string("words".into())));
         visual.simulate_keystrokes("cmd-v");
         assert_eq!(actions.borrow().len(), 1, "text is the field's to paste");
+    }
+
+    #[test]
+    fn an_image_pasted_into_a_queued_prompt_s_editor_is_not_attached_to_the_draft() {
+        let image =
+            gpui::Image::from_bytes(gpui::ImageFormat::Png, b"\x89PNG\r\n\x1a\nrest".to_vec());
+        let mut test = TestAppContext::single();
+        test.update(crate::commands::install_key_bindings);
+        let actions = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let recorded = actions.clone();
+        let (field, editor) = test.update(|cx| {
+            (
+                cx.new(TextField::new),
+                cx.new(|cx| TextField::new(cx).multiline(4.0)),
+            )
+        });
+        let chrome = ComposerChrome {
+            busy: true,
+            attachments_enabled: true,
+            queued: vec!["queued".into()],
+            editing_queued: Some((0, editor.clone())),
+            ..live()
+        }
+        .on_action(move |action, _, _| recorded.borrow_mut().push(action));
+        let window = test.add_window(move |_, _| Harness::new(field.clone(), chrome, ""));
+        test.refresh().expect("painted");
+        let focused = editor.clone();
+        window
+            .update(&mut test, |_, window, cx| {
+                focused.read(cx).focus_handle().focus(window)
+            })
+            .unwrap();
+        test.refresh().unwrap();
+        test.update(|cx| cx.write_to_clipboard(gpui::ClipboardItem::new_image(&image)));
+        let mut visual = VisualTestContext::from_window(*window.deref(), &test);
+        visual.simulate_keystrokes("cmd-v");
+        assert!(
+            !actions
+                .borrow()
+                .iter()
+                .any(|action| matches!(action, ComposerAction::PasteImage(_))),
+            "the image went to the draft the reader was not editing"
+        );
     }
 
     #[test]

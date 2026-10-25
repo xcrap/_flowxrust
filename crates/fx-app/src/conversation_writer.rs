@@ -40,6 +40,9 @@ pub(crate) struct Job {
     /// The thread's goal, which lives in the same file.
     pub goal: Option<fx_core::models::ConversationGoal>,
     pub cost: f64,
+    /// The images of the thread's queued prompts, by the queued prompt's id.
+    /// The queue's text is the conversation's; its images are the composer's.
+    pub queued_attachments: Vec<(Uuid, Arc<Vec<fx_core::Attachment>>)>,
 }
 
 /// How a save ended, for the UI to report.
@@ -318,6 +321,7 @@ impl Memory {
             retry_draft,
             goal,
             cost,
+            queued_attachments,
         } = job;
         // The clone happens under the lock and nothing else does: encoding a
         // large transcript while holding it would stall the runner and the view.
@@ -330,6 +334,12 @@ impl Memory {
         persisted.total_cost_usd = cost;
         persisted.draft_text = draft;
         persisted.goal = goal;
+        // Copied here, off the UI thread, rather than into every job.
+        for prompt in &mut persisted.queued {
+            if let Some((_, images)) = queued_attachments.iter().find(|(id, _)| *id == prompt.id) {
+                prompt.attachments = images.as_ref().clone();
+            }
+        }
         // Whitespace is not a draft; the rejected prompt takes its place.
         if persisted.draft_text.trim().is_empty()
             && let Some(prompt) = retry_draft

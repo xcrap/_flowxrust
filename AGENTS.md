@@ -306,6 +306,19 @@ An empty transcript is **deleted** on quit rather than written as a stub: an
 unopened provider thread has nothing to save, and writing it anyway would
 truncate every other thread's cache.
 
+A queued prompt is saved with its transcript, images included, because
+queuing clears the composer: a queue held only in memory was lost to every
+quit. It comes back in the composer rather than as a queue. After a relaunch
+nothing is running for it to wait behind, and FlowX never sends a prompt on
+its own.
+
+A binding records where its session starts in the transcript (`local_start`)
+when FlowX opened that session in a thread that already had turns, as Restart
+does. Native sync compares and replaces only from there. Compared whole, a
+restarted thread's history could never match again, and the sidebar said
+"Thread sync needs attention" on every pass. A prompt that replaces one the
+provider never accepted takes that prompt's row for the same reason.
+
 One cost of the crate boundary: `fx-store` cannot import `fx-design`, so the
 inspector's geometry is declared in both `PersistedApp` and `Layout`.
 `the_persisted_defaults_match_the_design_metrics` in `fx-app` is the only test
@@ -628,7 +641,7 @@ claiming only the keys it moves, and stopping propagation for those alone.
 The transcript is a `gpui::list` aligned to the bottom: only the rows in view
 are built, laid out and painted, and every other row keeps the height it was
 last measured at. With no scroll position of its own the list shows its last
-rows and stays there as they grow, which is what following the bottom is. Three
+rows and stays there as they grow, which is what following the bottom is. Four
 rules, each of which was a bug first:
 
 - **Splice every row that changed.** Each pass stamps the rows and splices only
@@ -637,6 +650,14 @@ rules, each of which was a bug first:
   GPUI otherwise moves them to the row's top on every delta.
 - **A pinned list's position is "the end", a viewport below the screen.** A
   step taken from there barely moves, so paging starts from what is on screen.
+- **A row keeps its id across a sync.** The provider's copy of a turn has ids
+  of its own, so native sync carries each local message's id onto the matching
+  message (`carry_message_ids`), and a splice that finds none of the reader's
+  rows keeps their place counted from the stretch's end. Taking the provider's
+  ids sent a reader in the turn just finished to the top of the thread and
+  closed every disclosure in it. The live reply is keyed per segment for the
+  same reason: under one key, a selection in one reply came back over the
+  next.
 - **What is off screen is not layout.** Selection reads the rows it does not
   see from the messages, through `selection::Document`, which has to produce the
   keys and text the rows would draw.

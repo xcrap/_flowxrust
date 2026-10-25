@@ -268,6 +268,7 @@ impl FlowX {
         if !self.polling
             && (self.state.read(cx).any_busy()
                 || self.state.read(cx).has_title_jobs()
+                || self.state.read(cx).has_ready_queues()
                 || ui.read(cx).is_checking()
                 || provider_catalog::is_refreshing())
         {
@@ -295,6 +296,7 @@ impl FlowX {
                             let activity = [
                                 state.any_busy(),
                                 state.has_title_jobs(),
+                                state.has_ready_queues(),
                                 ui.read(cx).is_checking(),
                                 provider_catalog::is_refreshing(),
                             ];
@@ -2515,6 +2517,67 @@ mod tests {
     }
 
     #[test]
+    fn a_finished_turn_takes_down_only_its_own_threads_failure() {
+        // Every finished turn cleared the banner, whatever had put it up: a
+        // save that failed while the turn was being recorded, or another
+        // thread's failure.
+        let test = gpui::TestAppContext::single();
+        let (_dir, state) = test.update(seeded);
+        let (first, second) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let send = |agent: Uuid, update: session::SessionUpdate| {
+            test.update(|cx| {
+                state.read(cx).update_sender_for(agent)(update);
+                state.update(cx, |state, _| state.drain_updates());
+            })
+        };
+        let completed = || session::SessionUpdate::Finished {
+            outcome: fx_agent::codex::TurnOutcome::Completed {
+                thread_id: "t1".into(),
+                stop_reason: "end_turn".into(),
+            },
+        };
+        let banner = || test.read(|cx| state.read(cx).last_error.clone());
+
+        send(
+            first,
+            session::SessionUpdate::Failed {
+                reason: "The first thread failed.".into(),
+            },
+        );
+        send(second, completed());
+        assert_eq!(
+            banner().as_deref(),
+            Some("The first thread failed."),
+            "another thread's turn took the failure down"
+        );
+
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                state.last_error = Some("The workspace could not be saved.".into())
+            })
+        });
+        send(first, completed());
+        assert_eq!(
+            banner().as_deref(),
+            Some("The workspace could not be saved."),
+            "a finished turn erased a save error"
+        );
+
+        send(
+            first,
+            session::SessionUpdate::Failed {
+                reason: "Again.".into(),
+            },
+        );
+        send(first, completed());
+        assert_eq!(
+            banner(),
+            None,
+            "the thread's own failure outlived its next turn"
+        );
+    }
+
+    #[test]
     fn a_thread_keeps_its_draft_across_switches() {
         // A draft is unsent work; switching threads and back must not lose it.
         let test = gpui::TestAppContext::single();
@@ -2772,6 +2835,51 @@ mod tests {
             test.executor().advance_clock(POLL_INTERVAL);
             test.run_until_parked();
         }
+    }
+
+    #[test]
+    fn a_queue_released_by_its_editor_moves_once_the_poller_has_stopped() {
+        // The turn ended with the next prompt open for editing, so the queue
+        // held and the poller stopped. Saving the edit released the queue, but
+        // only the poller sends one, and nothing started it again: the prompt
+        // sat in the strip until some unrelated turn ran.
+        let mut test = gpui::TestAppContext::single();
+        let (_dir, state) = test.update(seeded);
+        let for_window = state.clone();
+        test.add_window(move |_, _| FlowX::new(for_window));
+        test.refresh().unwrap();
+        tick(&mut test, 2);
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                let project = state.active_project().unwrap().id;
+                let agent = state.active_agent().unwrap().id;
+                let conversation = state.conversation(project, agent);
+                state
+                    .enqueue_prompt(agent, "draft", Vec::new(), cx)
+                    .unwrap();
+                let id = conversation.lock().unwrap().queued().next().unwrap().id;
+                state.begin_editing_queued(agent, id, cx);
+                assert_eq!(state.dequeue_prompt(agent), None, "sent mid-edit");
+                // A conversation still settling refuses the prompt before any
+                // provider is launched, which hands it back to the composer.
+                conversation
+                    .lock()
+                    .unwrap()
+                    .set_phase(fx_agent::conversation::Phase::Running);
+                let editor = state.queue_editor().unwrap().field.clone();
+                editor.update(cx, |field, cx| field.set_value("final", cx));
+                assert!(state.save_queued_edit(cx));
+                cx.notify();
+            })
+        });
+        tick(&mut test, 2);
+        test.update(|cx| {
+            let state = state.read(cx);
+            let agent = state.active_agent().unwrap().id;
+            assert!(!state.has_ready_queues(), "the released queue never moved");
+            let conversation = state.conversation_by_agent(agent).unwrap();
+            assert_eq!(conversation.lock().unwrap().queued_count(), 0);
+        });
     }
 
     fn renders(test: &mut gpui::TestAppContext, window: gpui::WindowHandle<FlowX>) -> usize {

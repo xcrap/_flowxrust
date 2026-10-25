@@ -347,6 +347,10 @@ pub struct Conversation {
     message_revision: u64,
     streaming_text: String,
     streaming_revision: u64,
+    /// Which streamed segment the live text is, bumped whenever one ends or a
+    /// new one begins. Every segment is drawn in the same place, so this is
+    /// what tells one reply's text from the next.
+    streaming_segment: u64,
     phase: Phase,
     error: Option<String>,
     queued: VecDeque<QueuedPrompt>,
@@ -434,6 +438,17 @@ impl Conversation {
         self.touch();
     }
 
+    /// Remove one message by id. `false` when no message has it.
+    pub fn remove_message(&mut self, id: Uuid) -> bool {
+        let Some(index) = self.messages.iter().position(|message| message.id == id) else {
+            return false;
+        };
+        self.messages.remove(index);
+        self.message_revision += 1;
+        self.touch();
+        true
+    }
+
     /// Restore complete provider or disk history without the live-tail cap.
     /// Drafts, usage, and session identity remain untouched.
     pub fn replace_full_history(&mut self, messages: Vec<ConversationMessage>) {
@@ -472,10 +487,16 @@ impl Conversation {
         !self.streaming_text.is_empty()
     }
 
+    /// Which streamed segment the live text belongs to.
+    pub fn streaming_segment(&self) -> u64 {
+        self.streaming_segment
+    }
+
     /// Begin streaming, discarding any leftover text from a previous turn.
     pub fn begin_streaming(&mut self) {
         self.streaming_text.clear();
         self.streaming_revision += 1;
+        self.streaming_segment += 1;
         self.touch();
     }
 
@@ -501,12 +522,14 @@ impl Conversation {
             text,
         ));
         self.streaming_revision += 1;
+        self.streaming_segment += 1;
     }
 
     pub fn clear_streaming(&mut self) {
         if !self.streaming_text.is_empty() {
             self.streaming_text.clear();
             self.streaming_revision += 1;
+            self.streaming_segment += 1;
             self.touch();
         }
     }
@@ -652,15 +675,28 @@ impl Conversation {
         // approval and a question at the same time; answering the approval and
         // then reporting "running" hides the question, so the composer opens and
         // the question can never be answered.
-        if self.pending_approvals.is_empty() {
-            self.set_phase(if self.pending_questions.is_empty() {
-                Phase::Running
-            } else {
-                Phase::WaitingForInput
-            });
+        if self.is_waiting_for_user() {
+            self.set_phase(self.working_phase());
         }
         self.touch();
         Some(removed)
+    }
+
+    /// The phase of a turn that is still going: waiting on the user while
+    /// anything is still asked of them, working otherwise.
+    ///
+    /// Every event that says the turn moved on goes through this. Setting
+    /// `Running` outright meant a parallel call's result, or answering the
+    /// question beside an open approval, reported the thread as working while
+    /// it was blocked on the reader.
+    fn working_phase(&self) -> Phase {
+        if !self.pending_approvals.is_empty() {
+            Phase::WaitingForApproval
+        } else if !self.pending_questions.is_empty() {
+            Phase::WaitingForInput
+        } else {
+            Phase::Running
+        }
     }
 
     pub fn pending_questions(&self) -> &[PendingQuestion] {
@@ -678,8 +714,8 @@ impl Conversation {
 
     pub fn remove_question(&mut self, id: &str) {
         self.pending_questions.retain(|q| q.id != id);
-        if self.pending_questions.is_empty() && self.phase == Phase::WaitingForInput {
-            self.set_phase(Phase::Running);
+        if self.is_waiting_for_user() {
+            self.set_phase(self.working_phase());
         }
         self.touch();
     }
@@ -1008,15 +1044,26 @@ impl Conversation {
                         self.set_phase(Phase::Compacting);
                     }
                     L::Compacted => {
-                        self.set_phase(Phase::Running);
+                        self.set_phase(self.working_phase());
                         self.record_activity("Context compacted", true);
                     }
+                    // A retry is starting over, but a wait on the reader is not
+                    // answered by the provider reconnecting.
                     L::Preparing => {
-                        self.set_phase(Phase::Starting);
+                        if !self.is_waiting_for_user() {
+                            self.set_phase(Phase::Starting);
+                        }
                     }
                 }
             }
-            ProviderEvent::TextDelta(delta) => self.append_streaming(&delta),
+            ProviderEvent::TextDelta(delta) => {
+                // Codex retries a dropped stream without a new `turn/started`,
+                // so the reply resuming is the only sign the retry worked.
+                if self.phase == Phase::Starting {
+                    self.set_phase(self.working_phase());
+                }
+                self.append_streaming(&delta);
+            }
             // The streamed message is whole. Committing here is what keeps two
             // consecutive messages from running together into one row.
             ProviderEvent::TextEnd => self.commit_streaming(),
@@ -1025,6 +1072,9 @@ impl Conversation {
                 // the buffer only when the buffer was empty, so the second of two
                 // such messages was dropped.
                 if !text.is_empty() {
+                    if self.phase == Phase::Starting {
+                        self.set_phase(self.working_phase());
+                    }
                     self.commit_streaming();
                     self.append(ConversationMessage::text(
                         fx_core::MessageRole::Assistant,
@@ -1050,7 +1100,7 @@ impl Conversation {
                 // finished, and claiming it as it starts made every running call
                 // read as done. The result claims it, and gates nothing.
                 self.record_activity(format!("Running {name}"), false);
-                self.set_phase(Phase::Running);
+                self.set_phase(self.working_phase());
             }
             ProviderEvent::ToolResult {
                 id,
@@ -1066,16 +1116,20 @@ impl Conversation {
                 let worth_recording =
                     is_error || (!trimmed.is_empty() && trimmed != TRIVIAL_TOOL_RESULT);
                 if worth_recording {
+                    // Only the end is trimmed. The first line's indentation is
+                    // content: `cat -n` numbering, or the leading space that
+                    // makes `git status --short`'s " M" unstaged rather than
+                    // staged. History keeps it, so the live row must too.
                     self.append(ConversationMessage::new(
                         fx_core::MessageRole::Tool,
                         vec![fx_core::MessageContent::ToolResult {
                             id: id.clone(),
-                            content: trimmed.to_string(),
+                            content: content.trim_end().to_string(),
                             is_error,
                         }],
                     ));
                 }
-                self.set_phase(Phase::Running);
+                self.set_phase(self.working_phase());
             }
             ProviderEvent::Approval(approval) => self.add_approval(PendingApproval {
                 id: approval.id,
@@ -1615,6 +1669,99 @@ mod tests {
         assert!(c.remove_approval("a1").is_some());
         assert!(c.pending_approvals().is_empty());
         assert_eq!(c.phase(), Phase::Running);
+    }
+
+    #[test]
+    fn answering_the_question_beside_an_open_approval_keeps_waiting_for_it() {
+        let mut c = Conversation::new(Uuid::nil());
+        c.add_approval(PendingApproval {
+            id: "a1".into(),
+            tool_name: "shell".into(),
+            input: serde_json::Value::Null,
+            risk: RiskLevelSerde::Moderate,
+        });
+        c.add_question(PendingQuestion {
+            id: "q1".into(),
+            question: "Which database?".into(),
+            header: "Scope".into(),
+            options: Vec::new(),
+            is_other: true,
+        });
+
+        c.remove_question("q1");
+        assert_eq!(
+            c.phase(),
+            Phase::WaitingForApproval,
+            "the open approval stopped being reported as a wait"
+        );
+    }
+
+    #[test]
+    fn a_parallel_call_moving_on_does_not_hide_an_open_approval() {
+        // Two calls run side by side and one waits for approval. The other's
+        // start and result are progress, not an answer to the wait.
+        let mut c = Conversation::new(Uuid::nil());
+        c.add_approval(PendingApproval {
+            id: "a1".into(),
+            tool_name: "shell".into(),
+            input: serde_json::Value::Null,
+            risk: RiskLevelSerde::Moderate,
+        });
+        c.apply(ProviderEvent::ToolUse {
+            id: "t2".into(),
+            name: "Read".into(),
+            input: "{}".into(),
+        });
+        assert_eq!(c.phase(), Phase::WaitingForApproval);
+        c.apply(ProviderEvent::ToolResult {
+            id: "t2".into(),
+            content: "fn main() {}".into(),
+            is_error: false,
+        });
+        assert_eq!(c.phase(), Phase::WaitingForApproval);
+        c.apply(ProviderEvent::Lifecycle(
+            crate::provider::Lifecycle::Preparing,
+        ));
+        assert_eq!(c.phase(), Phase::WaitingForApproval);
+
+        c.remove_approval("a1");
+        assert_eq!(c.phase(), Phase::Running);
+    }
+
+    #[test]
+    fn a_reply_resuming_after_a_retry_reads_as_working() {
+        // Codex reports a dropped stream as an error that will be retried, then
+        // carries on with no new `turn/started`. Text is the only sign of it.
+        let mut c = Conversation::new(Uuid::nil());
+        c.apply(ProviderEvent::Lifecycle(
+            crate::provider::Lifecycle::TurnStarted,
+        ));
+        c.apply(ProviderEvent::Lifecycle(
+            crate::provider::Lifecycle::Preparing,
+        ));
+        assert_eq!(c.phase(), Phase::Starting);
+
+        c.apply(ProviderEvent::TextDelta("Picking up where".into()));
+        assert_eq!(c.phase(), Phase::Running, "the retry left it on Starting");
+    }
+
+    #[test]
+    fn a_tool_result_keeps_its_first_lines_indentation() {
+        let mut c = Conversation::new(Uuid::nil());
+        c.apply(ProviderEvent::ToolResult {
+            id: "t1".into(),
+            content: " M crates/a.rs\n?? notes.md\n\n".into(),
+            is_error: false,
+        });
+        let Some(fx_core::MessageContent::ToolResult { content, .. }) = c
+            .messages()
+            .last()
+            .and_then(|message| message.content.first())
+        else {
+            panic!("the result was not recorded");
+        };
+        // " M" is an unstaged change; "M" would read as a staged one.
+        assert_eq!(content, " M crates/a.rs\n?? notes.md");
     }
 
     #[test]

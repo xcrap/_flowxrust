@@ -13,8 +13,8 @@ pub mod write;
 
 pub use format::{
     AutoTitlePreferences, PersistedApp, PersistedBinding, PersistedConversation,
-    PersistedPreferences, PersistedProject, PersistedUnsentPrompt, PersistedWorkspace,
-    ProviderDefaults, RightPanelTab, SplitContent,
+    PersistedPreferences, PersistedProject, PersistedQueuedPrompt, PersistedUnsentPrompt,
+    PersistedWorkspace, ProviderDefaults, RightPanelTab, SplitContent,
 };
 pub use paths::{AppPaths, PathsError};
 pub use store::{EncodedConversation, LoadError, SaveError, Store};

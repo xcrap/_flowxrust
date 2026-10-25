@@ -870,7 +870,16 @@ fn splice_changed(list: &ListState, old: &[RowStamp], new: &[RowStamp]) {
     if anchored && replaced.contains(&top.item_ix) {
         let row = &old[top.item_ix];
         let stretch = &new[prefix..prefix + count];
-        if let Some(at) = continuation(row, old, stretch) {
+        let at = continuation(row, old, stretch).or_else(|| {
+            // Nothing in the stretch is the row the reader was in, as when a
+            // history comes back under new ids and every row is replaced at
+            // once. GPUI's answer is the stretch's first row, which for the
+            // whole transcript is the top of the thread. Counted from the
+            // stretch's end instead, the reader stays about where they were.
+            let from_end = replaced.end - top.item_ix;
+            (count > 0).then(|| count.saturating_sub(from_end))
+        });
+        if let Some(at) = at {
             list.scroll_to(ListOffset {
                 item_ix: prefix + at,
                 offset_in_item: top.offset_in_item,
@@ -1295,6 +1304,7 @@ pub(crate) struct Snapshot {
     message_revision: u64,
     streaming_revision: u64,
     streaming: Rc<str>,
+    streaming_segment: u64,
     phase: Phase,
     busy: bool,
     waiting_for_user: bool,
@@ -1490,6 +1500,7 @@ pub(crate) fn snapshot(conversation: &crate::Conversation) -> Snapshot {
         message_revision,
         streaming_revision,
         streaming,
+        streaming_segment: conversation.streaming_segment(),
         phase: conversation.phase(),
         busy,
         waiting_for_user: conversation.is_waiting_for_user(),
@@ -2663,7 +2674,7 @@ impl selection::Document for TranscriptDocument {
             // The plan card draws no selectable text.
             Some(RowPlan::Plan { .. }) => Vec::new(),
             Some(RowPlan::Tail) if !snapshot.streaming.trim().is_empty() => {
-                crate::markdown::paragraphs(&snapshot.streaming, streaming_id(snapshot.id))
+                crate::markdown::paragraphs(&snapshot.streaming, streaming_id(snapshot))
             }
             // Status, not prose: the block is read, not copied from.
             Some(RowPlan::Tail | RowPlan::Tasks | RowPlan::Failure) | None => Vec::new(),
@@ -2794,8 +2805,15 @@ fn has_tail(snapshot: &Snapshot, has_active_group: bool) -> bool {
 }
 
 /// The id the reply still streaming in is rendered under.
-fn streaming_id(conversation: Uuid) -> String {
-    format!("{STREAMING_PREFIX}{conversation}")
+///
+/// Per segment: every segment is drawn in the tail, and under one id for all
+/// of them a selection made in one reply came back over the next, where Copy
+/// took text the reader had never selected.
+fn streaming_id(snapshot: &Snapshot) -> String {
+    format!(
+        "{STREAMING_PREFIX}{}:{}",
+        snapshot.id, snapshot.streaming_segment
+    )
 }
 
 /// The reply still being written, or the indicator that stands in for one before
@@ -2829,7 +2847,7 @@ fn streaming_tail(snapshot: &Snapshot, frame: u32, has_active_group: bool) -> Op
                                 .flex_1()
                                 .min_w_0()
                                 .fx_body()
-                                .child(crate::markdown::render(text, streaming_id(snapshot.id))),
+                                .child(crate::markdown::render(text, streaming_id(snapshot))),
                         )
                         // The caret is exactly one body line tall. GPUI has no
                         // caret, and a bar taller than the line it sits in reads
@@ -5855,6 +5873,60 @@ mod tests {
     }
 
     #[test]
+    fn a_selection_in_the_live_reply_does_not_come_back_over_the_next_one() {
+        // Every streamed segment is drawn in the tail. Under one id for all of
+        // them, a selection made in one reply reappeared over the next, and
+        // Cmd-C copied text the reader had never selected.
+        let mut conversation = Conversation::new(Uuid::new_v4());
+        conversation.apply(ProviderEvent::Lifecycle(Lifecycle::TurnStarted));
+        conversation.apply(ProviderEvent::TextDelta("Reading the first file.".into()));
+        let mut test = TestAppContext::single();
+        let window = test.add_window(move |_, _| Harness { conversation });
+        let mut visual = VisualTestContext::from_window(*window.deref(), &test);
+        visual.simulate_resize(size(px(700.0), px(600.0)));
+        test.refresh().unwrap();
+        let (key, ..) = crate::selection::tests::painted_paragraphs()
+            .into_iter()
+            .find(|(key, ..)| key.starts_with(STREAMING_PREFIX))
+            .expect("the live reply is selectable");
+        let reply = crate::selection::tests::painted_bounds(&key).unwrap();
+        let start = gpui::point(reply.origin.x + px(1.0), reply.center().y);
+        let end = gpui::point(reply.right() - px(1.0), reply.center().y);
+        visual.simulate_mouse_down(start, gpui::MouseButton::Left, Default::default());
+        visual.simulate_mouse_move(end, Some(gpui::MouseButton::Left), Default::default());
+        visual.simulate_mouse_up(end, gpui::MouseButton::Left, Default::default());
+        test.refresh().unwrap();
+        visual.simulate_keystrokes("cmd-c");
+        assert_eq!(
+            clipboard_text(&test).as_deref(),
+            Some("Reading the first file.")
+        );
+
+        // A call commits the reply, and the next one streams in its place.
+        window
+            .update(&mut test, |view, _, cx| {
+                view.conversation.apply(ProviderEvent::ToolUse {
+                    id: "call-1".into(),
+                    name: "Read".into(),
+                    input: r#"{"file_path":"/tmp/a.rs"}"#.into(),
+                });
+                view.conversation.apply(ProviderEvent::TextDelta(
+                    "Found the function, and here is what it does.".into(),
+                ));
+                cx.notify();
+            })
+            .unwrap();
+        test.refresh().unwrap();
+        test.write_to_clipboard(gpui::ClipboardItem::new_string("untouched".into()));
+        visual.simulate_keystrokes("cmd-c");
+        assert_eq!(
+            clipboard_text(&test).as_deref(),
+            Some("untouched"),
+            "Copy took the next reply's text"
+        );
+    }
+
+    #[test]
     fn a_press_without_a_drag_leaves_nothing_for_cmd_c() {
         let mut conversation = Conversation::new(Uuid::new_v4());
         let answer = text(MessageRole::Assistant, "Some text to click on.");
@@ -6280,6 +6352,47 @@ mod tests {
             (now.item_ix, now.offset_in_item),
             (held.item_ix, held.offset_in_item),
             "the reader was moved off the text they were reading"
+        );
+    }
+
+    #[test]
+    fn a_reader_keeps_their_place_when_every_row_comes_back_under_new_ids() {
+        // A provider's history replaces the transcript with copies under ids
+        // of its own. No row is the one the reader was in, and GPUI moved them
+        // to the start of the replaced stretch: the top of the thread.
+        let conversation = long_conversation(60);
+        let id = conversation.id;
+        let mut test = TestAppContext::single();
+        let window = test.add_window(move |_, _| Harness { conversation });
+        let mut visual = VisualTestContext::from_window(*window.deref(), &test);
+        visual.simulate_resize(size(px(700.0), px(500.0)));
+        redraw(&mut test);
+        let middle = visual.debug_bounds(SCROLL_ID).unwrap().center();
+        scroll_wheel(&mut visual, middle, 300.0);
+        redraw(&mut test);
+        let held = list_state(id).logical_scroll_top();
+        assert!(held.item_ix > 0 && held.item_ix < 59, "{held:?}");
+
+        window
+            .update(&mut test, |view, _, cx| {
+                let copies = view
+                    .conversation
+                    .messages()
+                    .map(|message| ConversationMessage {
+                        id: Uuid::new_v4(),
+                        ..message.clone()
+                    })
+                    .collect();
+                view.conversation.replace_full_history(copies);
+                cx.notify();
+            })
+            .unwrap();
+        redraw(&mut test);
+        let now = list_state(id).logical_scroll_top();
+        assert_eq!(
+            (now.item_ix, now.offset_in_item),
+            (held.item_ix, held.offset_in_item),
+            "the reader was sent to the top of the thread"
         );
     }
 

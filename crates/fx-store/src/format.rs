@@ -120,6 +120,23 @@ where
     decode_or(deserializer, T::default)
 }
 
+/// Read a list one element at a time, so an element this build cannot read
+/// costs only that element.
+fn readable_elements<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(match value {
+        serde_json::Value::Array(elements) => elements
+            .into_iter()
+            .filter_map(|element| serde_json::from_value(element).ok())
+            .collect(),
+        _ => Vec::new(),
+    })
+}
+
 /// Read one field, and a value it cannot hold as `fallback`.
 fn decode_or<'de, D, T>(deserializer: D, fallback: fn() -> T) -> Result<T, D::Error>
 where
@@ -603,6 +620,12 @@ pub struct PersistedBinding {
     /// Do not replace a locally completed turn until native history contains it.
     #[serde(default)]
     pub local_history_pending: bool,
+    /// The transcript message this session's history starts at, when FlowX
+    /// started the session in a thread that already had turns: Restart opens
+    /// a new session whose history holds none of the turns before it. Unset,
+    /// the provider's history is the whole thread.
+    #[serde(default)]
+    pub local_start: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -795,6 +818,24 @@ pub struct PersistedConversation {
         skip_serializing_if = "Option::is_none"
     )]
     pub goal: Option<fx_core::models::ConversationGoal>,
+    /// Prompts queued behind a running turn, with their images. Queuing
+    /// clears the composer, so a queue held only in memory was lost to a quit
+    /// or a crash with no trace of it left anywhere.
+    #[serde(
+        default,
+        deserialize_with = "readable_elements",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub queued: Vec<PersistedQueuedPrompt>,
+}
+
+/// A prompt waiting for the turn ahead of it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PersistedQueuedPrompt {
+    pub id: Uuid,
+    pub text: String,
+    #[serde(default, deserialize_with = "readable_elements")]
+    pub attachments: Vec<fx_core::Attachment>,
 }
 
 /// A prompt that failed to send.
@@ -819,6 +860,7 @@ impl PersistedConversation {
             || self.session_id.is_some()
             || self.total_tokens > 0
             || self.goal.is_some()
+            || !self.queued.is_empty()
     }
 
     /// Build a persisted record from a thread's messages.
@@ -843,6 +885,7 @@ impl PersistedConversation {
             unsent_prompt: None,
             draft_text: String::new(),
             goal: None,
+            queued: Vec::new(),
         }
     }
 }
@@ -1395,6 +1438,35 @@ mod tests {
         assert_eq!(legacy.goal, None);
         let preferences: PersistedPreferences = serde_json::from_str("{}").unwrap();
         assert_eq!(preferences.follow_up_mode, "steer");
+    }
+
+    #[test]
+    fn a_queue_survives_a_round_trip_and_an_unreadable_entry_costs_only_itself() {
+        let image = fx_core::Attachment::new(vec![1, 2, 3], "image/png", "shot.png");
+        let queued = PersistedQueuedPrompt {
+            id: Uuid::from_u128(7),
+            text: "Then run the tests".into(),
+            attachments: vec![image],
+        };
+        let persisted = PersistedConversation {
+            queued: vec![queued.clone()],
+            ..PersistedConversation::from_messages(Uuid::nil(), Vec::new())
+        };
+        assert!(
+            persisted.is_worth_persisting(),
+            "a queue alone was not worth writing"
+        );
+        let mut value = serde_json::to_value(&persisted).unwrap();
+        value["queued"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({ "id": "not a uuid", "text": 5 }));
+        let read: PersistedConversation = serde_json::from_value(value).unwrap();
+        assert_eq!(read.queued, vec![queued]);
+
+        let empty = PersistedConversation::from_messages(Uuid::nil(), Vec::new());
+        let bytes = serde_json::to_string(&empty).unwrap();
+        assert!(!bytes.contains("queued"), "an empty queue was written");
     }
 
     #[test]
