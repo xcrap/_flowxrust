@@ -126,10 +126,28 @@ pub fn button_with_icon(
     enabled: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> gpui::Stateful<gpui::Div> {
+    labelled_button(
+        label,
+        icon,
+        move |hovered, theme| button_palette(style, hovered, theme),
+        enabled,
+        on_click,
+    )
+}
+
+/// The body of every labelled button, painted from `palette(hovered, theme)`.
+fn labelled_button(
+    label: impl Into<SharedString>,
+    icon: Option<Icon>,
+    palette: impl Fn(bool, &crate::theme::Theme) -> ButtonPalette,
+    enabled: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
     let theme = global::current();
     let label = label.into();
     let button_id: SharedString = format!("button:{label}").into();
-    let palette = button_palette(style, false, &theme);
+    let hover = palette(true, &theme);
+    let palette = palette(false, &theme);
     let icon_element = icon.map(|i| i.render(IconSize::Control, palette.foreground, &theme));
 
     let mut content = div()
@@ -173,8 +191,8 @@ pub fn button_with_icon(
             if !enabled {
                 return s;
             }
-            let p = button_palette(style, true, &theme);
-            s.fx_background(p.background).fx_text_color(p.foreground)
+            s.fx_background(hover.background)
+                .fx_text_color(hover.foreground)
         })
         .active(|s: StyleRefinement| {
             if enabled {
@@ -195,6 +213,32 @@ pub fn button_with_icon(
         })
 }
 
+/// How a navigation destination looks: a ghost button, or the selected one.
+///
+/// The selected destination keeps its fill under the pointer. The ghost hover
+/// replaced it with a lighter wash, which read as the selection dropping away.
+pub fn navigation_palette(
+    selected: bool,
+    hovered: bool,
+    theme: &crate::theme::Theme,
+) -> ButtonPalette {
+    if !selected {
+        return button_palette(ButtonStyle::Ghost, hovered, theme);
+    }
+    let clear = gpui::Rgba {
+        r: 0.0,
+        g: 0.0,
+        b: 0.0,
+        a: 0.0,
+    };
+    ButtonPalette {
+        foreground: Colors::fg(theme),
+        background: Colors::bg_selected(theme),
+        border: clear,
+        hover_tint: clear,
+    }
+}
+
 /// A full-width, left-aligned destination in a settings or navigation list.
 pub fn navigation_button(
     label: impl Into<SharedString>,
@@ -202,15 +246,15 @@ pub fn navigation_button(
     selected: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    let theme = global::current();
-    button_with_icon(label, Some(icon), ButtonStyle::Ghost, true, on_click)
-        .w_full()
-        .justify_start()
-        .when(selected, |button| {
-            button
-                .bg(Colors::bg_selected(&theme))
-                .text_color(Colors::fg(&theme))
-        })
+    labelled_button(
+        label,
+        Some(icon),
+        move |hovered, theme| navigation_palette(selected, hovered, theme),
+        true,
+        on_click,
+    )
+    .w_full()
+    .justify_start()
 }
 
 /// How much chrome an icon button shows at rest.
@@ -651,13 +695,18 @@ pub fn text_disclosure(
 
 /// A selectable answer or preference, with enough room for its explanation.
 /// Unlike toolbar buttons, both labels wrap within the available panel width.
+///
+/// The row's id comes from its label, so two groups that can offer the same
+/// label each need an id of their own around their rows. Without one, both
+/// rows share one interaction state: a press on either shows on both, and a
+/// click on the second never arrives.
 pub fn choice_row(
     label: impl Into<SharedString>,
     description: impl Into<SharedString>,
     selected: bool,
     enabled: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
+) -> gpui::Stateful<gpui::Div> {
     let theme = global::current();
     let label = label.into();
     let description = description.into();
@@ -955,6 +1004,23 @@ mod tests {
                 let fill = crate::theme::composite(bg, panel);
                 assert!(crate::theme::contrast(fg, fill) >= 4.5);
             }
+        }
+    }
+
+    #[test]
+    fn a_selected_navigation_button_keeps_its_fill_under_the_pointer() {
+        for theme in themes() {
+            let selected = navigation_palette(true, false, &theme);
+            assert_eq!(selected.background, Colors::bg_selected(&theme));
+            assert_eq!(
+                navigation_palette(true, true, &theme).background,
+                selected.background
+            );
+            // The others still answer the pointer, as a ghost button does.
+            let rest = navigation_palette(false, false, &theme);
+            let hover = navigation_palette(false, true, &theme);
+            assert_eq!(rest.background.a, 0.0);
+            assert_eq!(hover.background, Colors::bg_hover(&theme));
         }
     }
 

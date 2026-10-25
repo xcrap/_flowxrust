@@ -1007,9 +1007,37 @@ pub fn contrast(foreground: Rgba, background: Rgba) -> f64 {
     contrast_ratio(composite(foreground, background), background)
 }
 
+/// `hue` where it clears `floor` on every one of `backgrounds`, and `fallback`
+/// where it does not.
+///
+/// The rule behind a badge's label, a checklist's marks, a menu's checkmark and
+/// the title bar's change counts: the hue says what something is, but never at
+/// the price of being read. Every fill the element can be drawn on is passed,
+/// because the color does not change when its background does — under the
+/// pointer, say, or on a lighter card.
+pub fn legible_or(hue: Rgba, fallback: Rgba, backgrounds: &[Rgba], floor: f64) -> Rgba {
+    if backgrounds
+        .iter()
+        .all(|background| contrast(hue, *background) >= floor)
+    {
+        hue
+    } else {
+        fallback
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hue_is_kept_only_where_it_clears_the_floor_on_every_background() {
+        let (white, black, gray) = (h(0xFFFFFF), h(0x000000), h(0x777777));
+        assert_eq!(legible_or(white, gray, &[black], 4.5), white);
+        // One background it cannot be read on is enough to lose it.
+        assert_eq!(legible_or(white, gray, &[black, h(0xEEEEEE)], 4.5), gray);
+        assert_eq!(legible_or(gray, black, &[white], 4.5), black);
+    }
 
     #[test]
     fn with_alpha_replaces_only_the_alpha() {

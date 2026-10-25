@@ -541,7 +541,15 @@ impl Render for RequestPanel {
             .py(px_len(Spacing::LG))
             .flex_shrink_0();
         for (index, question) in request.questions.iter().enumerate() {
-            let mut section = div().w_full().flex().flex_col().gap(px_len(Spacing::MD));
+            // An id per question, because a choice row's id is its label: two
+            // questions offering "Yes" shared one row state, and a click on
+            // the second question's never arrived.
+            let mut section = div()
+                .id(SharedString::from(format!("question:{index}")))
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap(px_len(Spacing::MD));
             if request.questions.len() > 1 || !question.header.is_empty() {
                 section = section.child(
                     div()
@@ -563,15 +571,19 @@ impl Render for RequestPanel {
                 let field = self.fields[index].clone();
                 let value = option.label.clone();
                 let selected = field.read(cx).value() == option.label;
-                section = section.child(choice_row(
-                    SharedString::from(option.label.clone()),
-                    SharedString::from(option.description.clone()),
-                    selected,
-                    !self.sent,
-                    move |_, _, cx| {
-                        field.update(cx, |field, cx| field.set_value(value.clone(), cx))
-                    },
-                ));
+                let selector = format!("question-option:{index}:{}", option.label);
+                section = section.child(
+                    choice_row(
+                        SharedString::from(option.label.clone()),
+                        SharedString::from(option.description.clone()),
+                        selected,
+                        !self.sent,
+                        move |_, _, cx| {
+                            field.update(cx, |field, cx| field.set_value(value.clone(), cx))
+                        },
+                    )
+                    .debug_selector(move || selector),
+                );
             }
             section = section
                 .when(!question.options.is_empty(), |section| {
@@ -771,6 +783,77 @@ mod tests {
                 "blur restored input into the covered draft"
             );
         });
+    }
+
+    #[test]
+    fn two_questions_offering_the_same_choices_each_take_their_own_click() {
+        // A choice row's id is its label. With both questions' rows under one
+        // id, the first question's row consumed the press meant for the second.
+        use gpui::{MouseButton, VisualTestContext, px, size};
+        let temp = tempfile::tempdir().unwrap();
+        let mut test = gpui::TestAppContext::single();
+        let (state, ui, composer) =
+            test.update(|cx| (state(cx, temp.path()), handle(cx), cx.new(TextField::new)));
+        let window = test.add_window({
+            let state = state.clone();
+            let ui = ui.clone();
+            move |_, _| MountedWorkspace {
+                state,
+                ui,
+                composer,
+            }
+        });
+        let mut visual = VisualTestContext::from_window(window.into(), &test);
+        visual.simulate_resize(size(px(1100.0), px(900.0)));
+        let yes_or_no = |id: &str| Question {
+            options: ["Yes", "No"]
+                .map(|label| fx_agent::provider::Option_ {
+                    label: label.into(),
+                    description: String::new(),
+                })
+                .to_vec(),
+            ..question(id, false)
+        };
+        test.update(|cx| {
+            state.read(cx).update_sender_for(Uuid::new_v4())(
+                crate::session::SessionUpdate::Interaction {
+                    event: ProviderEvent::UserInput(UserInputRequest {
+                        id: "two-questions".into(),
+                        questions: vec![yes_or_no("tests"), yes_or_no("docs")],
+                    }),
+                },
+            )
+        });
+        window.update(&mut test, |_, _, cx| cx.notify()).unwrap();
+        test.refresh().unwrap();
+        let fields = test.update(|cx| {
+            ui.read(cx)
+                .request
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .fields
+                .clone()
+        });
+        let values = |test: &gpui::TestAppContext| {
+            test.read(|cx| {
+                fields
+                    .iter()
+                    .map(|field| field.read(cx).value().to_string())
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        for (selector, expected) in [
+            ("question-option:1:No", ["", "No"]),
+            ("question-option:0:Yes", ["Yes", "No"]),
+        ] {
+            let row = visual.debug_bounds(selector).unwrap().center();
+            visual.simulate_mouse_down(row, MouseButton::Left, Default::default());
+            visual.simulate_mouse_up(row, MouseButton::Left, Default::default());
+            test.refresh().unwrap();
+            assert_eq!(values(&test), expected, "after clicking {selector}");
+        }
     }
 
     #[test]

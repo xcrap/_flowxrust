@@ -237,14 +237,20 @@ impl AppState {
     /// replaced.
     pub fn apply_menu_choice(&mut self, owner: &str, chosen: &str) {
         match chosen {
-            "sidebar" => self.toggle_sidebar(),
-            "inspector" => self.toggle_inspector(),
+            // The panel toggles are not here: they save once the panel has
+            // moved, which `shell_action` does and this function cannot.
             "new-thread" => {
                 if let Some(id) = owner
                     .strip_prefix("project:")
                     .and_then(|id| id.parse().ok())
                 {
-                    self.select_project(id);
+                    // Into the project without opening the thread it was left
+                    // on: the new thread replaces it before it is drawn, so it
+                    // keeps its unseen mark. The thread being left was seen.
+                    let previous = self.snapshot.active_agent_id;
+                    if self.enter_project(id) {
+                        self.mark_seen([previous]);
+                    }
                 }
                 self.create_thread();
             }
@@ -590,18 +596,30 @@ impl AppState {
 
     pub fn select_project(&mut self, id: Uuid) {
         let previous = self.snapshot.active_agent_id;
+        if self.enter_project(id) {
+            self.mark_seen([previous, self.snapshot.active_agent_id]);
+        }
+    }
+
+    /// Make a project active on the thread it was left on, and ask for its
+    /// provider threads, without marking anything seen. Returns whether the
+    /// project exists.
+    ///
+    /// For a caller about to put another thread on screen: the one the
+    /// project was left on is never drawn, so it keeps its unseen mark.
+    fn enter_project(&mut self, id: Uuid) -> bool {
         let Some(record) = self.snapshot.projects.iter().find(|record| {
             record
                 .project
                 .as_ref()
                 .is_some_and(|project| project.id == id)
         }) else {
-            return;
+            return false;
         };
         self.snapshot.active_project_id = Some(id);
         self.snapshot.active_agent_id = visible_agent(record, record.last_selected_agent_id);
-        self.mark_seen([previous, self.snapshot.active_agent_id]);
         self.request_native_refresh(id);
+        true
     }
 
     /// Whether a thread finished a turn the reader has not opened since.
@@ -648,6 +666,12 @@ impl AppState {
         }
     }
 
+    /// Select a thread, in whichever project it is.
+    ///
+    /// Arriving from another project asks for that project's provider threads,
+    /// as selecting the project does. Callers come here directly rather than
+    /// through `select_project` first, which would open the thread the project
+    /// was left on and mark it seen though it was never drawn.
     pub fn select_agent(&mut self, id: Uuid) {
         let previous = self.snapshot.active_agent_id;
         let Some(record) = self
@@ -661,27 +685,30 @@ impl AppState {
         let Some(project) = &record.project else {
             return;
         };
-        self.snapshot.active_project_id = Some(project.id);
+        let project_id = project.id;
+        let entered = self.snapshot.active_project_id != Some(project_id);
+        self.snapshot.active_project_id = Some(project_id);
         self.snapshot.active_agent_id = Some(id);
         record.last_selected_agent_id = Some(id);
         self.native_sync.history_due.remove(&id);
         self.mark_seen([previous, Some(id)]);
+        if entered {
+            self.request_native_refresh(project_id);
+        }
     }
 
-    /// Show a thread from anywhere — ⌘1…⌘9 or the palette — the way clicking
-    /// it in the sidebar does: its project selected and expanded, and its
-    /// transcript read on first selection, in the background. Reading it here
-    /// with `conversation` blocked the UI thread on the file for a ⌘K or ⌘1
-    /// that a click never paid. Returns whether the thread exists.
+    /// Show a thread from anywhere — ⌘1…⌘9, the palette, a restored archive —
+    /// the way clicking it in the sidebar does: its project selected and
+    /// expanded, and its transcript read on first selection, in the
+    /// background. Reading it here with `conversation` blocked the UI thread
+    /// on the file for a ⌘K or ⌘1 that a click never paid. Returns whether the
+    /// thread exists.
     pub fn open_thread(&mut self, agent_id: Uuid, cx: &mut Context<Self>) -> bool {
         let Some(project_id) = self.project_for_agent(agent_id) else {
             return false;
         };
         if !self.is_expanded(project_id) {
             self.toggle_project_expansion(project_id);
-        }
-        if self.snapshot.active_project_id != Some(project_id) {
-            self.select_project(project_id);
         }
         self.select_agent(agent_id);
         self.request_conversation(project_id, agent_id, cx);
@@ -2285,6 +2312,12 @@ impl AppState {
         {
             self.native_sync.history_due.remove(&agent);
         }
+    }
+
+    /// The provider-sync bookkeeping, for tests outside this module.
+    #[cfg(test)]
+    pub(crate) fn native_sync_mut(&mut self) -> &mut crate::native_sync::NativeSync {
+        &mut self.native_sync
     }
 
     /// Apply completed background work, then schedule only due requests. Returns

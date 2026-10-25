@@ -44,11 +44,12 @@ const MARK_CONTRAST_FLOOR: f64 = 3.0;
 /// short of 3:1, and a spinner nobody can see says nothing.
 pub fn checklist_ink(mark: ChecklistMark, theme: &Theme) -> ChecklistInk {
     let legible = |hue: Rgba| {
-        if crate::theme::contrast(hue, checklist_surface(theme)) >= MARK_CONTRAST_FLOOR {
-            hue
-        } else {
-            Colors::fg(theme)
-        }
+        crate::theme::legible_or(
+            hue,
+            Colors::fg(theme),
+            &[checklist_surface(theme)],
+            MARK_CONTRAST_FLOOR,
+        )
     };
     match mark {
         ChecklistMark::Pending => ChecklistInk {

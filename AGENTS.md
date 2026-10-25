@@ -104,6 +104,21 @@ touching any foreground, background, or accent token.
 - Checklist text clears 4.5:1 and every checklist mark 3:1 on its surface, with
   every accent. Light-mode emerald and orange fall short, so the active mark
   falls back to `fg` there, as a badge's label does.
+- A badge's label clears 4.5:1 on its own fill over `bg`, `bg_elevated` *and*
+  `bg_surface`, with every accent. The fill is translucent and badges sit on
+  cards as well as panels; measured over the panel alone, dark "Ready" on a
+  provider card was 4.2:1. In dark mode only neutral and warning keep their
+  hue on both, so the others' labels are `fg` on their tint.
+- The title bar's change counts clear 4.5:1 on the title bar at rest, hovered
+  and selected. They use the diff inks, not `success`/`error` (light `success`
+  was 3.4:1); dark `diff_removed_fg` is 4.2:1 on the selected fill, so it falls
+  back to `fg` while the inspector is open.
+- A menu's checkmark clears 3:1 on `bg_surface`, hovered or not, with every
+  accent. Where the accent falls short (dark violet is 2.15:1), it is `fg`.
+
+All four "hue where legible, `fg` where not" rules go through
+`theme::legible_or`, given every fill the element can be drawn on — its color
+does not change when the pointer or the surface under it does.
 
 One documented shortfall, recorded rather than hidden: where a status hue is
 used as an *icon on its own tint*, light-mode `warning` bottoms out at 2.29:1
@@ -189,10 +204,16 @@ GPUI cannot express the original:
   trimmed stroke, for the same reason.
 
 One accessibility improvement: `BadgeTone::text_ink` uses the tone's hue for
-the label only where it clears AA against its own fill, and falls back to
-`fg` where it does not. Light-mode `warning` over its own tint is 2.6:1, which
-is unreadable at 12pt. The tint still carries the tone, so the badge keeps its
-identity without shipping an illegible label.
+the label only where it clears AA against its own fill, over both a panel and a
+card, and falls back to `fg` where it does not. Light-mode `warning` over its
+own tint is 2.6:1, which is unreadable at 12pt. The tint still carries the
+tone, so the badge keeps its identity without shipping an illegible label.
+
+A selected row keeps its selection fill under the pointer — a thread row, a
+settings destination, the title bar's change counts — as the segmented control,
+`choice_row` and `compact_action_toggle` always did. GPUI's hover refinement
+replaces the background rather than layering on it, so an unconditional
+`.hover(bg_hover)` turned the 8% selection into a 4% wash.
 
 ### Icons
 

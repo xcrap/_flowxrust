@@ -12,7 +12,7 @@ pub mod typography;
 pub use animation::FxAnimation;
 pub use color::{
     AccentColor, AppearanceMode, BaseTone, Colors, Palette, Rgba, TextSizePreset, Theme,
-    ThemeSignature, ToneScale, WithAlpha, composite, contrast, contrast_ratio, h, ha,
+    ThemeSignature, ToneScale, WithAlpha, composite, contrast, contrast_ratio, h, ha, legible_or,
     relative_luminance,
 };
 pub use global::{ThemeGuard, current, set, set_system_appearance, update};

@@ -47,6 +47,20 @@ fn no_fill() -> Rgba {
     }
 }
 
+/// A thread row's fill.
+///
+/// The open thread keeps its selection under the pointer: the hover wash is
+/// half as strong, so replacing it read as the selection dropping away.
+fn thread_row_fill(selected: bool, hovered: bool, theme: &fx_design::theme::Theme) -> Rgba {
+    if selected {
+        Colors::bg_selected(theme)
+    } else if hovered {
+        Colors::bg_hover(theme)
+    } else {
+        no_fill()
+    }
+}
+
 /// Render the sidebar column, or collapse it to nothing when hidden.
 ///
 /// Collapsing rather than unmounting keeps the layout arithmetic simple: the
@@ -229,12 +243,14 @@ fn body(state: Entity<AppState>, cx: &mut App) -> AnyElement {
                             // Not tied to whether a background pass is running:
                             // that changes every few seconds, so the button
                             // blinked. A retry while one runs just makes the
-                            // next pass due at once.
+                            // next pass due at once. Tied to whether the row
+                            // shows, which a search decides as much as the
+                            // project's own disclosure.
                             .child(icon_button(
                                 IconButtonProps::new(Icon::ARROW_CLOCKWISE, "Retry thread sync")
                                     .tiny()
                                     .ghost()
-                                    .enabled(record.is_expanded),
+                                    .enabled(expanded),
                                 move |_, _, cx| {
                                     retry_state.update(cx, |state, cx| {
                                         state.request_native_refresh(id);
@@ -317,12 +333,24 @@ fn project_row(
         .on_click({
             let state = state.clone();
             move |_, _window, cx| {
+                let searching = state
+                    .read(cx)
+                    .sidebar
+                    .search()
+                    .read(cx)
+                    .query(cx)
+                    .is_active();
                 state.update(cx, |state, cx| {
                     // Selecting the already-open project collapses it, which is
                     // the same gesture as the triangle and avoids a row that
-                    // does nothing when clicked twice.
+                    // does nothing when clicked twice. Not during a search,
+                    // which holds every project open: the collapse would
+                    // change nothing on screen and appear only once the search
+                    // was cleared.
                     if state.snapshot.active_project_id == Some(id) {
-                        state.toggle_project_expansion(id);
+                        if !searching {
+                            state.toggle_project_expansion(id);
+                        }
                     } else {
                         if !state.is_expanded(id) {
                             state.toggle_project_expansion(id);
@@ -647,12 +675,8 @@ fn thread_row(
         .pr(px_len(Spacing::XXS))
         .cursor_pointer()
         .rounded(px_len(Radii::SM))
-        .bg(if selected {
-            Colors::bg_selected(&theme)
-        } else {
-            no_fill()
-        })
-        .hover(|s| s.fx_background(Colors::bg_hover(&theme)))
+        .bg(thread_row_fill(selected, false, &theme))
+        .hover(|s| s.fx_background(thread_row_fill(selected, true, &theme)))
         .on_click({
             let state = state.clone();
             move |_, _window, cx| {
@@ -660,7 +684,9 @@ fn thread_row(
                     return;
                 }
                 state.update(cx, |state, cx| {
-                    state.select_project(project_id);
+                    // Straight to the thread. Selecting its project first
+                    // opened the thread that project was left on, and marked
+                    // it seen though it was never drawn.
                     state.select_agent(agent_id);
                     // Read the transcript on first selection rather than at
                     // launch, and in the background rather than in the click.
@@ -1846,5 +1872,203 @@ mod tests {
                 assert!(!state.has_unseen_completion(ids[1]));
             })
         });
+    }
+
+    /// Two projects: the first open on its only thread, the second left on the
+    /// first of its two, which finished a turn nobody has opened since.
+    ///
+    /// Returns the second project and the threads `[a1, b1, b2]`.
+    fn two_projects(
+        test: &mut TestAppContext,
+        paths: AppPaths,
+    ) -> (Entity<AppState>, Uuid, [Uuid; 3]) {
+        let (a1, b1, b2) = (Agent::new("A1"), Agent::new("B1"), Agent::new("B2"));
+        let root = |name: &str| {
+            let root = paths.root().join(name);
+            std::fs::create_dir_all(&root).unwrap();
+            root.to_string_lossy().into_owned()
+        };
+        let mut first = Project::new(root("a"));
+        first.agent_order = vec![a1.id];
+        let mut second = Project::new(root("b"));
+        second.agent_order = vec![b1.id, b2.id];
+        let second_id = second.id;
+        let snapshot = PersistedApp {
+            active_project_id: Some(first.id),
+            active_agent_id: Some(a1.id),
+            projects: vec![
+                PersistedProject {
+                    project: Some(first),
+                    agents: vec![a1.clone()],
+                    last_selected_agent_id: Some(a1.id),
+                    is_expanded: true,
+                    ..Default::default()
+                },
+                PersistedProject {
+                    project: Some(second),
+                    agents: vec![b1.clone(), b2.clone()],
+                    last_selected_agent_id: Some(b1.id),
+                    unseen_completion_ids: vec![b1.id],
+                    is_expanded: true,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        Store::new(paths.clone()).save_app(&snapshot).unwrap();
+        let state = test.update(|cx| cx.new(|cx| AppState::restore(paths, cx)));
+        (state, second_id, [a1.id, b1.id, b2.id])
+    }
+
+    /// Make every provider's index pass for `project` due a minute from now,
+    /// so a test can tell whether something asked for one sooner.
+    fn postpone_index(state: &mut AppState, project: Uuid) {
+        let later = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        for provider in crate::native_sync::PROVIDERS {
+            state
+                .native_sync_mut()
+                .index_due
+                .insert((project, provider.into()), later);
+        }
+    }
+
+    fn index_requested(state: &mut AppState, project: Uuid) -> bool {
+        crate::native_sync::PROVIDERS.iter().all(|provider| {
+            !state
+                .native_sync_mut()
+                .index_due
+                .contains_key(&(project, (*provider).into()))
+        })
+    }
+
+    #[test]
+    fn clicking_into_another_project_leaves_the_mark_on_the_thread_it_was_left_on() {
+        // The click selected the project, which opened B1 and marked it seen,
+        // and only then moved on to B2: B1 lost its dot without being drawn.
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path());
+        let mut test = TestAppContext::single();
+        let (state, second, [_, b1, b2]) = two_projects(&mut test, paths.clone());
+        test.update(|cx| state.update(cx, |state, _| postpone_index(state, second)));
+        let for_view = state.clone();
+        let window = test.add_window(move |_, _| SidebarProbe(for_view));
+        let mut visual = VisualTestContext::from_window(window.into(), &test);
+        test.refresh().unwrap();
+
+        let row = thread_bounds(&test, &state, b2);
+        visual.simulate_click(row.center(), Default::default());
+        test.refresh().unwrap();
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                assert_eq!(state.snapshot.active_project_id, Some(second));
+                assert_eq!(state.snapshot.active_agent_id, Some(b2));
+                assert!(state.has_unseen_completion(b1), "B1 was never on screen");
+                // Arriving in a project still asks for its provider threads.
+                assert!(index_requested(state, second));
+            })
+        });
+        let saved = Store::new(paths).load_app().unwrap();
+        assert_eq!(saved.projects[1].unseen_completion_ids, vec![b1]);
+    }
+
+    #[test]
+    fn opening_or_starting_a_thread_in_another_project_leaves_its_marks_alone() {
+        // ⌘1…⌘9 and the palette go through `open_thread`, and a project's "+"
+        // through the menu's "new-thread": both selected the project first.
+        for start in ["open", "new-thread"] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut test = TestAppContext::single();
+            let (state, second, [_, b1, b2]) = two_projects(&mut test, AppPaths::at(temp.path()));
+            test.update(|cx| {
+                state.update(cx, |state, cx| {
+                    postpone_index(state, second);
+                    if start == "open" {
+                        assert!(state.open_thread(b2, cx));
+                        assert_eq!(state.snapshot.active_agent_id, Some(b2));
+                    } else {
+                        state.apply_menu_choice(&format!("project:{second}"), "new-thread");
+                        assert_eq!(state.active_agents().len(), 3, "no thread was started");
+                    }
+                    assert_eq!(state.snapshot.active_project_id, Some(second));
+                    assert!(state.has_unseen_completion(b1), "{start}: B1 lost its mark");
+                    assert!(index_requested(state, second), "{start}");
+                })
+            });
+        }
+    }
+
+    #[test]
+    fn a_search_keeps_a_clicked_project_open_and_its_retry_enabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut test = TestAppContext::single();
+        let (state, second, [a1, ..]) = two_projects(&mut test, AppPaths::at(temp.path()));
+        let first = test.read(|cx| state.read(cx).snapshot.active_project_id.unwrap());
+        // The second project is collapsed and its sync has failed, so a search
+        // is the only thing showing its retry button.
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                state.toggle_project_expansion(second);
+                state.native_sync_mut().warnings.insert(
+                    (second, "codex".into()),
+                    vec!["Codex is unavailable".into()],
+                );
+                postpone_index(state, second);
+            })
+        });
+        let (_window, mut visual) = tall_sidebar(&mut test, &state);
+        let field = test.read(|cx| state.read(cx).sidebar.search().read(cx).field().clone());
+        test.update(|cx| field.update(cx, |field, cx| field.set_value("A1", cx)));
+        settle_disclosure(&mut test);
+        assert_eq!(thread_regions(&test, &state), vec![format!("thread:{a1}")]);
+
+        // Clicking the open project collapses it, but not while a search is
+        // holding it open: nothing would change until the search was cleared.
+        let row = test.read(|cx| {
+            state
+                .read(cx)
+                .context_registry
+                .read(cx)
+                .regions()
+                .iter()
+                .find(|region| region.owner.as_ref() == format!("project:{first}"))
+                .expect("the project row is painted")
+                .bounds
+        });
+        visual.simulate_click(row.center(), Default::default());
+        test.read(|cx| assert!(state.read(cx).is_expanded(first)));
+        test.refresh().unwrap();
+
+        let retry = visual
+            .debug_bounds("icon-button:Retry thread sync")
+            .expect("the search shows the collapsed project's sync row");
+        visual.simulate_click(retry.center(), Default::default());
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                assert!(index_requested(state, second), "retry was disabled");
+                assert!(!state.is_expanded(second));
+            })
+        });
+
+        test.update(|cx| field.update(cx, |field, cx| field.set_value("", cx)));
+        settle_disclosure(&mut test);
+        assert_eq!(thread_regions(&test, &state), vec![format!("thread:{a1}")]);
+    }
+
+    #[test]
+    fn the_open_thread_keeps_its_selection_under_the_pointer() {
+        for theme in [
+            fx_design::theme::Theme::default(),
+            fx_design::theme::Theme::default()
+                .with_appearance(fx_design::theme::AppearanceMode::Light),
+        ] {
+            let selected = thread_row_fill(true, false, &theme);
+            assert_eq!(selected, Colors::bg_selected(&theme));
+            assert_eq!(thread_row_fill(true, true, &theme), selected);
+            assert_eq!(
+                thread_row_fill(false, true, &theme),
+                Colors::bg_hover(&theme)
+            );
+            assert_eq!(thread_row_fill(false, false, &theme).a, 0.0);
+        }
     }
 }

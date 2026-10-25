@@ -233,8 +233,31 @@ pub fn row_palette(item: &MenuItem, hovered: bool, theme: &crate::theme::Theme) 
         } else {
             clear
         },
-        check: Colors::accent(theme),
+        check: menu_check_ink(theme),
     }
+}
+
+/// The 3:1 non-text floor a checkmark has to clear: it is the only thing that
+/// says which choice is current.
+const CHECK_CONTRAST_FLOOR: f64 = 3.0;
+
+/// The selected row's checkmark: the accent where it reads on the menu, and
+/// the strongest foreground where it does not.
+///
+/// The checklist's rule. On `bg_surface` the dark violet accent is 2.15:1,
+/// and several light accents land between 2.1 and 3.0. Measured under the
+/// hover wash too, because the pointer changes the row and not the mark.
+fn menu_check_ink(theme: &crate::theme::Theme) -> gpui::Rgba {
+    let surface = Colors::bg_surface(theme);
+    crate::theme::legible_or(
+        Colors::accent(theme),
+        Colors::fg(theme),
+        &[
+            surface,
+            crate::theme::composite(Colors::bg_hover(theme), surface),
+        ],
+        CHECK_CONTRAST_FLOOR,
+    )
 }
 
 /// Render one row.
@@ -964,12 +987,41 @@ mod tests {
     }
 
     #[test]
-    fn a_checkmark_uses_the_accent() {
-        let theme = Theme::default();
-        assert_eq!(
-            row_palette(&items()[0], false, &theme).check,
-            Colors::accent(&theme)
-        );
+    fn a_checkmark_is_visible_on_the_menu_and_keeps_the_accent_where_it_can() {
+        // The checkmark alone says which choice is current, so it needs the
+        // 3:1 a meaningful graphic does, with the row hovered or not.
+        let mut kept = 0;
+        for theme in themes() {
+            for accent in crate::theme::AccentColor::ALL {
+                let theme = Theme {
+                    accent_color: accent,
+                    ..theme
+                };
+                let surface = Colors::bg_surface(&theme);
+                let hovered = crate::theme::composite(Colors::bg_hover(&theme), surface);
+                let fills = [surface, hovered];
+                let accent_reads = fills
+                    .iter()
+                    .all(|fill| crate::theme::contrast(Colors::accent(&theme), *fill) >= 3.0);
+                for row_hovered in [false, true] {
+                    let check = row_palette(&items()[0], row_hovered, &theme).check;
+                    for fill in fills {
+                        let ratio = crate::theme::contrast(check, fill);
+                        assert!(
+                            ratio >= 3.0,
+                            "{accent:?} {:?} {:?}: the checkmark is {ratio}:1",
+                            theme.base_tone,
+                            theme.appearance_mode
+                        );
+                    }
+                    if accent_reads {
+                        assert_eq!(check, Colors::accent(&theme), "{accent:?} lost its hue");
+                    }
+                }
+                kept += usize::from(accent_reads);
+            }
+        }
+        assert!(kept > 0, "no accent keeps its hue on a menu");
     }
 
     // ── Geometry ───────────────────────────────────────────────────────────

@@ -94,14 +94,20 @@ impl BadgeTone {
     /// So the hue is used wherever it is legible, and the strongest foreground
     /// takes over where it is not. This keeps the tint — which is what actually
     /// communicates the tone — while never shipping an illegible label.
+    ///
+    /// The fill is translucent, so what it reads as depends on what is under
+    /// it. A badge sits on a panel as often as on a card, so both surfaces are
+    /// measured: judged over the panel alone, the dark "Ready" label on a
+    /// provider card was 4.2:1.
     pub fn text_ink(self, theme: &crate::theme::Theme) -> Rgba {
-        let hue = self.hue(theme);
-        let fill = crate::theme::composite(self.fill(theme), Colors::bg_elevated(theme));
-        if crate::theme::contrast(hue, fill) >= Self::TEXT_CONTRAST_FLOOR {
-            hue
-        } else {
-            Colors::fg(theme)
-        }
+        let fills = [Colors::bg_elevated(theme), Colors::bg_surface(theme)]
+            .map(|surface| crate::theme::composite(self.fill(theme), surface));
+        crate::theme::legible_or(
+            self.hue(theme),
+            Colors::fg(theme),
+            &fills,
+            Self::TEXT_CONTRAST_FLOOR,
+        )
     }
 }
 
@@ -483,19 +489,29 @@ mod tests {
         }
     }
 
+    /// A tone's fill over each surface a badge is drawn on, as it renders.
+    fn fills(tone: BadgeTone, theme: &Theme) -> [Rgba; 2] {
+        [Colors::bg_elevated(theme), Colors::bg_surface(theme)]
+            .map(|surface| crate::theme::composite(tone.fill(theme), surface))
+    }
+
     #[test]
     fn badge_text_stays_legible_on_its_own_fill() {
         // A badge label is a 12pt caption, so it needs AA. This is the check
-        // that motivated `text_ink` falling back to a strong foreground.
+        // that motivated `text_ink` falling back to a strong foreground. The
+        // provider rows in Settings put badges on a card, where the dark
+        // "Ready" label measured over the panel alone was 4.2:1.
         for theme in themes() {
             for tone in BadgeTone::ALL {
-                let fill = crate::theme::composite(tone.fill(&theme), Colors::bg_elevated(&theme));
-                let ratio = contrast(tone.text_ink(&theme), fill);
-                assert!(
-                    ratio >= 4.5,
-                    "{tone:?} badge text is {ratio}:1 in {:?}",
-                    theme.appearance_mode
-                );
+                for fill in fills(tone, &theme) {
+                    let ratio = contrast(tone.text_ink(&theme), fill);
+                    assert!(
+                        ratio >= 4.5,
+                        "{tone:?} badge text is {ratio}:1 in {:?} {:?}",
+                        theme.base_tone,
+                        theme.appearance_mode
+                    );
+                }
             }
         }
     }
@@ -503,15 +519,17 @@ mod tests {
     #[test]
     fn the_text_fallback_keeps_the_hue_wherever_the_hue_is_legible() {
         // The fallback must not flatten every badge to gray. Where the hue is
-        // already legible, it is kept.
+        // legible on both surfaces, it is kept.
         let theme = Theme {
             appearance_mode: AppearanceMode::Dark,
             ..Default::default()
         };
         let mut kept = 0;
         for tone in BadgeTone::ALL {
-            let fill = crate::theme::composite(tone.fill(&theme), Colors::bg_elevated(&theme));
-            if contrast(tone.hue(&theme), fill) >= 4.5 {
+            if fills(tone, &theme)
+                .iter()
+                .all(|fill| contrast(tone.hue(&theme), *fill) >= 4.5)
+            {
                 assert_eq!(
                     tone.text_ink(&theme),
                     tone.hue(&theme),
@@ -520,7 +538,9 @@ mod tests {
                 kept += 1;
             }
         }
-        assert!(kept >= 5, "only {kept} tones kept their hue in dark mode");
+        // Neutral and warning. The other dark tints are legible on a panel but
+        // not on a card, and a badge does not know which one it is on.
+        assert!(kept >= 2, "only {kept} tones kept their hue in dark mode");
     }
 
     #[test]

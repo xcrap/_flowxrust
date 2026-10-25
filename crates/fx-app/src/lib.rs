@@ -1770,6 +1770,13 @@ pub fn dispatch_menu_choice(owner: &str, chosen: &str, window: &mut Window, cx: 
         workspace_ui::open_settings(handle.0, window, cx);
         return;
     }
+    // The way ⌘B and ⌘G do it: saved once the panel has moved. Through the
+    // default branch below, both saves ran at the click and cost the slide
+    // its first frames.
+    if matches!(chosen, "sidebar" | "inspector") {
+        shell_action(chosen, cx);
+        return;
+    }
     if sidebar::dispatch_menu_choice(&handle.0, owner, chosen, cx) {
         return;
     }
@@ -2196,13 +2203,46 @@ mod tests {
     }
 
     #[test]
-    fn choosing_sidebar_from_the_menu_toggles_and_saves() {
-        let test = gpui::TestAppContext::single();
+    fn the_workspace_menu_saves_a_panel_toggle_after_the_slide_as_its_shortcut_does() {
+        // The gear menu's toggles went through the default branch, which saved
+        // everything at the click and then saved again: the stutter that
+        // `save_after_panel_moves` exists to avoid for ⌘B and ⌘G.
+        let mut test = gpui::TestAppContext::single();
         let (_dir, state) = test.update(seeded);
-        test.update(|cx| {
-            state.update(cx, |state, _| state.apply_menu_choice("sidebar", "sidebar"))
-        });
-        test.read(|cx| assert!(!state.read(cx).sidebar_visible));
+        test.update(|cx| AppHandle::install(state.clone(), cx));
+        let window = test.add_window(|_, _| gpui::Empty);
+        let saved = |test: &gpui::TestAppContext| {
+            test.read(|cx| {
+                let app = state.read(cx).store.load_app().unwrap();
+                (app.sidebar_visible, app.right_panel_visible)
+            })
+        };
+        let shown = |test: &gpui::TestAppContext| {
+            test.read(|cx| {
+                let state = state.read(cx);
+                (state.sidebar_visible, state.snapshot.right_panel_visible)
+            })
+        };
+        let before = saved(&test);
+        assert_eq!(shown(&test), before);
+        for chosen in ["sidebar", "inspector"] {
+            window
+                .update(&mut test, |_, window, cx| {
+                    dispatch_menu_choice("sidebar", chosen, window, cx)
+                })
+                .unwrap();
+        }
+        assert_eq!(shown(&test), (!before.0, !before.1));
+        assert_eq!(saved(&test), before, "saved while the panels were moving");
+        test.executor().advance_clock(
+            fx_design::theme::FxAnimation::PANEL + std::time::Duration::from_millis(60),
+        );
+        test.run_until_parked();
+        assert_eq!(
+            saved(&test),
+            (!before.0, !before.1),
+            "never saved once moved"
+        );
     }
 
     #[test]

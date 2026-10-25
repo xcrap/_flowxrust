@@ -23,7 +23,9 @@ pub mod surface;
 pub mod tooltip;
 pub mod turn_action;
 
-pub use change_indicator::change_indicator;
+pub use change_indicator::{
+    ChangeIndicatorPalette, change_indicator, change_indicator_palette, change_indicator_surface,
+};
 pub use context_meter::{ContextUsage, context_meter};
 pub use provider_status::{ProviderIdentity, provider_status};
 pub use turn_action::{TurnAction, turn_action_button};
@@ -46,6 +48,7 @@ pub use button::{
     ButtonStyle, ICON_BUTTON_SIZE, IconButtonProps, IconButtonVariant, button, button_palette,
     button_with_icon, choice_row, compact_action_button, compact_action_palette,
     compact_action_toggle, glyph_button, icon_button, icon_button_palette, navigation_button,
+    navigation_palette,
 };
 pub use checkbox::{CheckboxPalette, checkbox, checkbox_palette};
 pub use checklist::{

@@ -42,7 +42,11 @@ impl ArchivedChats {
         let success = self.state.update(cx, |state, cx| {
             let restored = state.set_thread_archived(id, false);
             if restored {
-                state.select_agent(id);
+                // Shown the way ⌘1 or the palette shows a thread: in its
+                // project, opened if it was collapsed, with that project's
+                // provider threads asked for. `select_agent` alone left the
+                // restored chat inside a collapsed project.
+                state.open_thread(id, cx);
                 state.save();
             }
             cx.notify();
@@ -316,5 +320,66 @@ mod tests {
             .unwrap();
         assert_eq!(restored.messages, history.messages);
         assert_eq!(restored.draft_text, "Unsent draft");
+    }
+
+    #[test]
+    fn a_chat_restored_into_a_collapsed_project_is_shown_open_in_it() {
+        // Restoring selected the chat and nothing more, so it came back inside
+        // a project the sidebar still had folded away.
+        let directory = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(directory.path());
+        let open = Agent::new("Open elsewhere");
+        let archived = Agent::new("Archived");
+        let root = |name: &str| {
+            let root = directory.path().join(name);
+            std::fs::create_dir_all(&root).unwrap();
+            root.to_string_lossy().into_owned()
+        };
+        let mut current = Project::new(root("current"));
+        current.agent_order = vec![open.id];
+        let mut folded = Project::new(root("folded"));
+        folded.agent_order = vec![archived.id];
+        let folded_id = folded.id;
+        Store::new(paths.clone())
+            .save_app(&PersistedApp {
+                active_project_id: Some(current.id),
+                active_agent_id: Some(open.id),
+                projects: vec![
+                    PersistedProject {
+                        project: Some(current),
+                        agents: vec![open],
+                        is_expanded: true,
+                        ..Default::default()
+                    },
+                    PersistedProject {
+                        project: Some(folded),
+                        agents: vec![archived.clone()],
+                        archived_agent_ids: vec![archived.id],
+                        is_expanded: false,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            })
+            .unwrap();
+        let test = TestAppContext::single();
+        let (state, archives) = test.update(|cx| {
+            let state = cx.new(|cx| AppState::restore(paths.clone(), cx));
+            let archives = ArchivedChats::new(state.clone(), cx);
+            (state, archives)
+        });
+        test.update(|cx| archives.update(cx, |archives, cx| archives.restore(archived.id, cx)));
+        test.read(|cx| {
+            let state = state.read(cx);
+            assert!(!state.is_thread_archived(archived.id));
+            assert_eq!(state.snapshot.active_project_id, Some(folded_id));
+            assert_eq!(state.snapshot.active_agent_id, Some(archived.id));
+            assert!(
+                state.is_expanded(folded_id),
+                "restored into a folded project"
+            );
+        });
+        let saved = Store::new(paths).load_app().unwrap();
+        assert!(saved.projects[1].is_expanded);
     }
 }

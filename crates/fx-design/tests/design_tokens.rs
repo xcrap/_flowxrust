@@ -9,7 +9,9 @@
 use fx_design::components::context_meter::context_meter_palette;
 use fx_design::components::provider_status::provider_status_palette;
 use fx_design::components::{
-    ActivityState, ChecklistMark, ContextUsage, ProviderIdentity, checklist_ink, checklist_surface,
+    ActivityState, BadgeTone, ChecklistMark, ContextUsage, MenuItem, ProviderIdentity,
+    change_indicator_palette, change_indicator_surface, checklist_ink, checklist_surface,
+    row_palette,
 };
 use fx_design::theme::{
     AccentColor, AppearanceMode, BaseTone, Colors, Rgba, TextSizePreset, Theme, composite,
@@ -208,6 +210,86 @@ fn every_checklist_row_is_legible_on_its_surface_with_every_accent() {
                 assert!(
                     glyph >= 3.0,
                     "{tone:?} {mode:?} {accent:?}: {mark:?} mark is {glyph}:1"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn every_badge_label_clears_aa_on_its_fill_over_every_surface_it_sits_on() {
+    // A badge's fill is translucent, and badges sit on cards (`bgSurface`) as
+    // well as on panels. Measured over the panel alone, the dark "Ready" label
+    // on a provider card was 4.2:1.
+    for (tone, mode) in all_theme_combinations() {
+        for accent in AccentColor::ALL {
+            let t = Theme {
+                accent_color: accent,
+                ..theme_for(tone, mode)
+            };
+            for (surface_name, surface) in surfaces(&t) {
+                for badge in BadgeTone::ALL {
+                    let fill = composite(badge.fill(&t), surface);
+                    let ratio = contrast(badge.text_ink(&t), fill);
+                    assert!(
+                        ratio >= 4.5,
+                        "{tone:?} {mode:?} {accent:?}: the {badge:?} label over {surface_name} is {ratio}:1"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn the_change_counts_clear_aa_on_the_title_bar_selected_or_not() {
+    // 12pt text. Light-mode `success` was 3.4:1 here, and 2.9:1 with the
+    // inspector open; a selected indicator keeps its fill under the pointer.
+    for (tone, mode) in all_theme_combinations() {
+        let t = theme_for(tone, mode);
+        let bar = change_indicator_surface(&t);
+        for selected in [false, true] {
+            let ink = change_indicator_palette(selected, false, &t);
+            for hovered in [false, true] {
+                let fill = composite(
+                    change_indicator_palette(selected, hovered, &t).background,
+                    bar,
+                );
+                for (name, color) in [
+                    ("added", ink.added),
+                    ("removed", ink.removed),
+                    ("files", ink.files),
+                ] {
+                    let ratio = contrast(color, fill);
+                    assert!(
+                        ratio >= 4.5,
+                        "{tone:?} {mode:?}: the {name} count is {ratio}:1 (selected {selected}, hovered {hovered})"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_menu_checkmark_clears_non_text_contrast_with_every_accent() {
+    // The checkmark alone says which choice is current. The raw accent was
+    // 2.15:1 for dark violet on a menu, 1.9:1 hovered.
+    for (tone, mode) in all_theme_combinations() {
+        for accent in AccentColor::ALL {
+            let t = Theme {
+                accent_color: accent,
+                ..theme_for(tone, mode)
+            };
+            let surface = Colors::bg_surface(&t);
+            let item = MenuItem::new("current", "Current").selected(true);
+            for hovered in [false, true] {
+                let palette = row_palette(&item, hovered, &t);
+                let fill = composite(palette.background, surface);
+                let ratio = contrast(palette.check, fill);
+                assert!(
+                    ratio >= 3.0,
+                    "{tone:?} {mode:?} {accent:?}: the checkmark is {ratio}:1 (hovered {hovered})"
                 );
             }
         }
