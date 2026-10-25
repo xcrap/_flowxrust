@@ -104,6 +104,10 @@ pub enum ProviderEvent {
     },
     Approval(ApprovalRequest),
     UserInput(UserInputRequest),
+    /// The agent rewrote its task list. Codex reports its `update_plan` calls
+    /// this way rather than as a tool item; Claude's `TodoWrite` arrives as an
+    /// ordinary tool call instead.
+    PlanUpdated(fx_core::policy::TurnPlan),
     /// Usage for one turn, added to the thread's totals.
     Usage(Usage),
     /// The thread's running totals as the provider counts them, which replace
@@ -121,6 +125,64 @@ pub enum ProviderEvent {
     Done {
         stop_reason: String,
     },
+    /// A background task the turn started — a subagent, or a command run in
+    /// the background — started, reported progress, or finished.
+    Task(TaskUpdate),
+}
+
+/// One report about a background task.
+///
+/// Partial by design: `task_started` names the task, `task_progress` counts its
+/// work, and `task_notification` says how it ended. Each field is `None` where
+/// that report did not carry it, and the receiver keeps what it already knew.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TaskUpdate {
+    /// The provider's own id for the task.
+    pub id: String,
+    /// The tool call that started it.
+    pub tool_use_id: Option<String>,
+    pub description: Option<String>,
+    /// What runs it, in the provider's words: `local_bash`, `local_agent`.
+    pub kind: Option<String>,
+    /// The subagent type, for a task that is an agent.
+    pub subagent_type: Option<String>,
+    pub status: TaskStatus,
+    pub summary: Option<String>,
+    /// The last tool the task used.
+    pub last_tool: Option<String>,
+    pub tool_uses: Option<u64>,
+    pub tokens: Option<u64>,
+    /// How long the task had been running when this was reported.
+    pub duration_ms: Option<u64>,
+}
+
+/// Where a background task is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TaskStatus {
+    #[default]
+    Running,
+    Completed,
+    Failed,
+    /// Killed or stopped before it finished, by the user, the provider, or
+    /// FlowX giving up on it.
+    Stopped,
+}
+
+impl TaskStatus {
+    pub fn is_running(self) -> bool {
+        self == Self::Running
+    }
+
+    /// The provider's word for how a task ended. Anything other than success
+    /// or failure is a stop: `killed`, `stopped`, and whatever a later version
+    /// adds, none of which is a result to report as one.
+    pub fn from_notification(status: &str) -> Self {
+        match status {
+            "completed" => Self::Completed,
+            "failed" => Self::Failed,
+            _ => Self::Stopped,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

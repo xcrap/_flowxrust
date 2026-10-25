@@ -8,6 +8,7 @@ pub mod attachment;
 pub mod button;
 pub mod change_indicator;
 pub mod checkbox;
+pub mod checklist;
 pub mod collapsible;
 pub mod context_menu;
 pub mod context_meter;
@@ -47,6 +48,9 @@ pub use button::{
     compact_action_toggle, glyph_button, icon_button, icon_button_palette, navigation_button,
 };
 pub use checkbox::{CheckboxPalette, checkbox, checkbox_palette};
+pub use checklist::{
+    ChecklistInk, ChecklistMark, checklist, checklist_ink, checklist_row, checklist_surface,
+};
 pub use segmented::{SegmentedOption, segmented_control};
 pub use status::{
     ActivityState, BadgeTone, activity_dot, badge, context_ring_color, context_ring_icon,

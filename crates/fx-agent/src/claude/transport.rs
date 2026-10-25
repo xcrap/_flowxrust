@@ -25,11 +25,15 @@
 //!   afterwards. The Swift original failed a turn whose exit status was non-zero
 //!   *after* a complete answer, discarding a finished response over a status
 //!   code.
-//! - **stdin closes at `result`.** That is not tidiness, it is what makes the
-//!   process exit: a `-p` run that has answered and still holds its input pipe
-//!   open never terminates, so the turn would hang after its own answer. Every
-//!   write after that point is refused rather than dropped into a closed pipe,
-//!   where it would vanish with no error anywhere.
+//! - **stdin closes at a `result` with no background task running.** That is
+//!   not tidiness, it is what makes the process exit: a `-p` run that has
+//!   answered and still holds its input pipe open never terminates, so the turn
+//!   would hang after its own answer. Every write after that point is refused
+//!   rather than dropped into a closed pipe, where it would vanish with no error
+//!   anywhere. While a task runs the input stays open: Claude answers the task's
+//!   notification as a turn of its own, and an open input is what lets the user
+//!   steer meanwhile. Once it closes, Claude still runs any follow-up it has
+//!   queued, waits for tasks a follow-up started, and then exits.
 //! - **stderr is captured, not inherited.** A CLI that cannot start says why
 //!   there, and that text is the only useful diagnostic for a turn that failed
 //!   before saying anything.
@@ -1104,14 +1108,19 @@ async fn deliver_line(
     let (produced, refusal, finished) = {
         let mut parser = inner.parser.lock().await;
         // Completion is the parser's flag and nothing else. There is no second
-        // notion of "finished" here to disagree with it.
+        // notion of "finished" here to disagree with it. Only the line that
+        // sets it counts, because a follow-up turn's `init` clears it again.
+        let was_finished = parser.did_finish();
         let produced = parser.events(line);
         // A control request this parser cannot serve must be *answered*, not
         // merely recorded. Claude blocks on every one of them, so a refusal that
         // is produced but never written leaves the turn hanging forever with no
         // error and no way for the user to tell.
         let refusal = parser.take_refusal();
-        let finished = parser.did_finish();
+        // A background task still running will be reported as a turn of its
+        // own, and the input is what lets that turn be steered: it stays open
+        // until a `result` arrives with nothing left running.
+        let finished = !was_finished && parser.did_finish() && !parser.has_running_tasks();
         (produced, refusal, finished)
     };
     for event in produced {
@@ -2263,6 +2272,83 @@ mod process {
         // Recorded before the item was sent, so a caller that has seen the exit
         // can always ask for it again.
         assert_eq!(transport.exit_reason().await, Some(exit));
+    }
+
+    #[tokio::test]
+    async fn a_result_while_a_background_task_runs_keeps_the_process_for_its_follow_up() {
+        // Claude reports a background task's end as a turn of its own. stdin
+        // used to close at the first `result`, and the session then stopped
+        // the process: the task, its notification and the turn that answered
+        // it were all lost, and nothing said anything was still running.
+        let Some(server) = FakeClaude::new() else {
+            return;
+        };
+        let mut transport = connect(&server).await.expect("started");
+        let reader = transport.reader().await;
+        transport
+            .send_prompt("!background", &[] as &[&Path])
+            .await
+            .expect("written");
+
+        let first = tokio::time::timeout(Duration::from_secs(5), run_to_end(&reader))
+            .await
+            .expect("the first result arrived");
+        assert!(
+            first.iter().any(|event| matches!(event,
+                ProviderEvent::Task(task) if task.id == "task-1" && task.status.is_running())),
+            "{first:?}"
+        );
+        assert!(
+            transport.inner.input.lock().await.is_open(),
+            "the input closed while a task was still running"
+        );
+        assert!(
+            server
+                .exited_within(Duration::from_millis(300))
+                .await
+                .is_none(),
+            "the process ended with a task still running"
+        );
+
+        // The input is live, so the wait can still be steered.
+        transport
+            .send_prompt("while you wait", &[] as &[&Path])
+            .await
+            .expect("a steer is written while the task runs");
+        let steered = tokio::time::timeout(Duration::from_secs(5), run_to_end(&reader))
+            .await
+            .expect("the steer was answered");
+        assert!(
+            steered.contains(&ProviderEvent::TextDelta("while you wait".into())),
+            "{steered:?}"
+        );
+        assert!(transport.inner.input.lock().await.is_open());
+
+        server.release_background();
+        let follow_up = tokio::time::timeout(Duration::from_secs(5), run_to_end(&reader))
+            .await
+            .expect("the follow-up turn arrived");
+        assert!(
+            follow_up.iter().any(|event| matches!(event,
+                ProviderEvent::Task(task) if task.status == crate::provider::TaskStatus::Completed
+                    && task.summary.as_deref().is_some_and(|summary| summary.contains("completed")))),
+            "{follow_up:?}"
+        );
+        assert!(
+            follow_up.contains(&ProviderEvent::TextDelta("finished".into())),
+            "{follow_up:?}"
+        );
+        assert!(
+            follow_up.iter().any(
+                |event| matches!(event, ProviderEvent::Usage(usage) if usage.input_tokens == 7)
+            ),
+            "the follow-up's usage was dropped: {follow_up:?}"
+        );
+        // Nothing is running now, so the input closes and Claude exits.
+        assert!(
+            server.exited_within(Duration::from_secs(5)).await.is_some(),
+            "the process outlived its last task's follow-up"
+        );
     }
 
     #[tokio::test]

@@ -10,6 +10,6 @@ pub mod state;
 
 pub use delta_buffer::{Cadence, DEFAULT_CADENCE, DeltaPolicy};
 pub use state::{
-    Conversation, MAX_RETAINED_MESSAGES, PendingApproval, PendingQuestion, Phase, QuestionOption,
-    QueuedPrompt, RuntimeActivity, TRIVIAL_TOOL_RESULT, UnsentPrompt, UsageTotals,
+    BackgroundTask, Conversation, MAX_RETAINED_MESSAGES, PendingApproval, PendingQuestion, Phase,
+    QuestionOption, QueuedPrompt, RuntimeActivity, TRIVIAL_TOOL_RESULT, UnsentPrompt, UsageTotals,
 };

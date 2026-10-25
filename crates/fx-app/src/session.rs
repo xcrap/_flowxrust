@@ -64,6 +64,8 @@ const THREAD_FAILED: &str = "FlowX could not open a Codex thread.";
 const TURN_FAILED: &str = "FlowX could not run the turn.";
 const WORKER_FAILED: &str = "FlowX could not start a background worker.";
 const ANSWER_FAILED: &str = "FlowX could not deliver your answer to Claude Code.";
+const STEER_AFTER_INPUT_CLOSED: &str =
+    "Claude Code is finishing its background tasks and takes no more guidance this turn.";
 
 /// The prefix `ApprovalPolicy` puts on every refusal it reports.
 const REFUSAL_SENTINEL: &str = "FlowX ";
@@ -376,8 +378,13 @@ impl TurnRunner {
 
         // Claimed before the worker exists. A turn that has been asked for must
         // not read as idle for the few milliseconds the thread takes to start, or
-        // the composer offers to send it again.
-        lock(&job.conversation).set_phase(Phase::Starting);
+        // the composer offers to send it again. The previous turn's background
+        // tasks go with it: they belonged to a process that has exited.
+        {
+            let mut conversation = lock(&job.conversation);
+            conversation.clear_tasks();
+            conversation.set_phase(Phase::Starting);
+        }
 
         // One handle each for the failure path, which needs both after the
         // closure that owns the originals has been handed to `spawn`.
@@ -796,6 +803,7 @@ impl Job {
         };
         let mut args = spec.arguments.clone();
         args.extend(request.arguments());
+        let mut background = BackgroundWait::new(background_ceiling(runtime.environment.iter()));
         let launch = ClaudeLaunch {
             executable: runtime.executable.to_string_lossy().into_owned(),
             args,
@@ -828,15 +836,28 @@ impl Job {
         // A closed channel is ready forever, so selecting on it again would
         // spin a CPU for the rest of the turn. Once it closes it is left out.
         let mut responses_open = true;
+        // Whether the turn ends by stopping the whole process group, which a
+        // turn that gave up on its background tasks has to: they are still
+        // running, in Claude's group.
+        let mut stop_group = false;
         // Silence is not a failure: thinking and long tools can take minutes,
-        // and the parser intentionally omits non-display frames. Only a result,
-        // a provider/process error, a closed stream, or Stop ends this turn.
+        // and the parser intentionally omits non-display frames. Only a result
+        // with no background work outstanding, a provider/process error, a
+        // closed stream, Stop, or the background ceiling ends this turn.
         let ending = loop {
             tokio::select! {
                 _ = interrupts.recv() => {
                     lock(&self.conversation).set_phase(Phase::Cancelling);
                     emit(&self.on_update, SessionUpdate::Changed);
                     break TurnOutcome::Cancelled { thread_id, events: Vec::new() };
+                }
+                // Claude sits idle with tasks running, and has for as long as
+                // its own setting allows: stop waiting, as it would.
+                () = until(background.deadline()) => {
+                    self.stop_waiting(background.ceiling.unwrap_or_default());
+                    stop_group = true;
+                    let stop_reason = background.stop_reason.clone().unwrap_or_default();
+                    break TurnOutcome::Completed { thread_id, stop_reason, events: Vec::new() };
                 }
                 response = responses.recv(), if responses_open => {
                     let Some(response) = response else { responses_open = false; continue; };
@@ -863,14 +884,19 @@ impl Job {
                     }
                 }
                 // Guidance is one more user message on the live stream-json
-                // input: Claude reads stdin for the whole turn.
+                // input: Claude reads stdin for the whole turn, and for as
+                // long as a background task runs after it.
                 Some(steer) = steers.recv() => {
-                    let result = match attachment_files(&steer.attachments) {
-                        Ok(files) => transport
-                            .send_prompt(&steer.text, &files)
-                            .await
-                            .map_err(|error| error.to_string()),
-                        Err(error) => Err(error),
+                    let result = if background.input_closed {
+                        Err(STEER_AFTER_INPUT_CLOSED.to_string())
+                    } else {
+                        match attachment_files(&steer.attachments) {
+                            Ok(files) => transport
+                                .send_prompt(&steer.text, &files)
+                                .await
+                                .map_err(|error| error.to_string()),
+                            Err(error) => Err(error),
+                        }
                     };
                     self.steer_finished(steer, result);
                 }
@@ -905,15 +931,43 @@ impl Job {
                             } else if let ProviderEvent::UserInput(ref request) = event {
                                 waiting.insert(request.id.clone());
                             }
-                            self.apply(event.clone());
                             match event {
-                                ProviderEvent::Done { stop_reason } => break TurnOutcome::Completed { thread_id, stop_reason, events: Vec::new() },
-                                ProviderEvent::Error(reason) => break TurnOutcome::Failed { thread_id, reason, events: Vec::new() },
-                                _ => {}
+                                ProviderEvent::Done { stop_reason } => match background.result(stop_reason.clone()) {
+                                    AfterResult::End => {
+                                        self.apply(ProviderEvent::Done { stop_reason: stop_reason.clone() });
+                                        break TurnOutcome::Completed { thread_id, stop_reason, events: Vec::new() };
+                                    }
+                                    // The prose so far is whole, but the thread is
+                                    // still working: what the tasks found comes
+                                    // back as a turn of its own.
+                                    AfterResult::Wait | AfterResult::Drain => self.apply(ProviderEvent::TextEnd),
+                                },
+                                ProviderEvent::Error(reason) => {
+                                    self.apply(ProviderEvent::Error(reason.clone()));
+                                    break TurnOutcome::Failed { thread_id, reason, events: Vec::new() };
+                                }
+                                ProviderEvent::Task(update) => {
+                                    background.task(&update);
+                                    self.apply(ProviderEvent::Task(update));
+                                }
+                                // `init` opens every turn, an acknowledgement
+                                // that asks the model nothing included, so it is
+                                // not a sign a follow-up is under way.
+                                event @ ProviderEvent::Lifecycle(_) => self.apply(event),
+                                event => {
+                                    background.content();
+                                    self.apply(event);
+                                }
                             }
                         }
-                        Some(StreamItem::Exited(exit)) => break TurnOutcome::Failed { thread_id, reason: exit.reason(), events: Vec::new() },
-                        None => break TurnOutcome::Failed { thread_id, reason: "Claude Code ended before reporting a result.".into(), events: Vec::new() },
+                        Some(StreamItem::Exited(exit)) => match background.completed_at_exit() {
+                            Some(stop_reason) => break TurnOutcome::Completed { thread_id, stop_reason, events: Vec::new() },
+                            None => break TurnOutcome::Failed { thread_id, reason: exit.reason(), events: Vec::new() },
+                        },
+                        None => match background.completed_at_exit() {
+                            Some(stop_reason) => break TurnOutcome::Completed { thread_id, stop_reason, events: Vec::new() },
+                            None => break TurnOutcome::Failed { thread_id, reason: "Claude Code ended before reporting a result.".into(), events: Vec::new() },
+                        },
                     }
                 }
             }
@@ -924,10 +978,10 @@ impl Job {
             emit(&self.on_update, SessionUpdate::Accepted);
         }
         match ending {
-            TurnOutcome::Completed { .. } => transport.close().await,
+            TurnOutcome::Completed { .. } if !stop_group => transport.close().await,
             // Interrupted first, so Claude can end its own turn and tools;
             // then the process group, for whatever did not.
-            TurnOutcome::Cancelled { .. } => {
+            TurnOutcome::Completed { .. } | TurnOutcome::Cancelled { .. } => {
                 let _ = transport.interrupt().await;
                 transport.terminate().await;
             }
@@ -1218,6 +1272,28 @@ impl Job {
         }
     }
 
+    /// Give up on background tasks that outlived Claude's own wait, and say so
+    /// where the reader looks for them.
+    fn stop_waiting(&self, ceiling: Duration) {
+        let note = format!(
+            "Still running after {} of waiting, so FlowX stopped it, as Claude Code would.",
+            spoken_duration(ceiling)
+        );
+        let mut conversation = lock(&self.conversation);
+        let running = conversation.running_task_count();
+        conversation.stop_running_tasks(&note);
+        conversation.record_activity(
+            format!(
+                "Stopped waiting for {running} background {} after {}",
+                if running == 1 { "task" } else { "tasks" },
+                spoken_duration(ceiling)
+            ),
+            false,
+        );
+        drop(conversation);
+        emit(&self.on_update, SessionUpdate::Changed);
+    }
+
     /// Land a finished turn on the conversation and tell the UI.
     fn settle(&self, outcome: &TurnOutcome) {
         self.clear_interactions();
@@ -1227,6 +1303,12 @@ impl Job {
         // would discard the turn's last and often only sentence. `fail` commits
         // for the same reason.
         conversation.commit_streaming();
+        // The process is gone, and the tasks with it. A spinner left on one
+        // would never stop.
+        conversation.stop_running_tasks(match outcome {
+            TurnOutcome::Cancelled { .. } => "Stopped with the turn.",
+            _ => "Ended with the turn.",
+        });
         // `apply` leaves the conversation waiting when it is waiting on the user,
         // and that must survive the turn ending: an open approval is not
         // answered by the turn finishing.
@@ -1256,6 +1338,7 @@ impl Job {
         };
         let mut conversation = lock(&self.conversation);
         conversation.commit_streaming();
+        conversation.stop_running_tasks("Ended when the turn failed.");
         conversation.set_error(reason.clone());
         drop(conversation);
         emit(&self.on_update, SessionUpdate::Failed { reason });
@@ -1276,6 +1359,153 @@ fn lock(conversation: &Mutex<Conversation>) -> MutexGuard<'_, Conversation> {
 
 /// How long a steer already sent may take to be answered once its turn ends.
 const STEER_SETTLE: Duration = Duration::from_secs(2);
+
+/// The variable Claude Code reads for how long a print-mode run waits on
+/// background tasks, in milliseconds; `0` waits indefinitely.
+const BACKGROUND_CEILING_VARIABLE: &str = "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS";
+
+/// Claude Code's own default for that wait.
+const DEFAULT_BACKGROUND_CEILING: Duration = Duration::from_secs(600);
+
+/// How long a Claude turn waits on background tasks, from the environment it
+/// is launched with: the CLI's own setting, read the way the CLI reads it.
+///
+/// The CLI applies it only once its input is closed, and FlowX keeps the input
+/// open while tasks run so the turn can still be steered. So FlowX applies it
+/// instead, from the same setting.
+fn background_ceiling<'a>(
+    mut environment: impl Iterator<Item = (&'a String, &'a String)>,
+) -> Option<Duration> {
+    let configured = environment
+        .find(|(key, _)| key.as_str() == BACKGROUND_CEILING_VARIABLE)
+        .and_then(|(_, value)| value.trim().parse::<u64>().ok());
+    match configured {
+        Some(0) => None,
+        Some(milliseconds) => Some(Duration::from_millis(milliseconds)),
+        None => Some(DEFAULT_BACKGROUND_CEILING),
+    }
+}
+
+/// What a Claude turn knows about the background work it started, in the order
+/// the stream told it.
+///
+/// Claude reports a background task's end as a turn of its own, so a `result`
+/// is not the end of the user's turn while one runs. Kept apart from the loop
+/// so the rules can be read, and tested, without a process.
+#[derive(Debug)]
+struct BackgroundWait {
+    running: std::collections::HashSet<String>,
+    /// A background task started during this turn. Its notification may have
+    /// arrived before a `result` and still be answered after it, so a turn
+    /// that started one reads to the process's exit rather than stopping it.
+    started_any: bool,
+    /// The last `result`'s stop reason.
+    stop_reason: Option<String>,
+    /// No turn is in progress: the last thing Claude said was a `result`.
+    between_turns: bool,
+    /// The transport closed stdin at a `result` with nothing running, and
+    /// Claude will exit once it has answered what it still has queued.
+    input_closed: bool,
+    ceiling: Option<Duration>,
+    /// When FlowX stops waiting, while Claude sits idle with tasks running.
+    deadline: Option<tokio::time::Instant>,
+}
+
+/// What a `result` means for the user's turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AfterResult {
+    /// Nothing was started in the background: the turn is over.
+    End,
+    /// A task is still running; its end will be a turn of its own.
+    Wait,
+    /// Nothing is running, but a follow-up may still be queued. Claude's input
+    /// is closed, so it exits once it is done.
+    Drain,
+}
+
+impl BackgroundWait {
+    fn new(ceiling: Option<Duration>) -> Self {
+        Self {
+            running: std::collections::HashSet::new(),
+            started_any: false,
+            stop_reason: None,
+            between_turns: false,
+            input_closed: false,
+            ceiling,
+            deadline: None,
+        }
+    }
+
+    /// One report about a task.
+    fn task(&mut self, update: &fx_agent::TaskUpdate) {
+        if update.status.is_running() {
+            self.started_any = true;
+            self.running.insert(update.id.clone());
+        } else {
+            self.running.remove(&update.id);
+        }
+    }
+
+    /// Something a turn says: a follow-up, or a steer's answer, is under way.
+    fn content(&mut self) {
+        self.between_turns = false;
+        self.deadline = None;
+    }
+
+    fn result(&mut self, stop_reason: String) -> AfterResult {
+        self.stop_reason = Some(stop_reason);
+        self.between_turns = true;
+        if !self.running.is_empty() {
+            // Measured from each idle `result`, as the CLI measures from each
+            // time it goes idle: a follow-up is progress.
+            self.deadline = self
+                .ceiling
+                .map(|ceiling| tokio::time::Instant::now() + ceiling);
+            return AfterResult::Wait;
+        }
+        self.deadline = None;
+        if self.started_any {
+            self.input_closed = true;
+            AfterResult::Drain
+        } else {
+            AfterResult::End
+        }
+    }
+
+    /// The stop reason to complete with when the process ends, or `None` when
+    /// its ending is a failure: before any `result`, part-way through a
+    /// follow-up, or with tasks running and nobody having asked it to stop.
+    fn completed_at_exit(&self) -> Option<String> {
+        if !self.input_closed || !self.between_turns {
+            return None;
+        }
+        self.stop_reason.clone()
+    }
+
+    fn deadline(&self) -> Option<tokio::time::Instant> {
+        self.deadline
+            .filter(|_| self.between_turns && !self.running.is_empty())
+    }
+}
+
+/// Wait for a deadline, or forever when there is none.
+async fn until(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// A short, readable span for a note the user reads.
+fn spoken_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    match seconds {
+        0 => format!("{} ms", duration.as_millis()),
+        1..=59 => format!("{seconds} s"),
+        _ if seconds.is_multiple_of(60) => format!("{} min", seconds / 60),
+        _ => format!("{} min {} s", seconds / 60, seconds % 60),
+    }
+}
 
 type SteerRequest =
     std::pin::Pin<Box<dyn std::future::Future<Output = (uuid::Uuid, Result<(), String>)> + Send>>;
@@ -2088,13 +2318,57 @@ if sys.argv[1:] == ["agents", "--json"]:
     print(json.dumps([{"sessionId":active,"status":"idle"}] if active else []))
     sys.exit(0)
 
+import subprocess, threading
+SESSION="11111111-2222-4333-8444-555555555555"
+# Background tasks write from their own threads, so a line is never split.
+LOCK=threading.Lock()
+workers=[]
 def send(value):
-    print(json.dumps(value), flush=True)
+    with LOCK: print(json.dumps(value), flush=True)
 def record(value):
     with open("received.jsonl", "a") as log: log.write(json.dumps(value) + "\n")
-def finish(text):
+def finish(text, origin=None):
     send({"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":text}}})
-    send({"type":"result","subtype":"end_turn","session_id":"11111111-2222-4333-8444-555555555555","usage":{"input_tokens":5,"output_tokens":2}})
+    result={"type":"result","subtype":"end_turn","session_id":SESSION,"usage":{"input_tokens":5,"output_tokens":2}}
+    if origin: result.update({"origin":{"kind":origin},"num_turns":1})
+    send(result)
+def init():
+    send({"type":"system","subtype":"init","session_id":SESSION})
+def task_ended():
+    send({"type":"system","subtype":"task_progress","task_id":"task-1","tool_use_id":"tool-bg","description":"review the transport","subagent_type":"general-purpose","usage":{"total_tokens":900,"tool_uses":3,"duration_ms":40},"last_tool_name":"Grep"})
+    send({"type":"system","subtype":"task_notification","task_id":"task-1","tool_use_id":"tool-bg","status":"completed","output_file":"/tmp/task-1","summary":"Agent \"review the transport\" completed","usage":{"total_tokens":1200,"tool_uses":4,"duration_ms":60}})
+def follow_up():
+    # Claude answers a task's notification as a turn of its own.
+    init()
+    finish("finished", "task-notification")
+def background(prompt):
+    # The shape Claude Code 2.1.283 writes for an `Agent` call with
+    # `run_in_background`, as captured from a real run.
+    init()
+    send({"type":"assistant","message":{"content":[{"type":"tool_use","id":"tool-bg","name":"Agent","input":{"description":"review the transport","subagent_type":"general-purpose","run_in_background":True}}]}})
+    send({"type":"system","subtype":"task_started","task_id":"task-1","tool_use_id":"tool-bg","description":"review the transport","subagent_type":"general-purpose","is_backgrounded":True,"task_type":"local_agent"})
+    send({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tool-bg","content":"Async agent launched successfully."}]}})
+    if prompt=="background-spawn":
+        child=subprocess.Popen(["sleep","60"])
+        Path("background.pid").write_text(str(child.pid))
+    if prompt=="background-quick":
+        # The task ends before the turn's own `result`, and its follow-up
+        # still comes after it: what a real run did.
+        task_ended()
+        finish("started")
+        def later():
+            time.sleep(0.2)
+            follow_up()
+        worker=threading.Thread(target=later)
+    else:
+        def later():
+            while not Path("release-background").exists(): time.sleep(0.005)
+            task_ended()
+            follow_up()
+        worker=threading.Thread(target=later, daemon=True)
+        finish("started")
+    worker.start()
+    workers.append(worker)
 record({"args":sys.argv[1:]})
 for line in sys.stdin:
     message=json.loads(line)
@@ -2106,7 +2380,25 @@ for line in sys.stdin:
             send({"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"considering"}}})
             Path(__file__).with_name("thinking").write_text("1")
             continue
-        send({"type":"system","subtype":"init","session_id":"11111111-2222-4333-8444-555555555555"})
+        if prompt=="resumed":
+            # What a resumed session whose background tasks were killed writes
+            # before it reads the prompt: a `stopped` notification per lost
+            # task, then an `init` and a zero-turn `result` per batch.
+            for lost in ("lost-1","lost-2","lost-3"):
+                send({"type":"system","subtype":"task_notification","task_id":lost,"status":"stopped","session_id":SESSION})
+            for _ in range(2):
+                init()
+                send({"type":"result","subtype":"success","is_error":False,"num_turns":0,"duration_api_ms":0,"result":"","stop_reason":None,"origin":{"kind":"task-notification"},"usage":{"input_tokens":0,"output_tokens":0},"session_id":SESSION})
+            Path("preamble-sent").write_text("1")
+            while not Path("release-resumed").exists(): time.sleep(0.005)
+            init()
+            send({"type":"system","subtype":"status","status":"requesting","session_id":SESSION})
+            finish("the real reply")
+            continue
+        if prompt.startswith("background"):
+            background(prompt)
+            continue
+        init()
         if prompt=="hang": continue
         if prompt=="read":
             send({"type":"control_request","request_id":"control-1","request":{"subtype":"can_use_tool","tool_name":"Read","tool_use_id":"tool-1","input":{"file_path":"Cargo.toml"}}})
@@ -2139,6 +2431,8 @@ for line in sys.stdin:
             send({"type":"control_request","request_id":"control-1","request":{"subtype":"can_use_tool","tool_name":tool,"tool_use_id":"tool-1","input":data}})
         else: finish(prompt)
     elif message.get("type")=="control_response": finish("answered")
+# A closed input still waits for running tasks, as Claude's print mode does.
+for worker in workers: worker.join()
 "#).ok()?;
             Some(Self { dir, script, log })
         }
@@ -2170,6 +2464,47 @@ for line in sys.stdin:
             model: &str,
             approvals: ApprovalPolicy,
         ) -> (TurnRunner, Recorder) {
+            self.start_in(
+                conversation,
+                prompt,
+                access,
+                model,
+                approvals,
+                RuntimeDiscovery::default().without_extra_directories(),
+            )
+        }
+
+        /// A turn whose CLI is launched with one more environment variable.
+        fn start_with_variable(
+            &self,
+            conversation: &Arc<Mutex<Conversation>>,
+            prompt: &str,
+            (key, value): (&str, &str),
+        ) -> (TurnRunner, Recorder) {
+            let mut environment: std::collections::BTreeMap<String, String> =
+                std::env::vars().collect();
+            environment.insert(key.into(), value.into());
+            self.start_in(
+                conversation,
+                prompt,
+                AgentAccess::FullAccess,
+                "fixture-model",
+                ApprovalPolicy::Ask,
+                RuntimeDiscovery::default()
+                    .without_extra_directories()
+                    .with_environment(environment),
+            )
+        }
+
+        fn start_in(
+            &self,
+            conversation: &Arc<Mutex<Conversation>>,
+            prompt: &str,
+            access: AgentAccess,
+            model: &str,
+            approvals: ApprovalPolicy,
+            discovery: RuntimeDiscovery,
+        ) -> (TurnRunner, Recorder) {
             let mut agent = Agent::new("Claude");
             agent.configuration.provider_id = Some("claude".into());
             agent.configuration.model_id = Some(model.into());
@@ -2177,7 +2512,7 @@ for line in sys.stdin:
             agent.configuration.system_prompt = Some("fixture instructions".into());
             agent.configuration.agent_access = Some(access);
             let provider = RuntimeProvider::Claude {
-                discovery: RuntimeDiscovery::default().without_extra_directories(),
+                discovery,
                 spec: BinarySpec::new("claude", "Claude Code", vec![FakeServer::python().unwrap()])
                     .with_arguments(vec![self.script.display().to_string()]),
             };
@@ -3387,6 +3722,306 @@ for line in sys.stdin:
             .collect();
         assert_eq!(users.len(), 2, "{received:?}");
         assert_eq!(users[1]["message"]["content"][0]["text"], "use zsh");
+    }
+
+    /// Poll until `ready`, failing with the updates so far if it never is.
+    fn wait_until(recorder: &Recorder, what: &str, ready: impl Fn() -> bool) {
+        let deadline = Instant::now() + TURN_BUDGET;
+        while !ready() {
+            assert!(
+                Instant::now() < deadline,
+                "{what} never happened: {:?}",
+                recorder.updates()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn ended(recorder: &Recorder) -> bool {
+        recorder.updates().iter().any(|update| {
+            matches!(
+                update,
+                SessionUpdate::Finished { .. } | SessionUpdate::Failed { .. }
+            )
+        })
+    }
+
+    /// Wait until the first `result` has landed with the task still running.
+    fn wait_for_the_background_wait(conversation: &Mutex<Conversation>, recorder: &Recorder) {
+        wait_until(recorder, "the first result with a task running", || {
+            let conversation = lock(conversation);
+            conversation.has_running_tasks()
+                && conversation.last_text().as_deref() == Some("started")
+        });
+        // Long enough for a runner that wrongly ended at that `result` to say so.
+        std::thread::sleep(Duration::from_millis(300));
+    }
+
+    #[test]
+    fn claude_keeps_the_turn_through_a_background_task_and_lands_its_follow_up() {
+        // The turn used to end at the first `result` and stop Claude, which
+        // killed the six reviews it had started in the background. Their
+        // results never came back and the thread read as ready.
+        let Some(server) = ClaudeFixture::new() else {
+            return;
+        };
+        let conversation = conversation();
+        let (runner, recorder) = server.start(&conversation, "background", AgentAccess::FullAccess);
+        wait_for_the_background_wait(&conversation, &recorder);
+        assert!(!ended(&recorder), "the turn ended with a task running");
+        assert_eq!(lock(&conversation).phase(), Phase::Running);
+
+        // Waiting is not over, so guidance still goes to the live input.
+        let id = Uuid::new_v4();
+        assert!(runner.steer(id, "use zsh".into(), Vec::new()));
+        wait_until(&recorder, "the steer's answer", || {
+            recorder
+                .updates()
+                .contains(&SessionUpdate::Steered { id, result: Ok(()) })
+                && rows(&conversation)
+                    .iter()
+                    .filter(|row| *row == "text: use zsh")
+                    .count()
+                    == 2
+        });
+        assert!(!ended(&recorder), "the steer's result ended the turn");
+
+        std::fs::write(server.dir.path().join("release-background"), "go").unwrap();
+        let updates = recorder.wait_for_end(TURN_BUDGET);
+        assert!(
+            matches!(updates.last(), Some(SessionUpdate::Finished { outcome }) if outcome.is_completed()),
+            "{updates:?}"
+        );
+        let rows = rows(&conversation);
+        assert_eq!(
+            rows[rows.len() - 4..],
+            [
+                "text: started",
+                "text: use zsh",
+                "text: use zsh",
+                "text: finished"
+            ],
+            "{rows:?}"
+        );
+        let conversation = lock(&conversation);
+        assert_eq!(conversation.phase(), Phase::Idle);
+        let [task] = conversation.tasks() else {
+            panic!("{:?}", conversation.tasks())
+        };
+        assert_eq!(task.status, fx_agent::TaskStatus::Completed);
+        assert_eq!(task.subagent_type.as_deref(), Some("general-purpose"));
+        assert_eq!(task.tool_uses, Some(4));
+        assert!(
+            task.summary
+                .as_deref()
+                .is_some_and(|summary| summary.contains("completed"))
+        );
+        // Every turn's usage: the first, the steer's, and the follow-up's.
+        assert_eq!(conversation.usage().input_tokens, 15);
+    }
+
+    #[test]
+    fn claude_reads_past_a_result_to_the_follow_up_of_a_task_that_already_ended() {
+        // What a real run did: the task ended before the turn's `result`, and
+        // Claude answered its notification after it. Stopping at that
+        // `result` lost the answer.
+        let Some(server) = ClaudeFixture::new() else {
+            return;
+        };
+        let conversation = conversation();
+        let (_runner, recorder) =
+            server.start(&conversation, "background-quick", AgentAccess::FullAccess);
+        let updates = recorder.wait_for_end(TURN_BUDGET);
+        assert!(
+            matches!(updates.last(), Some(SessionUpdate::Finished { outcome }) if outcome.is_completed()),
+            "{updates:?}"
+        );
+        assert_eq!(
+            rows(&conversation).last().map(String::as_str),
+            Some("text: finished"),
+            "{:?}",
+            rows(&conversation)
+        );
+    }
+
+    #[test]
+    fn stopping_claude_while_it_waits_on_a_background_task_ends_the_process_group() {
+        let Some(server) = ClaudeFixture::new() else {
+            return;
+        };
+        let conversation = conversation();
+        let (runner, recorder) =
+            server.start(&conversation, "background-spawn", AgentAccess::FullAccess);
+        let pid: libc::pid_t = wait_for_file(&server.dir.path().join("background.pid"))
+            .trim()
+            .parse()
+            .unwrap();
+        let _reap = KillOnDrop(pid);
+        wait_for_the_background_wait(&conversation, &recorder);
+        assert!(!ended(&recorder), "{:?}", recorder.updates());
+
+        runner.interrupt();
+        let updates = recorder.wait_for_end(TURN_BUDGET);
+        assert!(
+            matches!(
+                updates.last(),
+                Some(SessionUpdate::Finished {
+                    outcome: TurnOutcome::Cancelled { .. }
+                })
+            ),
+            "{updates:?}"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while is_running(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!is_running(pid), "the background task outlived Stop");
+        let conversation = lock(&conversation);
+        assert!(!conversation.has_running_tasks());
+        assert_eq!(
+            conversation.tasks()[0].summary.as_deref(),
+            Some("Stopped with the turn.")
+        );
+    }
+
+    #[test]
+    fn claude_stops_waiting_on_background_tasks_at_the_clis_own_ceiling() {
+        let Some(server) = ClaudeFixture::new() else {
+            return;
+        };
+        let conversation = conversation();
+        let (_runner, recorder) = server.start_with_variable(
+            &conversation,
+            "background-spawn",
+            (BACKGROUND_CEILING_VARIABLE, "400"),
+        );
+        let pid: libc::pid_t = wait_for_file(&server.dir.path().join("background.pid"))
+            .trim()
+            .parse()
+            .unwrap();
+        let _reap = KillOnDrop(pid);
+        let updates = recorder.wait_for_end(TURN_BUDGET);
+        // Graceful: the turn's answer stands, and the note says what happened.
+        assert!(
+            matches!(updates.last(), Some(SessionUpdate::Finished { outcome }) if outcome.is_completed()),
+            "{updates:?}"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while is_running(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!is_running(pid), "the task outlived the ceiling");
+        let conversation = lock(&conversation);
+        let task = &conversation.tasks()[0];
+        assert_eq!(task.status, fx_agent::TaskStatus::Stopped);
+        assert!(
+            task.summary
+                .as_deref()
+                .is_some_and(|note| note.contains("400 ms")),
+            "{:?}",
+            task.summary
+        );
+        assert!(conversation.activities().any(|activity| {
+            activity
+                .summary
+                .contains("Stopped waiting for 1 background task")
+        }),);
+    }
+
+    #[test]
+    fn a_resumed_claude_session_ends_at_the_real_result_not_at_a_lost_tasks_acknowledgement() {
+        // Resuming a session whose background tasks were killed opens with a
+        // `stopped` notification per task and a zero-turn `result` per batch.
+        // The first of those used to end the turn before Claude had read the
+        // prompt, so the reply that followed landed nowhere.
+        let Some(server) = ClaudeFixture::new() else {
+            return;
+        };
+        let conversation = conversation();
+        let (_runner, recorder) = server.start(&conversation, "resumed", AgentAccess::FullAccess);
+        wait_for_file(&server.dir.path().join("preamble-sent"));
+        std::thread::sleep(Duration::from_millis(300));
+        let updates = recorder.updates();
+        assert!(!ended(&recorder), "{updates:?}");
+        assert!(
+            !updates.contains(&SessionUpdate::Accepted),
+            "the preamble was taken for Claude reading the prompt"
+        );
+        assert!(
+            lock(&conversation).tasks().is_empty(),
+            "a task the previous process lost was shown as this turn's"
+        );
+
+        std::fs::write(server.dir.path().join("release-resumed"), "go").unwrap();
+        let updates = recorder.wait_for_end(TURN_BUDGET);
+        assert!(
+            matches!(updates.last(), Some(SessionUpdate::Finished { outcome }) if outcome.is_completed()),
+            "{updates:?}"
+        );
+        assert!(updates.contains(&SessionUpdate::Accepted));
+        assert_eq!(rows(&conversation), vec!["text: the real reply"]);
+    }
+
+    #[test]
+    fn a_background_wait_ends_only_when_nothing_is_left_to_answer() {
+        let task = |id: &str, status| fx_agent::TaskUpdate {
+            id: id.into(),
+            status,
+            ..Default::default()
+        };
+        // A plain turn ends at its result.
+        let mut wait = BackgroundWait::new(Some(Duration::from_secs(1)));
+        assert_eq!(wait.result("end_turn".into()), AfterResult::End);
+
+        // A running task holds it, and arms the ceiling while Claude is idle.
+        let mut wait = BackgroundWait::new(Some(Duration::from_secs(1)));
+        wait.task(&task("a", fx_agent::TaskStatus::Running));
+        assert_eq!(wait.result("end_turn".into()), AfterResult::Wait);
+        assert!(wait.deadline().is_some());
+        assert_eq!(
+            wait.completed_at_exit(),
+            None,
+            "an exit with a task running and the input open is a failure"
+        );
+        // A follow-up under way is progress, not idleness.
+        wait.content();
+        assert!(wait.deadline().is_none());
+        wait.task(&task("a", fx_agent::TaskStatus::Completed));
+        assert_eq!(wait.result("end_turn".into()), AfterResult::Drain);
+        assert!(wait.deadline().is_none());
+        assert_eq!(wait.completed_at_exit().as_deref(), Some("end_turn"));
+        // Dying part-way through a follow-up is not a completion.
+        wait.content();
+        assert_eq!(wait.completed_at_exit(), None);
+
+        // No ceiling configured means waiting indefinitely.
+        let mut wait = BackgroundWait::new(None);
+        wait.task(&task("a", fx_agent::TaskStatus::Running));
+        wait.result("end_turn".into());
+        assert!(wait.deadline().is_none());
+    }
+
+    #[test]
+    fn the_background_ceiling_is_the_clis_own_setting() {
+        let read = |pairs: &[(&str, &str)]| {
+            let environment: std::collections::BTreeMap<String, String> = pairs
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect();
+            background_ceiling(environment.iter())
+        };
+        assert_eq!(read(&[]), Some(DEFAULT_BACKGROUND_CEILING));
+        assert_eq!(
+            read(&[(BACKGROUND_CEILING_VARIABLE, "1500")]),
+            Some(Duration::from_millis(1500))
+        );
+        assert_eq!(read(&[(BACKGROUND_CEILING_VARIABLE, "0")]), None);
+        assert_eq!(
+            read(&[(BACKGROUND_CEILING_VARIABLE, "soon")]),
+            Some(DEFAULT_BACKGROUND_CEILING)
+        );
+        assert_eq!(spoken_duration(Duration::from_secs(600)), "10 min");
+        assert_eq!(spoken_duration(Duration::from_millis(400)), "400 ms");
     }
 
     #[test]

@@ -1,8 +1,10 @@
 //! The conversation transcript.
 //!
 //! Everything a turn produced, in the order it was produced: the prose the
-//! model wrote, the tool traffic folded into a disclosure, the reply still
-//! streaming in, and whatever the provider is blocked on.
+//! model wrote, the tool traffic folded into a disclosure, the agent's own
+//! plan as a checklist, the reply still streaming in, and whatever the provider
+//! is blocked on. While a turn runs, its live group also says what it is doing
+//! this moment and for how long, on a clock that ticks once a second.
 //!
 //! Three decisions are borrowed rather than re-made here, because each of them
 //! is load-bearing somewhere else and a second copy is a second place to be
@@ -52,29 +54,31 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::time::{Duration, Instant};
 
 use crate::attachments::{ImageInput, clipboard_image, preview as image_attachment};
 use crate::selection::{self, Paragraph, SelectableText};
-use fx_agent::Phase;
 use fx_agent::conversation::state::RiskLevelSerde;
-use fx_agent::conversation::{PendingApproval, PendingQuestion, QuestionOption};
+use fx_agent::conversation::{BackgroundTask, PendingApproval, PendingQuestion, QuestionOption};
+use fx_agent::{Phase, TaskStatus};
 use fx_core::Timestamp;
 use fx_core::policy::conversation_scroll::{ConversationScrollPolicy, ScrollMetrics};
 use fx_core::policy::transcript_grouping::{QUESTION_TOOL_NAME, TranscriptActivityGroupingPolicy};
 use fx_core::policy::transcript_presentation::{MentionedAttachment, user_prompt};
+use fx_core::policy::{PlanStatus, TurnPlan};
 use fx_core::{ConversationMessage, MessageContent, MessageRole};
 use fx_design::components::button::text_disclosure;
 use fx_design::components::surface::banner;
 use fx_design::components::{
-    BadgeTone, ButtonStyle, DividerAxis, MenuItem, MenuModel, MenuSection, badge, button,
-    compact_action_button, context_region, divider_with_axis, empty_state, panel, spinner_arc,
-    typing_indicator,
+    BadgeTone, ButtonStyle, ChecklistMark, DividerAxis, MenuItem, MenuModel, MenuSection, badge,
+    button, card, checklist, checklist_row, compact_action_button, context_region,
+    divider_with_axis, empty_state, panel, spinner_arc, typing_indicator,
 };
 use fx_design::icon::Icon;
 use fx_design::styled::{FxRefinement, FxStyled, px_len};
 use fx_design::theme::{
-    BorderWidth, Colors, IconSize, Layout, Radii, Spacing, TextRole, TextSizePreset, Typography,
-    WithAlpha, global,
+    BorderWidth, Colors, FxAnimation, IconSize, Layout, Radii, Spacing, TextRole, TextSizePreset,
+    Typography, WithAlpha, global,
 };
 use gpui::prelude::*;
 use gpui::{
@@ -97,7 +101,18 @@ const PROMPT_BODY_SELECTOR: &str = "transcript.prompt-body";
 const PROMPT_TOGGLE_SELECTOR: &str = "transcript.prompt-toggle";
 const MESSAGE_COPY_SELECTOR: &str = "transcript.copy-message";
 const STREAMING_SELECTOR: &str = "transcript.streaming";
+/// A group's title, followed by the title itself, so a test can read it.
+const ACTIVITY_TITLE_PREFIX: &str = "transcript.activity-title:";
+/// The step a live group is on, under its header.
+const LIVE_STEP_SELECTOR: &str = "transcript.live-step";
+/// The turn's task list.
+const PLAN_SELECTOR: &str = "transcript.plan";
+const TASKS_SELECTOR: &str = "transcript.background-tasks";
 const ACTIVITY_PAGE_SIZE: usize = 20;
+
+/// How often a running background task's clock is redrawn: once a second,
+/// which is the resolution it shows, rather than once a frame.
+const TASK_CLOCK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// How far past the viewport, above and below, rows are measured without
 /// being drawn.
@@ -170,6 +185,14 @@ const CARET_FADED_OPACITY: f32 = 0.25;
 /// stream does not turn this into a frame per delta.
 const CARET_BLINK_PASSES: u32 = 8;
 
+const MICROS_PER_SECOND: i64 = 1_000_000;
+
+/// How far past a turned second a clock's tick lands.
+///
+/// A tick timed to the second exactly can read the clock a hair early, and
+/// draw the second it was meant to replace.
+const CLOCK_TICK_MARGIN: std::time::Duration = std::time::Duration::from_millis(5);
+
 // ── Per-thread UI state ────────────────────────────────────────────────────
 
 /// State this view owns because nothing above it can hold it yet.
@@ -225,12 +248,19 @@ struct ThreadMemory {
     pruned_at: Option<(u64, u64)>,
     /// The blink phase the last caret frame was requested for.
     blink_requested_at: Option<u32>,
+    /// Whether a clock tick is already scheduled, so a running turn has one
+    /// timer at a time however often it is drawn.
+    tick_pending: bool,
     /// The messages the last pass rendered, shared with the next one. Only the
     /// thread on screen keeps these: a handle held for a thread the reader
     /// left would keep messages alive that its conversation has since dropped.
     messages: Option<SharedMessages>,
     /// The streamed text the last pass rendered, with its revision.
     streaming: Option<(u64, Rc<str>)>,
+    /// The background tasks the last pass rendered, with their revision.
+    tasks: Option<(u64, Rc<[BackgroundTask]>)>,
+    /// Whether a redraw for a running task's clock is already on its way.
+    clock_pending: bool,
     /// Prompts the reader expanded past "Show more". Bounded by what the reader
     /// clicked, and forgotten with the thread.
     expanded_prompts: HashSet<Uuid>,
@@ -255,8 +285,11 @@ impl ThreadMemory {
             focus: None,
             pruned_at: None,
             blink_requested_at: None,
+            tick_pending: false,
             messages: None,
             streaming: None,
+            tasks: None,
+            clock_pending: false,
             expanded_prompts: HashSet::new(),
             copied: None,
         }
@@ -334,7 +367,14 @@ impl ThreadMemory {
                     let head = match plan {
                         RowPlan::Message(index) => *index,
                         RowPlan::Activity { messages, .. } => messages.start,
-                        RowPlan::Tail | RowPlan::Failure => return None,
+                        // Neither card has selectable text, so nothing is keyed
+                        // to it.
+                        RowPlan::Plan { .. }
+                        | RowPlan::Tail
+                        | RowPlan::Tasks
+                        | RowPlan::Failure => {
+                            return None;
+                        }
                     };
                     Some((messages[head].id, row))
                 })
@@ -427,6 +467,7 @@ fn release_hidden_messages(shown: Uuid) {
             if *id != shown {
                 thread.messages = None;
                 thread.streaming = None;
+                thread.tasks = None;
             }
         }
     });
@@ -590,35 +631,56 @@ enum RowPlan {
         /// Whether this is the tail of a turn that is still running.
         is_active: bool,
     },
+    /// The turn's task list, as the agent last wrote it: an index into the
+    /// snapshot's messages, at the message holding the latest plan call.
+    Plan {
+        message: usize,
+        /// Whether its turn is still running, which is what spins the step in
+        /// progress.
+        is_live: bool,
+    },
     /// The reply still being written, or the indicator standing in for one.
     Tail,
+    /// The latest turn's background tasks, running and finished.
+    ///
+    /// After the tail, so a follow-up's reply streams in above the block and
+    /// commits where it streamed instead of jumping over it.
+    Tasks,
     /// The failed turn's banner.
     Failure,
 }
 
-/// Every row one pass shows: the messages' rows, then the live tail and the
-/// failure banner when there are any.
+/// Every row one pass shows: the messages' rows, then the live tail, the
+/// background tasks and the failure banner when there are any.
 #[derive(Clone)]
 struct Rows {
     plan: Rc<[RowPlan]>,
     tail: bool,
+    tasks: bool,
     failure: bool,
 }
 
 impl Rows {
     fn len(&self) -> usize {
-        self.plan.len() + usize::from(self.tail) + usize::from(self.failure)
+        self.plan.len()
+            + usize::from(self.tail)
+            + usize::from(self.tasks)
+            + usize::from(self.failure)
     }
 
     fn get(&self, index: usize) -> Option<RowPlan> {
         if let Some(row) = self.plan.get(index) {
             return Some(row.clone());
         }
-        match (index - self.plan.len(), self.tail, self.failure) {
-            (0, true, _) => Some(RowPlan::Tail),
-            (0, false, true) | (1, true, true) => Some(RowPlan::Failure),
-            _ => None,
-        }
+        [
+            (self.tail, RowPlan::Tail),
+            (self.tasks, RowPlan::Tasks),
+            (self.failure, RowPlan::Failure),
+        ]
+        .into_iter()
+        .filter(|(shown, _)| *shown)
+        .map(|(_, row)| row)
+        .nth(index - self.plan.len())
     }
 
     fn tail_index(&self) -> Option<usize> {
@@ -650,7 +712,16 @@ impl Rows {
                         is_active,
                     }
                 }
+                RowPlan::Plan { message, is_live } => {
+                    let message = &snapshot.messages[message];
+                    RowStamp::Plan {
+                        id: message.id,
+                        message: Arc::downgrade(message),
+                        is_live,
+                    }
+                }
                 RowPlan::Tail => RowStamp::Tail(snapshot.streaming_revision),
+                RowPlan::Tasks => RowStamp::Tasks(snapshot.tasks_revision),
                 RowPlan::Failure => RowStamp::Failure(snapshot.error.clone(), snapshot.recovery),
             })
             .collect()
@@ -674,7 +745,15 @@ enum RowStamp {
         messages: usize,
         is_active: bool,
     },
+    Plan {
+        id: Uuid,
+        message: Weak<ConversationMessage>,
+        is_live: bool,
+    },
     Tail(u64),
+    /// The tasks' revision. A running task's clock does not move it: the
+    /// clock changes what a line says, not how many lines there are.
+    Tasks(u64),
     Failure(Option<String>, RecoveryFacts),
 }
 
@@ -683,8 +762,11 @@ impl RowStamp {
     fn same_row(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Message { id: a, .. }, Self::Message { id: b, .. })
-            | (Self::Activity { id: a, .. }, Self::Activity { id: b, .. }) => a == b,
-            (Self::Tail(_), Self::Tail(_)) | (Self::Failure(..), Self::Failure(..)) => true,
+            | (Self::Activity { id: a, .. }, Self::Activity { id: b, .. })
+            | (Self::Plan { id: a, .. }, Self::Plan { id: b, .. }) => a == b,
+            (Self::Tail(_), Self::Tail(_))
+            | (Self::Tasks(_), Self::Tasks(_))
+            | (Self::Failure(..), Self::Failure(..)) => true,
             _ => false,
         }
     }
@@ -710,7 +792,19 @@ impl PartialEq for RowStamp {
                     ..
                 },
             ) => Weak::ptr_eq(a, b) && a_messages == b_messages && a_active == b_active,
-            (Self::Tail(a), Self::Tail(b)) => a == b,
+            (
+                Self::Plan {
+                    message: a,
+                    is_live: a_live,
+                    ..
+                },
+                Self::Plan {
+                    message: b,
+                    is_live: b_live,
+                    ..
+                },
+            ) => Weak::ptr_eq(a, b) && a_live == b_live,
+            (Self::Tail(a), Self::Tail(b)) | (Self::Tasks(a), Self::Tasks(b)) => a == b,
             (Self::Failure(a, a_facts), Self::Failure(b, b_facts)) => a == b && a_facts == b_facts,
             _ => false,
         }
@@ -805,6 +899,9 @@ struct ToolCall<'a> {
     /// that said nothing is never recorded, so a finished call can sit here with
     /// no result at all. The engine's completed-id memory settles that case.
     result_recorded: bool,
+    /// When the call was made: its message's timestamp, which the engine stamps
+    /// as the call arrives.
+    started: Timestamp,
 }
 
 /// What a group's header reports.
@@ -857,21 +954,97 @@ fn plan_turn(
     // the runner waited on that lock for each streamed delta.
     let runs = TranscriptActivityGroupingPolicy::runs(messages[turn.clone()].iter().copied());
     let last = runs.len().saturating_sub(1);
+    // Where the plan goes: straight after the turn's last burst of work. That
+    // is the end of the transcript while the turn runs, and stays put when the
+    // final answer lands below it.
+    let mut plan_at = None;
     for (index, (range, is_activity)) in runs.into_iter().enumerate() {
         let range = turn.start + range.start..turn.start + range.end;
         if !is_activity {
             rows.extend(range.map(RowPlan::Message));
             continue;
         }
-        // Only the last segment of a running turn is live. Anything else has
-        // already been overtaken by what follows it, and holding it open would
-        // leave a spinner running on settled work.
-        rows.push(RowPlan::Activity {
-            messages: range,
-            index,
-            is_active: is_running && index == last,
-        });
+        // A burst that only rewrote the plan is drawn as the plan, not as a
+        // group with nothing in it.
+        if !is_plan_only(&messages[range.clone()]) {
+            // Only the last segment of a running turn is live. Anything else
+            // has already been overtaken by what follows it, and holding it
+            // open would leave a spinner running on settled work.
+            rows.push(RowPlan::Activity {
+                messages: range,
+                index,
+                is_active: is_running && index == last,
+            });
+        }
+        plan_at = Some(rows.len());
     }
+    if let Some(message) = latest_plan(messages, turn) {
+        rows.insert(
+            plan_at.unwrap_or(rows.len()),
+            RowPlan::Plan {
+                message,
+                is_live: is_running,
+            },
+        );
+    }
+}
+
+/// The plan a message's latest plan call wrote, if it wrote one that reads.
+fn message_plan(message: &ConversationMessage) -> Option<TurnPlan> {
+    message.content.iter().rev().find_map(|block| match block {
+        MessageContent::ToolUse { name, input, .. } => TurnPlan::from_tool_call(name, input),
+        _ => None,
+    })
+}
+
+/// Whether a call is a plan update the plan card stands in for.
+///
+/// Only one that reads: a plan call whose arguments do not parse stays an
+/// ordinary row, so the reader still sees that it happened.
+fn is_plan_call(name: &str, input: &str) -> bool {
+    TurnPlan::from_tool_call(name, input).is_some()
+}
+
+/// The message holding a turn's latest plan, when that plan has any steps.
+///
+/// An empty latest plan is the agent clearing its list, so it shows nothing
+/// rather than the list it replaced.
+fn latest_plan(messages: &[&ConversationMessage], turn: Range<usize>) -> Option<usize> {
+    turn.rev().find_map(|index| {
+        let plan = message_plan(messages[index])?;
+        Some((!plan.is_empty()).then_some(index))
+    })?
+}
+
+/// Whether a run of tool traffic is nothing but plan updates and their results.
+fn is_plan_only(messages: &[&ConversationMessage]) -> bool {
+    let mut plans: HashSet<&str> = HashSet::new();
+    for block in messages.iter().flat_map(|message| &message.content) {
+        match block {
+            MessageContent::ToolUse { id, name, input } if is_plan_call(name, input) => {
+                plans.insert(id.as_str());
+            }
+            MessageContent::ToolResult { id, .. } if plans.contains(id.as_str()) => {}
+            _ => return false,
+        }
+    }
+    !plans.is_empty()
+}
+
+/// Whether the plan names a live activity group.
+///
+/// Only the last segment of the last turn can be live, and the plan card is
+/// the only row that can follow it, so only the last two rows need looking at.
+fn has_active_group(plan: &[RowPlan]) -> bool {
+    plan.iter().rev().take(2).any(|row| {
+        matches!(
+            row,
+            RowPlan::Activity {
+                is_active: true,
+                ..
+            }
+        )
+    })
 }
 
 /// The group an activity row names, built only while the row is drawn or its
@@ -922,7 +1095,7 @@ fn build_rows<'a>(
                 index,
                 is_active,
             ))),
-            RowPlan::Tail | RowPlan::Failure => None,
+            RowPlan::Plan { .. } | RowPlan::Tail | RowPlan::Tasks | RowPlan::Failure => None,
         })
         .collect()
 }
@@ -946,11 +1119,18 @@ fn tool_calls<'a>(messages: &[&'a ConversationMessage]) -> Vec<ToolCall<'a>> {
     // Calls with no id cannot be keyed, and two of them would collide on an empty
     // string. They keep their own row instead, which is what the id is for.
     let mut index_by_id: HashMap<&str, usize> = HashMap::new();
+    // Plan updates are drawn as the plan card, so neither the call nor its
+    // result is a row here.
+    let mut plans: HashSet<&str> = HashSet::new();
 
     for message in messages {
         for block in &message.content {
             match block {
                 MessageContent::ToolUse { id, name, input } => {
+                    if is_plan_call(name, input) {
+                        plans.insert(id.as_str());
+                        continue;
+                    }
                     if !id.is_empty() {
                         index_by_id.insert(id.as_str(), calls.len());
                     }
@@ -961,6 +1141,7 @@ fn tool_calls<'a>(messages: &[&'a ConversationMessage]) -> Vec<ToolCall<'a>> {
                         output: None,
                         is_error: false,
                         result_recorded: false,
+                        started: message.timestamp,
                     });
                 }
                 MessageContent::ToolResult {
@@ -968,6 +1149,9 @@ fn tool_calls<'a>(messages: &[&'a ConversationMessage]) -> Vec<ToolCall<'a>> {
                     content,
                     is_error,
                 } => {
+                    if plans.contains(id.as_str()) {
+                        continue;
+                    }
                     let Some(position) = index_by_id.get(id.as_str()).copied() else {
                         calls.push(ToolCall {
                             id: id.clone(),
@@ -976,6 +1160,7 @@ fn tool_calls<'a>(messages: &[&'a ConversationMessage]) -> Vec<ToolCall<'a>> {
                             output: Some(content),
                             is_error: *is_error,
                             result_recorded: true,
+                            started: message.timestamp,
                         });
                         continue;
                     };
@@ -994,11 +1179,13 @@ fn tool_calls<'a>(messages: &[&'a ConversationMessage]) -> Vec<ToolCall<'a>> {
 fn summarize(messages: &[&ConversationMessage]) -> ActivitySummary {
     let mut summary = ActivitySummary::default();
     let mut earliest: Option<Timestamp> = None;
+    // A plan update is bookkeeping the plan card shows, not an action.
+    let mut plans: HashSet<&str> = HashSet::new();
 
     for message in messages {
         for block in &message.content {
             match block {
-                MessageContent::ToolUse { name, .. } => {
+                MessageContent::ToolUse { id, name, input } => {
                     // The question tool is not background work — it is the
                     // transcript asking the reader something — and the grouping
                     // policy already keeps it out of the group, so it cannot
@@ -1007,12 +1194,18 @@ fn summarize(messages: &[&ConversationMessage]) -> ActivitySummary {
                     if name.eq_ignore_ascii_case(QUESTION_TOOL_NAME) {
                         continue;
                     }
+                    if is_plan_call(name, input) {
+                        plans.insert(id.as_str());
+                        continue;
+                    }
                     summary.calls += 1;
                     if name.eq_ignore_ascii_case("Edit") || name.eq_ignore_ascii_case("Write") {
                         summary.edits += 1;
                     }
                 }
-                MessageContent::ToolResult { is_error: true, .. } => summary.failures += 1,
+                MessageContent::ToolResult {
+                    id, is_error: true, ..
+                } if !plans.contains(id.as_str()) => summary.failures += 1,
                 _ => {}
             }
         }
@@ -1066,6 +1259,16 @@ pub(crate) struct Snapshot {
     /// worth recording. Only a live group asks, so nothing earlier is copied.
     completed_tools: HashSet<String>,
     recovery: RecoveryFacts,
+    /// When the running turn began, and when it last moved on. `None` once
+    /// the turn has settled: nothing settled shows a running clock.
+    turn_started_at: Option<Timestamp>,
+    step_started_at: Option<Timestamp>,
+    /// What the pass measures elapsed times against.
+    clock: Clock,
+    /// The latest turn's background tasks, shared with the previous pass's
+    /// until one of them reports something.
+    tasks: Rc<[BackgroundTask]>,
+    tasks_revision: u64,
 }
 
 impl Snapshot {
@@ -1073,8 +1276,78 @@ impl Snapshot {
         !self.streaming.is_empty()
     }
 
+    fn has_running_tasks(&self) -> bool {
+        self.tasks.iter().any(|task| task.status.is_running())
+    }
+
     fn has_completed_tool(&self, id: &str) -> bool {
         self.completed_tools.contains(id)
+    }
+
+    /// Whole seconds the running turn has taken so far.
+    fn turn_seconds(&self) -> Option<u64> {
+        self.turn_started_at
+            .map(|start| self.clock.seconds_since(start))
+    }
+}
+
+/// The time a pass measures elapsed times against.
+///
+/// Read once per pass, so every clock on screen agrees.
+#[derive(Debug, Clone, Copy)]
+struct Clock {
+    wall: Timestamp,
+    /// How far the executor's clock runs ahead of the system's, in
+    /// microseconds: nothing in the app, and whatever a test's
+    /// `advance_clock` has added. Reading the executor is what lets a test
+    /// move these clocks the same way it fires the tick that redraws them.
+    ahead_us: i64,
+}
+
+impl Clock {
+    /// The system's time alone, for a snapshot taken outside a pass.
+    fn system() -> Self {
+        Self {
+            wall: fx_core::models::now(),
+            ahead_us: 0,
+        }
+    }
+
+    fn read(cx: &App) -> Self {
+        let executor = cx.background_executor().now();
+        let system = Instant::now();
+        let micros =
+            |duration: std::time::Duration| i64::try_from(duration.as_micros()).unwrap_or(i64::MAX);
+        let ahead_us = match executor.checked_duration_since(system) {
+            Some(ahead) => micros(ahead),
+            None => -micros(system.duration_since(executor)),
+        };
+        Self {
+            wall: fx_core::models::now(),
+            ahead_us,
+        }
+    }
+
+    /// Microseconds from `start` to now, negative for a start in the future.
+    fn micros_since(&self, start: Timestamp) -> i64 {
+        self.wall
+            .signed_duration_since(start)
+            .num_microseconds()
+            .unwrap_or(i64::MAX)
+            .saturating_add(self.ahead_us)
+    }
+
+    /// Whole seconds from `start` to now. A start in the future is zero, not
+    /// a negative duration.
+    fn seconds_since(&self, start: Timestamp) -> u64 {
+        (self.micros_since(start).max(0) / MICROS_PER_SECOND) as u64
+    }
+
+    /// How long until a clock started at `start` shows its next second, so a
+    /// tick lands just after the second turns rather than up to a second late.
+    fn until_next_second(&self, start: Timestamp) -> std::time::Duration {
+        let into = self.micros_since(start).rem_euclid(MICROS_PER_SECOND);
+        std::time::Duration::from_micros((MICROS_PER_SECOND - into) as u64) + CLOCK_TICK_MARGIN
     }
 }
 
@@ -1093,7 +1366,8 @@ struct RecoveryFacts {
 pub(crate) fn snapshot(conversation: &crate::Conversation) -> Snapshot {
     let message_revision = conversation.message_revision();
     let streaming_revision = conversation.streaming_revision();
-    let (messages, streaming) = with_thread(conversation.id, |thread| {
+    let tasks_revision = conversation.tasks_revision();
+    let (messages, streaming, tasks) = with_thread(conversation.id, |thread| {
         thread.agent = conversation.agent_id;
         let messages = match thread
             .messages
@@ -1119,7 +1393,15 @@ pub(crate) fn snapshot(conversation: &crate::Conversation) -> Snapshot {
                 text
             }
         };
-        (messages, streaming)
+        let tasks = match &thread.tasks {
+            Some((revision, tasks)) if *revision == tasks_revision => tasks.clone(),
+            _ => {
+                let tasks: Rc<[BackgroundTask]> = conversation.tasks().into();
+                thread.tasks = Some((tasks_revision, tasks.clone()));
+                tasks
+            }
+        };
+        (messages, streaming, tasks)
     });
 
     let busy = conversation.is_busy();
@@ -1170,6 +1452,11 @@ pub(crate) fn snapshot(conversation: &crate::Conversation) -> Snapshot {
         questions: conversation.pending_questions().to_vec(),
         completed_tools,
         recovery,
+        turn_started_at: conversation.turn_started_at().filter(|_| busy),
+        step_started_at: conversation.step_started_at().filter(|_| busy),
+        clock: Clock::system(),
+        tasks,
+        tasks_revision,
     }
 }
 
@@ -1199,29 +1486,25 @@ pub fn view_guarded(
     render(snapshot, window, cx)
 }
 
-fn render(snapshot: Snapshot, window: &mut Window, cx: &mut App) -> AnyElement {
+fn render(mut snapshot: Snapshot, window: &mut Window, cx: &mut App) -> AnyElement {
     let theme = global::current();
     sweep_memory(&snapshot, cx);
     release_hidden_messages(snapshot.id);
     crate::markdown::begin_pass();
+    snapshot.clock = Clock::read(cx);
+    schedule_tick(&snapshot, window, cx);
     // Shared with the list, which asks for rows after this function returns.
     let snapshot = Rc::new(snapshot);
 
     let (plan, heads) = with_thread(snapshot.id, |thread| thread.plan(&snapshot));
-    // Only the last segment of the last turn can be live, so only the last
-    // row needs looking at.
-    let has_active_group = matches!(
-        plan.last(),
-        Some(RowPlan::Activity {
-            is_active: true,
-            ..
-        })
-    );
+    let has_active_group = has_active_group(&plan);
     let rows = Rows {
         plan,
         tail: has_tail(&snapshot, has_active_group),
+        tasks: !snapshot.tasks.is_empty(),
         failure: snapshot.error.is_some(),
     };
+    request_task_clock(&snapshot, cx);
     prune_disclosures(
         snapshot.id,
         snapshot.message_revision,
@@ -1361,8 +1644,12 @@ fn row_element(
                 frame,
             )
         }
+        RowPlan::Plan { message, is_live } => {
+            plan_card(&snapshot.messages[*message], *is_live, frame)
+        }
         RowPlan::Tail => streaming_tail(snapshot, frame, has_active_group)
             .unwrap_or_else(|| div().into_any_element()),
+        RowPlan::Tasks => background_tasks(&snapshot.tasks, Instant::now(), frame),
         RowPlan::Failure => match snapshot.error.as_deref() {
             Some(error) => error_banner(error, snapshot),
             None => div().into_any_element(),
@@ -1522,6 +1809,46 @@ fn request_caret_frame(snapshot: &Snapshot, frame: u32, window: &mut Window) {
 /// Whether the caret is drawn solid or faded, as a phase rather than a boolean.
 fn blink_phase(frame: u32) -> u32 {
     (frame / CARET_BLINK_PASSES) % 2
+}
+
+/// Repaint once a second while a turn runs, so its clocks move.
+///
+/// One pending tick per thread at a time, from the executor's timer — which a
+/// test clock drives — and never a frame per display refresh. A tick changes
+/// no row's stamp, so the list re-measures nothing: the rows in view are
+/// rebuilt, as on any pass, and every other row keeps its height. The clocks
+/// sit on lines of a fixed height for the same reason. A settled thread
+/// schedules nothing, so the ticking stops with the turn.
+fn schedule_tick(snapshot: &Snapshot, window: &mut Window, cx: &mut App) {
+    if !snapshot.busy {
+        return;
+    }
+    let due = with_thread(snapshot.id, |thread| {
+        !std::mem::replace(&mut thread.tick_pending, true)
+    });
+    if !due {
+        return;
+    }
+    let conversation = snapshot.id;
+    // On the turn's own seconds, so the header ticks when its second turns.
+    let delay = snapshot
+        .turn_started_at
+        .map_or(FxAnimation::CLOCK_TICK, |start| {
+            snapshot.clock.until_next_second(start)
+        });
+    window
+        .spawn(cx, async move |cx| {
+            cx.background_executor().timer(delay).await;
+            // Cleared before the refresh, and whether or not the window is
+            // still there, so a closed window cannot strand the flag.
+            MEMORY.with(|memory| {
+                if let Some(thread) = memory.borrow_mut().threads.get_mut(&conversation) {
+                    thread.tick_pending = false;
+                }
+            });
+            let _ = cx.update(|window, _cx| window.refresh());
+        })
+        .detach();
 }
 
 /// Pin the view to the bottom when the reader has scrolled back to it.
@@ -1930,6 +2257,9 @@ fn content_block(
         MessageContent::ToolUse { name, input, .. } => {
             if name.eq_ignore_ascii_case(QUESTION_TOOL_NAME) {
                 Some(question_card(input, place))
+            } else if is_plan_call(name, input) {
+                // The turn's plan card already shows it.
+                None
             } else {
                 Some(inline_tool_call(name, input, place))
             }
@@ -2284,10 +2614,13 @@ impl selection::Document for TranscriptDocument {
                 let messages = group_messages(snapshot, &messages);
                 group_paragraphs(&group_for(snapshot.id, &messages, index, is_active))
             }
+            // The plan card draws no selectable text.
+            Some(RowPlan::Plan { .. }) => Vec::new(),
             Some(RowPlan::Tail) if !snapshot.streaming.trim().is_empty() => {
                 crate::markdown::paragraphs(&snapshot.streaming, streaming_id(snapshot.id))
             }
-            Some(RowPlan::Tail | RowPlan::Failure) | None => Vec::new(),
+            // Status, not prose: the block is read, not copied from.
+            Some(RowPlan::Tail | RowPlan::Tasks | RowPlan::Failure) | None => Vec::new(),
         }
     }
 }
@@ -2329,6 +2662,8 @@ fn message_paragraphs(message: &ConversationMessage, conversation: Uuid) -> Vec<
                         continue;
                     }
                     ("arguments", bounded_detail(input).into())
+                } else if is_plan_call(name, input) {
+                    continue;
                 } else if !input.is_empty() && input != "{}" {
                     ("input", bounded_detail(input).into())
                 } else {
@@ -2491,11 +2826,271 @@ fn streaming_tail(snapshot: &Snapshot, frame: u32, has_active_group: bool) -> Op
                         div()
                             .fx_caption()
                             .text_color(Colors::fg_secondary(&theme))
-                            .child(SharedString::from(snapshot.phase.label())),
+                            // How long the turn has been at it, before there is
+                            // any work to show for it.
+                            .child(SharedString::from(match snapshot.turn_seconds() {
+                                Some(seconds) => {
+                                    format!(
+                                        "{} {}",
+                                        snapshot.phase.label(),
+                                        duration_label(seconds)
+                                    )
+                                }
+                                None => snapshot.phase.label().to_string(),
+                            })),
                     ),
             )
             .into_any_element(),
     )
+}
+
+// ── Background tasks ───────────────────────────────────────────────────────
+
+/// Keep a running task's clock moving while nothing else repaints.
+///
+/// One timer at a time per thread, and only while a task runs: a redraw a
+/// second is the clock's resolution, where a frame per frame would repaint the
+/// window sixty times a second to change one digit. The timer refreshes rather
+/// than notifies, because this view is a function with no entity of its own,
+/// and the list redraws only the rows in view, so the clock costs the rows on
+/// screen and nothing else.
+fn request_task_clock(snapshot: &Snapshot, cx: &mut App) {
+    if !snapshot.has_running_tasks() {
+        return;
+    }
+    let conversation = snapshot.id;
+    let already = with_thread(conversation, |thread| {
+        std::mem::replace(&mut thread.clock_pending, true)
+    });
+    if already {
+        return;
+    }
+    cx.spawn(async move |cx| {
+        // The executor's timer, so a test clock can drive it.
+        cx.background_executor().timer(TASK_CLOCK_INTERVAL).await;
+        // Through `update`, which flushes the refresh: `AsyncApp::refresh`
+        // only queues it, and the window would wait for some other event.
+        let _ = cx.update(|cx| {
+            // Looked up rather than made: a thread deleted meanwhile stays
+            // forgotten.
+            MEMORY.with(|memory| {
+                if let Some(thread) = memory.borrow_mut().threads.get_mut(&conversation) {
+                    thread.clock_pending = false;
+                }
+            });
+            cx.refresh_windows();
+        });
+    })
+    .detach();
+}
+
+/// The latest turn's background tasks, as one block: what each is, what it is
+/// doing, and how each ended.
+fn background_tasks(tasks: &[BackgroundTask], now: Instant, frame: u32) -> AnyElement {
+    let theme = global::current();
+    let mut list = div()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap(px_len(Spacing::SM));
+    for task in tasks {
+        list = list.child(background_task_row(task, now, frame));
+    }
+    div()
+        .debug_selector(|| TASKS_SELECTOR.to_string())
+        .w_full()
+        .min_w_0()
+        .pb(px_len(Spacing::XXL))
+        .child(card(
+            div()
+                .w_full()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px_len(Spacing::SM))
+                .child(
+                    div()
+                        .fx_role(TextRole::CaptionMedium)
+                        .text_color(Colors::fg_secondary(&theme))
+                        .child(SharedString::from(tasks_title(tasks))),
+                )
+                .child(list),
+            Spacing::MD,
+        ))
+        .into_any_element()
+}
+
+/// One task: its state, what it is, its last tool, its tool count and its
+/// clock, and below them what it said it found.
+fn background_task_row(task: &BackgroundTask, now: Instant, frame: u32) -> AnyElement {
+    let theme = global::current();
+    let status: AnyElement = match task.status {
+        TaskStatus::Running => {
+            spinner_arc(Colors::accent(&theme), spin_degrees(frame)).into_any_element()
+        }
+        TaskStatus::Completed => {
+            Icon::CHECKMARK.render(IconSize::Micro, Colors::success(&theme), &theme)
+        }
+        TaskStatus::Failed => {
+            Icon::XMARK_CIRCLE_FILL.render(IconSize::Small, Colors::error(&theme), &theme)
+        }
+        TaskStatus::Stopped => {
+            Icon::STOP_CIRCLE_FILL.render(IconSize::Small, Colors::fg_tertiary(&theme), &theme)
+        }
+    };
+    let selector = format!(
+        "transcript.background-task:{}:{}",
+        task.id,
+        task_status_word(task.status)
+    );
+    let kind: AnyElement = match task_kind_label(task) {
+        Some(kind) => div()
+            .flex_shrink_0()
+            .child(badge(SharedString::from(kind), BadgeTone::Neutral, false))
+            .into_any_element(),
+        None => div().into_any_element(),
+    };
+    let header = div()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px_len(Spacing::SM))
+        // A fixed gutter, so a spinner and a check sit on the same axis and the
+        // summary below lines up under the description.
+        .child(
+            div()
+                .flex_shrink_0()
+                .size(px_len(Spacing::LG))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(status),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .fx_role(TextRole::CaptionMedium)
+                .text_color(Colors::fg(&theme))
+                .child(SharedString::from(task_title(task))),
+        )
+        .child(kind)
+        .child(
+            div()
+                .flex_shrink_0()
+                .whitespace_nowrap()
+                .fx_role(TextRole::MonoSmall)
+                .text_color(Colors::fg_tertiary(&theme))
+                .child(SharedString::from(task_meta(task, now))),
+        );
+    let mut column = div()
+        .debug_selector(move || selector)
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap(px_len(Spacing::XXS))
+        .child(header);
+    if let Some(summary) = task
+        .summary
+        .as_deref()
+        .map(|summary| summarize_line(summary, DETAIL_CHARACTER_LIMIT))
+        .filter(|summary| !summary.is_empty())
+    {
+        column = column.child(
+            div()
+                .w_full()
+                .min_w_0()
+                .pl(px_len(Spacing::LG + Spacing::SM))
+                .truncate()
+                .fx_caption()
+                .text_color(Colors::fg_secondary(&theme))
+                .child(SharedString::from(summary)),
+        );
+    }
+    column.into_any_element()
+}
+
+/// The block's heading: how many are still running, or how they ended.
+fn tasks_title(tasks: &[BackgroundTask]) -> String {
+    let running = tasks.iter().filter(|task| task.status.is_running()).count();
+    if running > 0 {
+        return format!("Background tasks · {running} running");
+    }
+    let failed = tasks
+        .iter()
+        .filter(|task| task.status == TaskStatus::Failed)
+        .count();
+    let stopped = tasks
+        .iter()
+        .filter(|task| task.status == TaskStatus::Stopped)
+        .count();
+    let mut title = format!("Background tasks · {} done", tasks.len() - failed - stopped);
+    if failed > 0 {
+        title.push_str(&format!(" · {failed} failed"));
+    }
+    if stopped > 0 {
+        title.push_str(&format!(" · {stopped} stopped"));
+    }
+    title
+}
+
+/// What the task is called: its description, or what runs it.
+fn task_title(task: &BackgroundTask) -> String {
+    let description = summarize_line(&task.description, SUMMARY_CHARACTER_LIMIT);
+    if !description.is_empty() {
+        return description;
+    }
+    match task.kind.as_deref() {
+        Some("local_bash") => "Background command".to_string(),
+        _ => "Background task".to_string(),
+    }
+}
+
+/// The badge naming what does the work: the subagent's type, or a shell.
+fn task_kind_label(task: &BackgroundTask) -> Option<String> {
+    if let Some(subagent) = task
+        .subagent_type
+        .as_deref()
+        .filter(|subagent| !subagent.trim().is_empty())
+    {
+        return Some(subagent.to_string());
+    }
+    match task.kind.as_deref() {
+        Some("local_bash") => Some("shell".to_string()),
+        _ => None,
+    }
+}
+
+/// The trailing line: last tool, tool count, and the clock.
+fn task_meta(task: &BackgroundTask, now: Instant) -> String {
+    let mut parts = Vec::new();
+    if task.status.is_running()
+        && let Some(tool) = task.last_tool.as_deref().filter(|tool| !tool.is_empty())
+    {
+        parts.push(tool.to_string());
+    }
+    match task.tool_uses {
+        Some(1) => parts.push("1 tool".to_string()),
+        Some(count) if count > 1 => parts.push(format!("{count} tools")),
+        _ => {}
+    }
+    parts.push(duration_label(task.elapsed(now).as_secs()));
+    parts.join(" · ")
+}
+
+/// The word a task's state goes by, for its element's selector.
+fn task_status_word(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Running => "running",
+        TaskStatus::Completed => "completed",
+        TaskStatus::Failed => "failed",
+        TaskStatus::Stopped => "stopped",
+    }
 }
 
 /// A way out of a failed turn, other than dismissing it.
@@ -2682,6 +3277,11 @@ fn activity_group(group: &ActivityGroup<'_>, snapshot: &Snapshot, frame: u32) ->
         div().w(px(0.0)).h(px(0.0)).into_any_element()
     };
 
+    let title = group_title(
+        group,
+        snapshot.phase.label(),
+        group.is_active.then(|| snapshot.turn_seconds()).flatten(),
+    );
     let header = div()
         .debug_selector(|| ACTIVITY_HEADER_SELECTOR.into())
         .w_full()
@@ -2697,15 +3297,16 @@ fn activity_group(group: &ActivityGroup<'_>, snapshot: &Snapshot, frame: u32) ->
         .child(status)
         .child(
             div()
+                .debug_selector({
+                    let title = title.clone();
+                    move || format!("{ACTIVITY_TITLE_PREFIX}{title}")
+                })
                 .flex_1()
                 .min_w_0()
                 .fx_role(TextRole::CaptionMedium)
                 .text_color(Colors::fg_secondary(&theme))
                 .truncate()
-                .child(SharedString::from(group_title(
-                    group,
-                    snapshot.phase.label(),
-                ))),
+                .child(SharedString::from(title)),
         )
         .child(failures)
         .id(SharedString::from(format!("activity:{}", group.key)))
@@ -2728,6 +3329,12 @@ fn activity_group(group: &ActivityGroup<'_>, snapshot: &Snapshot, frame: u32) ->
         .flex_col()
         .pb(px_len(Spacing::MD))
         .child(header);
+
+    // What the turn is doing this moment, open or closed: a closed group is
+    // exactly when the reader cannot see the calls for themselves.
+    if group.is_active {
+        column = column.child(live_step_line(group, snapshot));
+    }
 
     if expanded {
         let mut details = div()
@@ -2784,11 +3391,7 @@ fn tool_row(
     failure_key: SharedString,
 ) -> AnyElement {
     let theme = global::current();
-    // A successful result that said nothing is never recorded as a row, so the
-    // transcript cannot tell a finished call from a running one on its own. The
-    // engine's completed-id memory is what closes that gap.
-    let finished = call.result_recorded || snapshot.has_completed_tool(&call.id);
-    let running = !finished && group_is_active;
+    let running = !call_finished(call, snapshot) && group_is_active;
 
     let status: AnyElement = if call.is_error {
         Icon::XMARK_CIRCLE_FILL.render(IconSize::Small, Colors::error(&theme), &theme)
@@ -2816,7 +3419,7 @@ fn tool_row(
                 .flex_shrink_0()
                 .text_color(Colors::fg_secondary(&theme))
                 .whitespace_nowrap()
-                .child(SharedString::from(tool_title(call))),
+                .child(SharedString::from(tool_title(call, Tense::Past))),
         )
         .child(if let Some(detail) = tool_detail(call) {
             div()
@@ -2876,24 +3479,41 @@ fn tool_glyph(name: &str) -> AnyElement {
     icon.render(IconSize::Small, Colors::fg_tertiary(&theme), &theme)
 }
 
+/// Whether a call has been answered.
+///
+/// A successful result that said nothing is never recorded as a row, so the
+/// transcript cannot tell a finished call from a running one on its own. The
+/// engine's completed-id memory is what closes that gap.
+fn call_finished(call: &ToolCall<'_>, snapshot: &Snapshot) -> bool {
+    call.result_recorded || snapshot.has_completed_tool(&call.id)
+}
+
+/// Whether a call is described as done or as happening now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tense {
+    Past,
+    Present,
+}
+
 /// What the call is called, in the reader's language rather than the tool's.
-fn tool_title(call: &ToolCall<'_>) -> String {
-    match call.name.to_ascii_lowercase().as_str() {
-        "read" => "Read".to_string(),
-        "edit" => "Edited".to_string(),
-        "write" => "Wrote".to_string(),
-        "grep" => "Searched".to_string(),
-        "glob" => "Matched files".to_string(),
-        "bash" | "command" | "shell" | "commandexecution" => "Ran command".to_string(),
-        _ if call.name == ORPHAN_TOOL => {
-            if call.is_error {
-                "Tool failed".to_string()
-            } else {
-                "Tool result".to_string()
-            }
-        }
-        _ => call.name.to_string(),
+fn tool_title(call: &ToolCall<'_>, tense: Tense) -> String {
+    let (past, present) = match call.name.to_ascii_lowercase().as_str() {
+        "read" => ("Read", "Reading"),
+        "edit" => ("Edited", "Editing"),
+        // Not "Writing", which is what the model is doing when it writes prose.
+        "write" => ("Wrote", "Writing file"),
+        "grep" => ("Searched", "Searching"),
+        "glob" => ("Matched files", "Matching files"),
+        "bash" | "command" | "shell" | "commandexecution" => ("Ran command", "Running command"),
+        _ if call.name == ORPHAN_TOOL && call.is_error => ("Tool failed", "Tool failed"),
+        _ if call.name == ORPHAN_TOOL => ("Tool result", "Tool result"),
+        _ => return call.name.to_string(),
+    };
+    match tense {
+        Tense::Past => past,
+        Tense::Present => present,
     }
+    .to_string()
 }
 
 /// The one line that says what the call was pointed at.
@@ -2905,11 +3525,16 @@ fn tool_detail(call: &ToolCall<'_>) -> Option<String> {
     (!summarized.is_empty()).then_some(summarized)
 }
 
-fn group_title(group: &ActivityGroup<'_>, phase_label: &str) -> String {
-    let mut title = match (group.is_active, group.summary.seconds) {
-        (true, _) => format!("{phase_label}…"),
-        (false, Some(seconds)) => format!("Worked for {}", duration_label(seconds)),
-        (false, None) => "Worked".to_string(),
+/// A group's header line.
+///
+/// `turn_seconds` is the running turn's elapsed time, which a live group shows
+/// in place of the ellipsis: "Working 1m 23s · 5 actions".
+fn group_title(group: &ActivityGroup<'_>, phase_label: &str, turn_seconds: Option<u64>) -> String {
+    let mut title = match (group.is_active, turn_seconds, group.summary.seconds) {
+        (true, Some(seconds), _) => format!("{phase_label} {}", duration_label(seconds)),
+        (true, None, _) => format!("{phase_label}…"),
+        (false, _, Some(seconds)) => format!("Worked for {}", duration_label(seconds)),
+        (false, _, None) => "Worked".to_string(),
     };
     if group.summary.calls > 0 {
         title.push_str(" · ");
@@ -2964,6 +3589,215 @@ fn duration_label(seconds: u64) -> String {
     } else {
         format!("{hours}h {minutes}m")
     }
+}
+
+// ── The live step ──────────────────────────────────────────────────────────
+
+/// What a live group is doing this moment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LiveStep<'a> {
+    /// The latest call that has not been answered yet.
+    Call {
+        name: &'a str,
+        title: String,
+        detail: Option<String>,
+        started: Timestamp,
+    },
+    /// No call is open: the model is thinking or writing, or the turn is
+    /// waiting on something.
+    Between {
+        label: String,
+        since: Option<Timestamp>,
+    },
+}
+
+/// The step a live group is on.
+///
+/// The latest open call rather than the latest call: with calls running side
+/// by side, the one that finished last says nothing about what is still going.
+fn live_step<'a>(group: &ActivityGroup<'a>, snapshot: &Snapshot) -> LiveStep<'a> {
+    if let Some(call) = group
+        .calls
+        .iter()
+        .rev()
+        .find(|call| !call_finished(call, snapshot))
+    {
+        return LiveStep::Call {
+            name: call.name,
+            title: tool_title(call, Tense::Present),
+            detail: tool_detail(call),
+            started: call.started,
+        };
+    }
+    let label = match snapshot.phase {
+        Phase::Running | Phase::Starting if !snapshot.streaming.trim().is_empty() => {
+            "Writing…".to_string()
+        }
+        Phase::Running | Phase::Starting => "Thinking…".to_string(),
+        phase => format!("{}…", phase.label()),
+    };
+    LiveStep::Between {
+        label,
+        since: snapshot.step_started_at,
+    }
+}
+
+/// The line under a live group's header: the step in progress and how long it
+/// has taken.
+///
+/// One line of a fixed height whatever it says, so neither a tick nor the next
+/// call can change the row's height — which is what lets a tick re-measure
+/// nothing.
+fn live_step_line(group: &ActivityGroup<'_>, snapshot: &Snapshot) -> AnyElement {
+    let theme = global::current();
+    let (glyph, label, detail, since) = match live_step(group, snapshot) {
+        LiveStep::Call {
+            name,
+            title,
+            detail,
+            started,
+        } => (tool_glyph(name), title, detail, Some(started)),
+        LiveStep::Between { label, since } => (
+            Icon::ELLIPSIS.render(IconSize::Small, Colors::fg_tertiary(&theme), &theme),
+            label,
+            None,
+            since,
+        ),
+    };
+    let elapsed = since.map(|start| duration_label(snapshot.clock.seconds_since(start)));
+    let line = [TextRole::CaptionMedium, TextRole::MonoSmall]
+        .map(|role| Typography::style(role, &theme).size * role.line_height_multiplier())
+        .into_iter()
+        .fold(0.0, f32::max);
+    let selector = |part: &'static str, text: &str| {
+        let text = text.to_string();
+        move || format!("{LIVE_STEP_SELECTOR}:{part}:{text}")
+    };
+    div()
+        .debug_selector(|| LIVE_STEP_SELECTOR.into())
+        .w_full()
+        .min_w_0()
+        .h(px(line))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px_len(Spacing::SM))
+        .pl(px_len(Spacing::XXL))
+        .pr(px_len(Spacing::SM))
+        .child(div().flex_shrink_0().child(glyph))
+        .child(
+            div()
+                .debug_selector(selector("label", &label))
+                .flex_shrink_0()
+                .whitespace_nowrap()
+                .fx_role(TextRole::CaptionMedium)
+                .text_color(Colors::fg_secondary(&theme))
+                .child(SharedString::from(label)),
+        )
+        .child(match detail {
+            Some(detail) => div()
+                .debug_selector(selector("detail", &detail))
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .fx_role(TextRole::MonoSmall)
+                .text_color(Colors::fg_tertiary(&theme))
+                .child(SharedString::from(detail))
+                .into_any_element(),
+            None => div().flex_1().min_w_0().into_any_element(),
+        })
+        .children(elapsed.map(|elapsed| {
+            div()
+                .debug_selector(selector("elapsed", &elapsed))
+                .flex_shrink_0()
+                .whitespace_nowrap()
+                .fx_role(TextRole::MonoSmall)
+                .text_color(Colors::fg_tertiary(&theme))
+                .child(SharedString::from(elapsed))
+        }))
+        .into_any_element()
+}
+
+// ── The plan ───────────────────────────────────────────────────────────────
+
+/// The turn's task list as a checklist: done steps checked, the step in
+/// progress in its active wording, the rest still open.
+///
+/// While the turn runs the step in progress spins. Afterwards the card stays
+/// where it was as the record of how far the plan got, with a step that was
+/// still in progress shown as stopped rather than as still going.
+fn plan_card(message: &ConversationMessage, is_live: bool, frame: u32) -> AnyElement {
+    let Some(plan) = message_plan(message) else {
+        return div().into_any_element();
+    };
+    let theme = global::current();
+    let header = div()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px_len(Spacing::SM))
+        .child(Icon::CHECKLIST.render(IconSize::Small, Colors::fg_tertiary(&theme), &theme))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .fx_role(TextRole::CaptionMedium)
+                .text_color(Colors::fg_secondary(&theme))
+                .child(SharedString::from("Plan")),
+        )
+        .child(
+            div()
+                .flex_shrink_0()
+                .fx_caption()
+                .text_color(Colors::fg_tertiary(&theme))
+                .child(SharedString::from(format!(
+                    "{} of {} done",
+                    plan.completed(),
+                    plan.steps.len()
+                ))),
+        );
+    let mut rows: Vec<AnyElement> = Vec::new();
+    if let Some(explanation) = &plan.explanation {
+        rows.push(
+            div()
+                .min_w_0()
+                .whitespace_normal()
+                .fx_caption()
+                .text_color(Colors::fg_tertiary(&theme))
+                .child(SharedString::from(explanation.clone()))
+                .into_any_element(),
+        );
+    }
+    for step in &plan.steps {
+        let (mark, state) = match step.status {
+            PlanStatus::Completed => (ChecklistMark::Done, "done"),
+            PlanStatus::InProgress => (ChecklistMark::Active, "active"),
+            PlanStatus::Pending => (ChecklistMark::Pending, "pending"),
+        };
+        let label = step.label().to_string();
+        let spin = (is_live && mark == ChecklistMark::Active).then(|| spin_degrees(frame));
+        rows.push(
+            div()
+                .debug_selector({
+                    let label = label.clone();
+                    move || format!("{PLAN_SELECTOR}:{state}:{label}")
+                })
+                .w_full()
+                .min_w_0()
+                .child(checklist_row(label, mark, spin))
+                .into_any_element(),
+        );
+    }
+    div()
+        .debug_selector(|| PLAN_SELECTOR.into())
+        .w_full()
+        .min_w_0()
+        .pb(px_len(Spacing::MD))
+        .child(checklist(header, rows))
+        .into_any_element()
 }
 
 // ── Detail blocks ──────────────────────────────────────────────────────────
@@ -3741,8 +4575,8 @@ mod tests {
         assert_eq!(group.summary.calls, 4);
         assert_eq!(group.summary.edits, 2);
         assert_eq!(group.summary.failures, 1);
-        assert!(group_title(group, "Working").contains("4 actions"));
-        assert!(group_title(group, "Working").contains("2 edits"));
+        assert!(group_title(group, "Working", None).contains("4 actions"));
+        assert!(group_title(group, "Working", None).contains("2 edits"));
     }
 
     #[test]
@@ -3764,23 +4598,24 @@ mod tests {
         let source = [tool_use("a", "Read", "{}")];
         let rows = build_rows(&borrowed(&source), true, CONVERSATION);
         assert_eq!(
-            group_title(only_group(&rows), "Working"),
+            group_title(only_group(&rows), "Working", None),
             "Working… · 1 action"
         );
     }
 
     #[test]
-    fn a_tool_title_says_what_the_reader_did() {
+    fn a_tool_title_says_what_the_reader_did_or_is_doing() {
         let cases = [
-            ("Read", "Read"),
-            ("Edit", "Edited"),
-            ("Write", "Wrote"),
-            ("Grep", "Searched"),
-            ("Glob", "Matched files"),
-            ("Bash", "Ran command"),
-            ("Frobnicate", "Frobnicate"),
+            ("Read", "Read", "Reading"),
+            ("Edit", "Edited", "Editing"),
+            ("Write", "Wrote", "Writing file"),
+            ("Grep", "Searched", "Searching"),
+            ("Glob", "Matched files", "Matching files"),
+            ("Bash", "Ran command", "Running command"),
+            ("Frobnicate", "Frobnicate", "Frobnicate"),
+            (ORPHAN_TOOL, "Tool result", "Tool result"),
         ];
-        for (name, expected) in cases {
+        for (name, past, present) in cases {
             let call = ToolCall {
                 id: "t".into(),
                 name,
@@ -3788,8 +4623,10 @@ mod tests {
                 output: None,
                 is_error: false,
                 result_recorded: false,
+                started: fx_core::models::now(),
             };
-            assert_eq!(tool_title(&call), expected, "for {name}");
+            assert_eq!(tool_title(&call, Tense::Past), past, "for {name}");
+            assert_eq!(tool_title(&call, Tense::Present), present, "for {name}");
         }
     }
 
@@ -3823,6 +4660,7 @@ mod tests {
                 output: None,
                 is_error: false,
                 result_recorded: false,
+                started: fx_core::models::now(),
             };
             assert_eq!(tool_detail(&call), expected, "for {name} {input}");
         }
@@ -4156,7 +4994,7 @@ mod tests {
             let messages: Vec<_> = conversation.messages().collect();
             let rows = build_rows(&messages, conversation.is_busy(), conversation.id);
             assert_eq!(
-                group_title(only_group(&rows), conversation.phase().label()),
+                group_title(only_group(&rows), conversation.phase().label(), None),
                 format!("{}… · 12 actions", phase.label())
             );
             assert!(streaming_tail(&snapshot(&conversation), 0, true).is_none());
@@ -5632,5 +6470,561 @@ mod tests {
         );
         assert!(visual.debug_bounds("transcript.recovery:Dismiss").is_some());
         assert!(visual.debug_bounds("transcript.recovery:Retry").is_none());
+    }
+
+    // ── Live progress ───────────────────────────────────────────────────────
+
+    /// Whether the frame on screen drew an element under this selector.
+    ///
+    /// GPUI looks selectors up by `&'static str`; these are built from the
+    /// text a row shows, so each is leaked for the test's lifetime.
+    fn drew(visual: &mut VisualTestContext, selector: &str) -> bool {
+        visual
+            .debug_bounds(Box::leak(selector.to_owned().into_boxed_str()))
+            .is_some()
+    }
+
+    fn live(part: &str, text: &str) -> String {
+        format!("{LIVE_STEP_SELECTOR}:{part}:{text}")
+    }
+
+    fn title(text: &str) -> String {
+        format!("{ACTIVITY_TITLE_PREFIX}{text}")
+    }
+
+    /// A turn that read a file and is now running the tests.
+    ///
+    /// Built before the test's app, so its timestamps are no later than the
+    /// test clock's start and a whole second on that clock reads as one.
+    fn running_the_tests() -> Conversation {
+        let mut conversation = Conversation::new(Uuid::new_v4());
+        conversation.append(text(MessageRole::User, "Fix the parser"));
+        conversation.apply(ProviderEvent::Lifecycle(Lifecycle::TurnStarted));
+        conversation.apply(ProviderEvent::ToolUse {
+            id: "read".into(),
+            name: "Read".into(),
+            input: r#"{"file_path":"/src/parser.rs"}"#.into(),
+        });
+        conversation.apply(ProviderEvent::ToolResult {
+            id: "read".into(),
+            content: "fn parse() {}".into(),
+            is_error: false,
+        });
+        conversation.apply(ProviderEvent::ToolUse {
+            id: "test".into(),
+            name: "Bash".into(),
+            input: r#"{"command":"cargo test --workspace"}"#.into(),
+        });
+        conversation
+    }
+
+    #[test]
+    fn a_live_group_shows_the_step_in_progress_even_while_closed() {
+        let mut test = TestAppContext::single();
+        let conversation = running_the_tests();
+        let window = test.add_window(move |_, _| Harness { conversation });
+        let mut visual = VisualTestContext::from_window(*window.deref(), &test);
+        visual.simulate_resize(size(px(900.0), px(600.0)));
+        redraw(&mut test);
+
+        assert!(!drew(&mut visual, ACTIVITY_DETAILS_SELECTOR), "it opened");
+        assert!(drew(&mut visual, &title("Working 0s · 2 actions")));
+        assert!(drew(&mut visual, &live("label", "Running command")));
+        assert!(drew(&mut visual, &live("detail", "cargo test --workspace")));
+        assert!(drew(&mut visual, &live("elapsed", "0s")));
+
+        // The call finishing with nothing to say leaves no call open: the
+        // model is thinking, and then writing.
+        window
+            .update(&mut test, |view, _, cx| {
+                view.conversation.apply(ProviderEvent::ToolResult {
+                    id: "test".into(),
+                    content: "Completed".into(),
+                    is_error: false,
+                });
+                cx.notify();
+            })
+            .unwrap();
+        redraw(&mut test);
+        assert!(drew(&mut visual, &live("label", "Thinking…")));
+
+        window
+            .update(&mut test, |view, _, cx| {
+                view.conversation
+                    .apply(ProviderEvent::TextDelta("All green.".into()));
+                cx.notify();
+            })
+            .unwrap();
+        redraw(&mut test);
+        assert!(drew(&mut visual, &live("label", "Writing…")));
+
+        // The next call replaces it.
+        window
+            .update(&mut test, |view, _, cx| {
+                view.conversation.apply(ProviderEvent::TextEnd);
+                view.conversation.apply(ProviderEvent::ToolUse {
+                    id: "grep".into(),
+                    name: "Grep".into(),
+                    input: r#"{"pattern":"fn parse"}"#.into(),
+                });
+                cx.notify();
+            })
+            .unwrap();
+        redraw(&mut test);
+        assert!(drew(&mut visual, &live("label", "Searching")));
+        assert!(drew(&mut visual, &live("detail", "fn parse")));
+    }
+
+    #[test]
+    fn the_live_clocks_tick_on_the_executor_clock_and_stop_with_the_turn() {
+        let conversation = running_the_tests();
+        let (mut test, mut visual) = open(conversation, 900.0, 600.0);
+        assert!(drew(&mut visual, &live("elapsed", "0s")));
+
+        // No redraw is asked for here: the tick is what repaints.
+        test.executor()
+            .advance_clock(std::time::Duration::from_millis(3_500));
+        test.run_until_parked();
+        assert!(
+            drew(&mut visual, &live("elapsed", "3s")),
+            "the step's clock"
+        );
+        assert!(
+            drew(&mut visual, &title("Working 3s · 2 actions")),
+            "the turn's clock"
+        );
+
+        test.executor()
+            .advance_clock(std::time::Duration::from_secs(60));
+        test.run_until_parked();
+        assert!(drew(&mut visual, &live("elapsed", "1m 3s")));
+    }
+
+    #[test]
+    fn a_settled_turn_stops_ticking() {
+        let mut test = TestAppContext::single();
+        let conversation = running_the_tests();
+        let window = test.add_window(move |_, _| Harness { conversation });
+        redraw(&mut test);
+        window
+            .update(&mut test, |view, _, cx| {
+                view.conversation.apply(ProviderEvent::Done {
+                    stop_reason: "end_turn".into(),
+                });
+                cx.notify();
+            })
+            .unwrap();
+        redraw(&mut test);
+        // The tick already scheduled lands once; nothing after it does.
+        test.executor().advance_clock(FxAnimation::CLOCK_TICK * 2);
+        test.run_until_parked();
+        let settled = rows_built_by_a_frame(&mut test, |test| {
+            for _ in 0..5 {
+                test.executor().advance_clock(FxAnimation::CLOCK_TICK);
+                test.run_until_parked();
+            }
+        });
+        assert_eq!(settled, 0, "a settled turn kept repainting");
+    }
+
+    #[test]
+    fn a_tick_rebuilds_only_the_rows_in_view_and_re_measures_none() {
+        let mut conversation = long_conversation(200);
+        conversation.apply(ProviderEvent::Lifecycle(Lifecycle::TurnStarted));
+        conversation.apply(ProviderEvent::ToolUse {
+            id: "test".into(),
+            name: "Bash".into(),
+            input: r#"{"command":"cargo test"}"#.into(),
+        });
+        let (mut test, _visual) = open(conversation, 900.0, 800.0);
+        redraw(&mut test);
+
+        SPLICES.with(|splices| splices.borrow_mut().clear());
+        let ticked = rows_built_by_a_frame(&mut test, |test| {
+            // One tick: the next lands a second after this one.
+            test.executor()
+                .advance_clock(FxAnimation::CLOCK_TICK + CLOCK_TICK_MARGIN);
+            test.run_until_parked();
+        });
+        assert!(
+            (1..=24).contains(&ticked),
+            "a tick built {ticked} of 201 rows"
+        );
+        assert_eq!(
+            SPLICES.with(|splices| splices.borrow().clone()),
+            Vec::new(),
+            "a tick re-measured rows whose height it cannot change"
+        );
+    }
+
+    /// A Claude task list, one step in each state.
+    const TODOS: &str = r#"{"todos":[
+        {"content":"Read the parser","status":"completed","activeForm":"Reading the parser"},
+        {"content":"Fix the bug","status":"in_progress","activeForm":"Fixing the bug"},
+        {"content":"Run the tests","status":"pending","activeForm":"Running the tests"}
+    ]}"#;
+
+    fn plan_step(state: &str, text: &str) -> String {
+        format!("{PLAN_SELECTOR}:{state}:{text}")
+    }
+
+    #[test]
+    fn a_todo_write_plan_renders_its_three_states_and_not_its_raw_call() {
+        let mut conversation = running_the_tests();
+        conversation.apply(ProviderEvent::ToolUse {
+            id: "todo".into(),
+            name: "TodoWrite".into(),
+            input: TODOS.into(),
+        });
+        conversation.apply(ProviderEvent::ToolResult {
+            id: "todo".into(),
+            content: "Todos have been modified successfully.".into(),
+            is_error: false,
+        });
+        let messages: Vec<_> = conversation.messages().collect();
+        let rows = build_rows(&messages, true, conversation.id);
+        toggle_disclosure(&only_group(&rows).key);
+        let (_test, mut visual) = open(conversation, 900.0, 800.0);
+
+        assert!(drew(&mut visual, &plan_step("done", "Read the parser")));
+        assert!(drew(&mut visual, &plan_step("active", "Fixing the bug")));
+        assert!(drew(&mut visual, &plan_step("pending", "Run the tests")));
+        // The open group shows the work and not the bookkeeping, and its count
+        // agrees.
+        assert!(drew(&mut visual, "transcript.activity-call:test"));
+        assert!(!drew(&mut visual, "transcript.activity-call:todo"));
+        assert!(drew(&mut visual, &title("Working 0s · 2 actions")));
+        // The plan follows the work it tracks.
+        let header = visual.debug_bounds(ACTIVITY_HEADER_SELECTOR).unwrap();
+        let plan = visual.debug_bounds(PLAN_SELECTOR).unwrap();
+        assert!(plan.top() > header.bottom());
+    }
+
+    #[test]
+    fn a_codex_plan_notification_becomes_the_same_checklist() {
+        let mut conversation = running_the_tests();
+        let events = fx_agent::codex::parse_notification(
+            "turn/plan/updated",
+            &serde_json::json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "plan": [
+                    { "step": "Read the parser", "status": "completed" },
+                    { "step": "Fix the bug", "status": "inProgress" },
+                    { "step": "Run the tests", "status": "pending" },
+                ],
+            }),
+        );
+        for event in events {
+            conversation.apply(event);
+        }
+        let (_test, mut visual) = open(conversation, 900.0, 800.0);
+        assert!(drew(&mut visual, &plan_step("done", "Read the parser")));
+        // Codex has no active wording, so the step says what it is.
+        assert!(drew(&mut visual, &plan_step("active", "Fix the bug")));
+        assert!(drew(&mut visual, &plan_step("pending", "Run the tests")));
+        assert!(drew(&mut visual, &title("Working 0s · 2 actions")));
+    }
+
+    #[test]
+    fn the_plan_follows_the_turns_last_work_and_stays_when_the_answer_lands() {
+        let source = [
+            text(MessageRole::User, "fix it"),
+            text(MessageRole::Assistant, "Let me plan this."),
+            tool_use("todo-1", "TodoWrite", TODOS),
+            tool_result("todo-1", "Todos have been modified successfully.", false),
+            text(MessageRole::Assistant, "Reading first."),
+            tool_use("read", "Read", "{}"),
+            tool_use("todo-2", "TodoWrite", TODOS),
+            text(MessageRole::Assistant, "Fixed."),
+        ];
+        let messages = borrowed(&source);
+
+        // While the turn runs, before the answer: the plan comes straight after
+        // the live group, so the group is still found live.
+        let running = plan_rows(&messages[..7], true);
+        assert_eq!(
+            running,
+            vec![
+                RowPlan::Message(0),
+                RowPlan::Message(1),
+                RowPlan::Message(4),
+                RowPlan::Activity {
+                    messages: 5..7,
+                    index: 3,
+                    is_active: true,
+                },
+                RowPlan::Plan {
+                    message: 6,
+                    is_live: true,
+                },
+            ],
+            "the burst that only wrote the plan is not a group of its own"
+        );
+        assert!(has_active_group(&running));
+
+        // Settled, with the answer below: the plan has not moved, and it is
+        // the latest plan rather than the first.
+        assert_eq!(
+            plan_rows(&messages, false),
+            vec![
+                RowPlan::Message(0),
+                RowPlan::Message(1),
+                RowPlan::Message(4),
+                RowPlan::Activity {
+                    messages: 5..7,
+                    index: 3,
+                    is_active: false,
+                },
+                RowPlan::Plan {
+                    message: 6,
+                    is_live: false,
+                },
+                RowPlan::Message(7),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_emptied_or_unreadable_plan_is_no_card() {
+        let emptied = [
+            tool_use("todo-1", "TodoWrite", TODOS),
+            tool_use("todo-2", "TodoWrite", r#"{"todos":[]}"#),
+        ];
+        assert!(
+            !plan_rows(&borrowed(&emptied), false)
+                .iter()
+                .any(|row| matches!(row, RowPlan::Plan { .. })),
+            "a cleared list still showed the one it replaced"
+        );
+
+        // Arguments that do not read stay an ordinary call, so the reader still
+        // sees that it happened.
+        let unreadable = [tool_use("todo", "TodoWrite", "not json")];
+        let rows = build_rows(&borrowed(&unreadable), false, CONVERSATION);
+        assert_eq!(only_group(&rows).summary.calls, 1);
+    }
+
+    #[test]
+    fn a_finished_turn_keeps_its_plan_without_a_spinner() {
+        let mut conversation = running_the_tests();
+        conversation.apply(ProviderEvent::ToolUse {
+            id: "todo".into(),
+            name: "TodoWrite".into(),
+            input: TODOS.into(),
+        });
+        conversation.apply(ProviderEvent::TextDelta("Stopping here.".into()));
+        conversation.apply(ProviderEvent::Done {
+            stop_reason: "end_turn".into(),
+        });
+        let messages: Vec<_> = conversation.messages().collect();
+        assert!(plan_rows(&messages, false).contains(&RowPlan::Plan {
+            message: messages.len() - 2,
+            is_live: false,
+        }));
+        let (_test, mut visual) = open(conversation, 900.0, 800.0);
+        assert!(drew(&mut visual, &plan_step("active", "Fixing the bug")));
+        assert!(!drew(&mut visual, LIVE_STEP_SELECTOR), "nothing is live");
+        assert!(drew(&mut visual, &title("Worked · 2 actions")));
+    }
+
+    // ── Background tasks ────────────────────────────────────────────────────
+
+    fn task_event(id: &str, status: TaskStatus) -> ProviderEvent {
+        ProviderEvent::Task(fx_agent::TaskUpdate {
+            id: id.into(),
+            status,
+            ..Default::default()
+        })
+    }
+
+    /// A turn that left four tasks behind it, one in each state.
+    fn tasks_conversation() -> Conversation {
+        let mut conversation = long_conversation(4);
+        for (id, description) in [
+            ("t-run", "Review the transport"),
+            ("t-done", "Review the parser"),
+            ("t-fail", "Review the store"),
+            ("t-stop", "sleep 600"),
+        ] {
+            conversation.apply(ProviderEvent::Task(fx_agent::TaskUpdate {
+                id: id.into(),
+                description: Some(description.into()),
+                subagent_type: (id != "t-stop").then(|| "general-purpose".into()),
+                kind: Some(
+                    if id == "t-stop" {
+                        "local_bash"
+                    } else {
+                        "local_agent"
+                    }
+                    .into(),
+                ),
+                status: TaskStatus::Running,
+                ..Default::default()
+            }));
+        }
+        conversation.apply(ProviderEvent::Task(fx_agent::TaskUpdate {
+            last_tool: Some("Grep".into()),
+            tool_uses: Some(4),
+            ..match task_event("t-run", TaskStatus::Running) {
+                ProviderEvent::Task(update) => update,
+                _ => unreachable!(),
+            }
+        }));
+        conversation.apply(ProviderEvent::Task(fx_agent::TaskUpdate {
+            summary: Some("Found two bugs in the framer".into()),
+            ..match task_event("t-done", TaskStatus::Completed) {
+                ProviderEvent::Task(update) => update,
+                _ => unreachable!(),
+            }
+        }));
+        conversation.apply(task_event("t-fail", TaskStatus::Failed));
+        conversation.apply(task_event("t-stop", TaskStatus::Stopped));
+        conversation
+    }
+
+    #[test]
+    fn the_background_tasks_block_shows_each_task_running_and_finished() {
+        let mut test = TestAppContext::single();
+        let window = test.add_window(|_, _| Harness {
+            conversation: tasks_conversation(),
+        });
+        let mut visual = VisualTestContext::from_window(*window.deref(), &test);
+        visual.simulate_resize(size(px(900.0), px(900.0)));
+        redraw(&mut test);
+        assert!(visual.debug_bounds(TASKS_SELECTOR).is_some());
+        for selector in [
+            "transcript.background-task:t-run:running",
+            "transcript.background-task:t-done:completed",
+            "transcript.background-task:t-fail:failed",
+            "transcript.background-task:t-stop:stopped",
+        ] {
+            assert!(visual.debug_bounds(selector).is_some(), "{selector}");
+        }
+        // The finished summary is a line of its own under its task.
+        let done = visual
+            .debug_bounds("transcript.background-task:t-done:completed")
+            .unwrap();
+        let running = visual
+            .debug_bounds("transcript.background-task:t-run:running")
+            .unwrap();
+        assert!(done.size.height > running.size.height);
+
+        // The last running task finishes, and the block says so.
+        window
+            .update(&mut test, |view, _, cx| {
+                view.conversation
+                    .apply(task_event("t-run", TaskStatus::Completed));
+                cx.notify();
+            })
+            .unwrap();
+        redraw(&mut test);
+        // Only presence can be asserted: GPUI 0.2.2 keeps every frame's debug
+        // bounds, so the running row's selector outlives the frame it was in.
+        assert!(
+            visual
+                .debug_bounds("transcript.background-task:t-run:completed")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_task_report_re_measures_only_the_task_block_and_the_clock_none() {
+        let mut conversation = long_conversation(40);
+        let id = conversation.id;
+        conversation.apply(task_event("t1", TaskStatus::Running));
+        let mut test = TestAppContext::single();
+        let window = test.add_window(move |_, _| Harness { conversation });
+        let visual = VisualTestContext::from_window(*window.deref(), &test);
+        visual.simulate_resize(size(px(700.0), px(500.0)));
+        redraw(&mut test);
+        assert_eq!(
+            list_state(id).item_count(),
+            41,
+            "forty messages and the block"
+        );
+
+        SPLICES.with(|splices| splices.borrow_mut().clear());
+        window
+            .update(&mut test, |view, _, cx| {
+                view.conversation
+                    .apply(ProviderEvent::Task(fx_agent::TaskUpdate {
+                        id: "t1".into(),
+                        last_tool: Some("Read".into()),
+                        tool_uses: Some(2),
+                        ..Default::default()
+                    }));
+                cx.notify();
+            })
+            .unwrap();
+        redraw(&mut test);
+        assert_eq!(
+            SPLICES.with(|splices| splices.borrow().clone()),
+            vec![(40..41, 1)],
+            "a task's progress re-measured more than its block"
+        );
+
+        // The clock: a timer redraws the rows in view once a second, and
+        // tells the list nothing, because no height moved.
+        assert!(with_thread(id, |thread| thread.clock_pending));
+        SPLICES.with(|splices| splices.borrow_mut().clear());
+        let built = rows_built_by_a_frame(&mut test, |test| {
+            test.executor().advance_clock(TASK_CLOCK_INTERVAL);
+            test.run_until_parked();
+        });
+        assert!(built > 0, "the clock did not redraw");
+        assert!(SPLICES.with(|splices| splices.borrow().is_empty()));
+        assert!(
+            with_thread(id, |thread| thread.clock_pending),
+            "a task still running keeps its clock"
+        );
+
+        // Nothing running, nothing ticking.
+        window
+            .update(&mut test, |view, _, cx| {
+                view.conversation
+                    .apply(task_event("t1", TaskStatus::Completed));
+                cx.notify();
+            })
+            .unwrap();
+        redraw(&mut test);
+        test.executor().advance_clock(TASK_CLOCK_INTERVAL);
+        test.run_until_parked();
+        let idle = rows_built_by_a_frame(&mut test, |test| {
+            test.executor().advance_clock(TASK_CLOCK_INTERVAL * 3);
+            test.run_until_parked();
+        });
+        assert_eq!(idle, 0, "a finished block kept redrawing");
+        assert!(!with_thread(id, |thread| thread.clock_pending));
+    }
+
+    #[test]
+    fn a_task_line_names_its_tool_its_count_and_its_clock() {
+        let conversation = tasks_conversation();
+        let tasks = conversation.tasks();
+        let now = Instant::now();
+        let running = &tasks[0];
+        assert!(task_meta(running, now).starts_with("Grep · 4 tools · "));
+        assert_eq!(task_kind_label(running).as_deref(), Some("general-purpose"));
+        // A finished task's last tool is history, not what it is doing.
+        assert_eq!(task_kind_label(&tasks[3]).as_deref(), Some("shell"));
+        assert_eq!(
+            tasks_title(tasks),
+            "Background tasks · 1 running",
+            "{tasks:?}"
+        );
+        let mut finished = tasks_conversation();
+        finished.apply(task_event("t-run", TaskStatus::Completed));
+        assert_eq!(
+            tasks_title(finished.tasks()),
+            "Background tasks · 2 done · 1 failed · 1 stopped"
+        );
+        assert_eq!(
+            task_meta(&finished.tasks()[0], Instant::now()),
+            format!(
+                "4 tools · {}",
+                duration_label(finished.tasks()[0].elapsed(Instant::now()).as_secs())
+            )
+        );
     }
 }

@@ -14,18 +14,30 @@
 //!   suppresses the echo.
 //! - **Tool calls are reported twice for the same reason**, and the dedup is by
 //!   tool-use id rather than by position.
-//! - **`result` arrives once**, and a turn that reported it must ignore a second
-//!   one rather than double-counting usage.
+//! - **`result` arrives once per model turn**, and a turn that reported it must
+//!   ignore a second one rather than double-counting usage. A process can run
+//!   several turns, though: a background task's notification and a steer each
+//!   start one, opened by `system/init`, which is what re-arms the count.
 //! - **Control requests block.** Claude waits for a `control_response` on every
 //!   one, so an unrecognised subtype that is silently ignored hangs the turn
 //!   forever. Anything unrecognised gets an explicit refusal instead.
+//!
+//! Background tasks are the fifth. `task_started`, `task_progress` and
+//! `task_notification` are `system` frames, so a subagent's `parent_tool_use_id`
+//! never drops them. Only tasks started in *this* process are reported: a
+//! resumed session announces the tasks the previous process lost as `stopped`
+//! notifications, and those are not work anybody is waiting for. Claude then
+//! answers each such batch with an `init` and a zero-turn `result` whose origin
+//! is `task-notification` — before it reads the prompt — and neither of those is
+//! the turn the user asked for.
 
 use std::collections::VecDeque;
 
 use serde_json::{Value, json};
 
 use crate::provider::{
-    ApprovalRequest, Lifecycle, ProviderEvent, Question, RiskLevel, Usage, UserInputRequest,
+    ApprovalRequest, Lifecycle, ProviderEvent, Question, RiskLevel, TaskStatus, TaskUpdate, Usage,
+    UserInputRequest,
 };
 
 /// The most questions taken from one `AskUserQuestion` payload.
@@ -36,6 +48,9 @@ pub const MAX_OPTIONS: usize = 10;
 pub const MAX_PARAMETERS: usize = 20;
 /// The most tool calls whose ids are remembered for deduplication.
 pub const MAX_TRACKED_TOOL_IDS: usize = 512;
+/// The most tasks one process tracks. Past this the oldest is forgotten, and a
+/// notification for it is then ignored like one from a previous process.
+pub const MAX_TRACKED_TASKS: usize = 256;
 /// Reads Claude's stream, producing provider events.
 #[derive(Debug, Default)]
 pub struct ClaudeStreamParser {
@@ -77,11 +92,28 @@ pub struct ClaudeStreamParser {
     /// Held rather than written directly because the parser has no process; the
     /// transport writes it.
     last_refusal: Option<Value>,
+    /// Tasks this process started and has not heard the last of, oldest first.
+    tasks: VecDeque<TrackedTask>,
     /// Whether `AskUserQuestion` is answered automatically.
     ///
     /// Off by default: a question is a decision for the user, and auto-answering
     /// it would have the agent ask itself things and guess.
     pub auto_approve: bool,
+}
+
+/// One task the parser has seen start.
+#[derive(Debug, Clone)]
+struct TrackedTask {
+    /// What `task_started` said, so a call that moves to the background later
+    /// can be reported with its description.
+    started: TaskUpdate,
+    /// Running behind the turn rather than inside the call that started it.
+    /// Only these are reported or waited for: a foreground subagent is already
+    /// its own tool row, and its call does not return until it is done.
+    background: bool,
+    /// A terminal status arrived. The notification that follows still carries
+    /// the summary, so the task is kept until it does.
+    finished: bool,
 }
 
 /// What a pending control is waiting for.
@@ -158,13 +190,7 @@ impl ClaudeStreamParser {
             self.session_id = Some(id.to_owned());
         }
 
-        // Everything Claude writes in stream-json mode answers a user message,
-        // `init` included. A `control_response` is the exception: it answers
-        // FlowX's own control requests, which come with or without a prompt.
-        if matches!(
-            kind,
-            "system" | "stream_event" | "assistant" | "user" | "result" | "control_request"
-        ) {
+        if answers_prompt(kind, &envelope) {
             self.prompt_consumed = true;
         }
         // A subagent's narration carries the id of the tool call that started
@@ -286,20 +312,178 @@ impl ClaudeStreamParser {
         })]
     }
 
-    /// Lifecycle and session-init frames.
+    /// Lifecycle, session-init and task frames.
     fn system(&mut self, envelope: &Value) -> Vec<ProviderEvent> {
         let subtype = envelope.get("subtype").and_then(Value::as_str);
         match subtype {
             // No subtype is the older spelling of `init`.
-            None | Some("init") => vec![ProviderEvent::Lifecycle(Lifecycle::TurnStarted)],
+            None | Some("init") => {
+                // Every model turn opens with `init`, the follow-up a task's
+                // notification starts and a steer included. The turn before
+                // has reported its `result`, so this one's must be counted,
+                // and its text has not streamed yet.
+                self.did_finish = false;
+                self.saw_text_delta = false;
+                vec![ProviderEvent::Lifecycle(Lifecycle::TurnStarted)]
+            }
             Some("status")
                 if envelope.get("status").and_then(Value::as_str) == Some("compacting") =>
             {
                 vec![ProviderEvent::Lifecycle(Lifecycle::Compacting)]
             }
             Some("compact_boundary") => vec![ProviderEvent::Lifecycle(Lifecycle::Compacted)],
+            Some("task_started") => self.task_started(envelope),
+            Some("task_progress") => self.task_progress(envelope),
+            Some("task_updated") => self.task_updated(envelope),
+            Some("task_notification") => self.task_notification(envelope),
             _ => Vec::new(),
         }
+    }
+
+    /// A task began. Ambient work — memory consolidation, a passive monitor —
+    /// is the CLI's own business and nobody waits on it.
+    fn task_started(&mut self, envelope: &Value) -> Vec<ProviderEvent> {
+        let Some(id) = non_empty(envelope.get("task_id")) else {
+            return Vec::new();
+        };
+        if is_ambient(envelope) {
+            return Vec::new();
+        }
+        let started = TaskUpdate {
+            id: id.clone(),
+            tool_use_id: non_empty(envelope.get("tool_use_id")),
+            description: non_empty(envelope.get("description")).map(|text| bounded(&text, 512)),
+            kind: non_empty(envelope.get("task_type")),
+            subagent_type: non_empty(envelope.get("subagent_type")),
+            status: TaskStatus::Running,
+            ..TaskUpdate::default()
+        };
+        // Only an explicit `false` is a foreground call. Remote agents,
+        // workflows and monitors do not carry the flag at all, and they run
+        // behind the turn by nature.
+        let background = envelope.get("is_backgrounded").and_then(Value::as_bool) != Some(false);
+        self.tasks.retain(|task| task.started.id != id);
+        self.tasks.push_back(TrackedTask {
+            started: started.clone(),
+            background,
+            finished: false,
+        });
+        while self.tasks.len() > MAX_TRACKED_TASKS {
+            self.tasks.pop_front();
+        }
+        if background {
+            vec![ProviderEvent::Task(started)]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Work a running task has done so far.
+    fn task_progress(&mut self, envelope: &Value) -> Vec<ProviderEvent> {
+        let Some(task) = self.tracked(envelope) else {
+            return Vec::new();
+        };
+        if !task.background || task.finished {
+            return Vec::new();
+        }
+        let mut update = self.task_update(envelope, TaskStatus::Running);
+        update.last_tool = non_empty(envelope.get("last_tool_name"));
+        vec![ProviderEvent::Task(update)]
+    }
+
+    /// A change to a task's record: moved to the background, or ended. The
+    /// notification usually follows at once, but the patch is the earlier word
+    /// and the one a stopped task may be left with.
+    fn task_updated(&mut self, envelope: &Value) -> Vec<ProviderEvent> {
+        let Some(id) = non_empty(envelope.get("task_id")) else {
+            return Vec::new();
+        };
+        let Some(patch) = envelope.get("patch") else {
+            return Vec::new();
+        };
+        let Some(task) = self.tasks.iter_mut().find(|task| task.started.id == id) else {
+            return Vec::new();
+        };
+        let mut events = Vec::new();
+        if !task.background && patch.get("is_backgrounded").and_then(Value::as_bool) == Some(true) {
+            task.background = true;
+            events.push(ProviderEvent::Task(task.started.clone()));
+        }
+        if let Some(status) = patch
+            .get("status")
+            .and_then(Value::as_str)
+            .filter(|status| *status != "running" && *status != "pending")
+            && !task.finished
+        {
+            task.finished = true;
+            if task.background {
+                events.push(ProviderEvent::Task(TaskUpdate {
+                    id,
+                    status: TaskStatus::from_notification(status),
+                    ..TaskUpdate::default()
+                }));
+            }
+        }
+        events
+    }
+
+    /// How a task ended, with its summary. The last word about it.
+    fn task_notification(&mut self, envelope: &Value) -> Vec<ProviderEvent> {
+        let Some(task) = self.tracked(envelope) else {
+            // Not started in this process: a resumed session reports the tasks
+            // the last one lost, and nothing here is waiting for them.
+            return Vec::new();
+        };
+        let background = task.background;
+        let id = task.started.id.clone();
+        self.tasks.retain(|task| task.started.id != id);
+        if !background {
+            return Vec::new();
+        }
+        let status = envelope
+            .get("status")
+            .and_then(Value::as_str)
+            .map(TaskStatus::from_notification)
+            .unwrap_or(TaskStatus::Stopped);
+        let mut update = self.task_update(envelope, status);
+        // A failure may explain itself only in `reason`.
+        if update.summary.is_none() {
+            update.summary = non_empty(envelope.get("reason")).map(|text| bounded(&text, 2_048));
+        }
+        vec![ProviderEvent::Task(update)]
+    }
+
+    /// The task a frame names, if this process started it.
+    fn tracked(&self, envelope: &Value) -> Option<&TrackedTask> {
+        let id = non_empty(envelope.get("task_id"))?;
+        self.tasks.iter().find(|task| task.started.id == id)
+    }
+
+    /// The fields progress and notification frames share.
+    fn task_update(&self, envelope: &Value, status: TaskStatus) -> TaskUpdate {
+        let usage = envelope.get("usage");
+        TaskUpdate {
+            id: non_empty(envelope.get("task_id")).unwrap_or_default(),
+            tool_use_id: non_empty(envelope.get("tool_use_id")),
+            description: non_empty(envelope.get("description")).map(|text| bounded(&text, 512)),
+            subagent_type: non_empty(envelope.get("subagent_type")),
+            status,
+            summary: non_empty(envelope.get("summary")).map(|text| bounded(&text, 2_048)),
+            tool_uses: usage.and_then(|usage| counted(usage.get("tool_uses"))),
+            tokens: usage.and_then(|usage| counted(usage.get("total_tokens"))),
+            duration_ms: usage.and_then(|usage| counted(usage.get("duration_ms"))),
+            ..TaskUpdate::default()
+        }
+    }
+
+    /// Whether a background task this process started is still running.
+    ///
+    /// This is what keeps stdin open past a `result`: Claude reports the task's
+    /// end as a new turn, and only an open input can still be steered.
+    pub fn has_running_tasks(&self) -> bool {
+        self.tasks
+            .iter()
+            .any(|task| task.background && !task.finished)
     }
 
     /// A streamed frame. Only text deltas are meaningful here.
@@ -410,6 +594,11 @@ impl ClaudeStreamParser {
 
     /// The end of a turn: usage, then completion.
     fn result(&mut self, envelope: &Value) -> Vec<ProviderEvent> {
+        // Nothing was asked and nothing answered, so there is nothing to end:
+        // the turn the user is waiting for has not started yet.
+        if acknowledges_notification(envelope) {
+            return Vec::new();
+        }
         // A second `result` would double-count a turn's cost.
         if self.did_finish {
             return Vec::new();
@@ -476,6 +665,7 @@ impl ClaudeStreamParser {
         self.pending.clear();
         self.sequence = 0;
         self.last_refusal = None;
+        self.tasks.clear();
     }
 
     /// Take a refusal produced by the last line, if any.
@@ -760,14 +950,60 @@ fn context_window_of(envelope: &Value) -> Option<u64> {
 }
 
 fn count(value: Option<&Value>) -> u64 {
-    value
-        .and_then(|value| match value {
-            Value::Number(n) => n.as_u64(),
-            // Claude writes some counts as strings on older builds.
-            Value::String(s) => s.parse().ok(),
-            _ => None,
-        })
-        .unwrap_or(0)
+    counted(value).unwrap_or(0)
+}
+
+/// A count, or `None` when the frame did not carry one.
+fn counted(value: Option<&Value>) -> Option<u64> {
+    value.and_then(|value| match value {
+        Value::Number(n) => n.as_u64(),
+        // Claude writes some counts as strings on older builds.
+        Value::String(s) => s.parse().ok(),
+        _ => None,
+    })
+}
+
+/// Whether a frame proves Claude read the prompt FlowX sent.
+///
+/// Content does, and so do the lifecycle frames of a turn that is actually
+/// running — a compaction, a request going out — even though none of them is
+/// shown, because a prompt Claude has read must not be offered back for
+/// sending again. `init` does not: a resumed session opens a turn for each
+/// batch of notifications about tasks the previous process lost, and answers it
+/// with a zero-turn `result`, all before the prompt is read. For the same
+/// reason a `result` that answers a task notification proves nothing, and nor
+/// do task, hook and housekeeping frames. A `control_response` answers FlowX's
+/// own control requests, which come with or without a prompt.
+fn answers_prompt(kind: &str, envelope: &Value) -> bool {
+    match kind {
+        "stream_event" | "assistant" | "user" | "control_request" => true,
+        "result" => !answers_notification(envelope),
+        "system" => matches!(
+            envelope.get("subtype").and_then(Value::as_str),
+            Some("status" | "compact_boundary")
+        ),
+        _ => false,
+    }
+}
+
+/// Whether a `result` closes a turn a task notification started, rather than
+/// one a user message did.
+fn answers_notification(envelope: &Value) -> bool {
+    envelope.pointer("/origin/kind").and_then(Value::as_str) == Some("task-notification")
+}
+
+/// Whether a `result` is Claude acknowledging a task notification without
+/// asking the model anything: no turns, no usage, no answer. A resumed session
+/// sends one for each batch of tasks the previous process lost.
+fn acknowledges_notification(envelope: &Value) -> bool {
+    answers_notification(envelope)
+        && envelope.get("num_turns").and_then(Value::as_u64) == Some(0)
+        && envelope.get("is_error").and_then(Value::as_bool) != Some(true)
+}
+
+/// Whether a task frame is the CLI's own background housekeeping.
+fn is_ambient(envelope: &Value) -> bool {
+    envelope.get("ambient").and_then(Value::as_bool) == Some(true)
 }
 
 /// The decision object Claude expects back for a tool call.
@@ -1926,7 +2162,7 @@ mod tests {
         // Thinking produces no event at all, and usage and lifecycle frames are
         // not content, but each shows Claude read the prompt.
         for frame in [
-            json!({"type": "system", "subtype": "init"}),
+            json!({"type": "system", "subtype": "status", "status": "requesting"}),
             json!({"type": "system", "subtype": "status", "status": "compacting"}),
             json!({"type": "stream_event", "event": {"type": "content_block_delta",
                    "delta": {"type": "thinking_delta", "thinking": "hmm"}}}),
@@ -1941,6 +2177,196 @@ mod tests {
         parser.events(&line(json!({"type": "control_response", "response": {}})));
         parser.events("not json");
         assert!(!parser.prompt_consumed());
+    }
+
+    /// What Claude Code 2.1.283 writes on resuming a session whose background
+    /// tasks the previous process lost, before it reads the prompt: a `stopped`
+    /// notification per task, then an `init` and a zero-turn `result` per batch.
+    fn resumed_preamble() -> Vec<Value> {
+        let ack = json!({"type": "result", "subtype": "success", "is_error": false,
+            "num_turns": 0, "duration_api_ms": 0, "result": "", "stop_reason": null,
+            "origin": {"kind": "task-notification"},
+            "usage": {"input_tokens": 0, "output_tokens": 0}, "session_id": "s1"});
+        vec![
+            json!({"type": "system", "subtype": "task_notification", "task_id": "a1",
+                   "status": "stopped", "session_id": "s1"}),
+            json!({"type": "system", "subtype": "task_notification", "task_id": "b1",
+                   "tool_use_id": "toolu_b1", "status": "stopped", "session_id": "s1"}),
+            json!({"type": "system", "subtype": "init", "session_id": "s1"}),
+            ack.clone(),
+            json!({"type": "system", "subtype": "init", "session_id": "s1"}),
+            ack,
+        ]
+    }
+
+    #[test]
+    fn a_resumed_sessions_lost_tasks_neither_end_the_turn_nor_read_the_prompt() {
+        // The zero-turn `result` used to end the turn before Claude had read
+        // the prompt, so the reply that followed it landed nowhere, and the
+        // `init` before it counted as Claude having taken the prompt.
+        let mut parser = ClaudeStreamParser::new();
+        let mut events = Vec::new();
+        for frame in resumed_preamble() {
+            events.extend(parser.events(&line(frame)));
+        }
+        assert!(
+            events
+                .iter()
+                .all(|event| *event == ProviderEvent::Lifecycle(Lifecycle::TurnStarted)),
+            "{events:?}"
+        );
+        assert!(!parser.did_finish());
+        assert!(!parser.prompt_consumed());
+        assert!(
+            !parser.has_running_tasks(),
+            "a task the last process lost was counted as running"
+        );
+
+        // The real turn still ends at its own `result`.
+        for frame in [
+            json!({"type": "system", "subtype": "init", "session_id": "s1"}),
+            json!({"type": "stream_event", "event": {"type": "content_block_delta",
+                   "delta": {"type": "text_delta", "text": "the reply"}}}),
+            json!({"type": "result", "subtype": "success", "num_turns": 1,
+                   "usage": {"input_tokens": 3, "output_tokens": 2}}),
+        ] {
+            events.extend(parser.events(&line(frame)));
+        }
+        assert!(parser.prompt_consumed());
+        assert!(events.contains(&ProviderEvent::TextDelta("the reply".into())));
+        assert!(matches!(events.last(), Some(ProviderEvent::Done { .. })));
+    }
+
+    fn task_started(id: &str, background: bool) -> Value {
+        json!({"type": "system", "subtype": "task_started", "task_id": id,
+               "tool_use_id": format!("toolu_{id}"), "description": format!("review {id}"),
+               "subagent_type": "general-purpose", "is_backgrounded": background,
+               "task_type": "local_agent", "session_id": "s1"})
+    }
+
+    #[test]
+    fn a_background_task_is_reported_from_start_to_finish() {
+        let mut parser = ClaudeStreamParser::new();
+        let started = parser.events(&line(task_started("t1", true)));
+        assert_eq!(
+            started,
+            vec![ProviderEvent::Task(TaskUpdate {
+                id: "t1".into(),
+                tool_use_id: Some("toolu_t1".into()),
+                description: Some("review t1".into()),
+                kind: Some("local_agent".into()),
+                subagent_type: Some("general-purpose".into()),
+                status: TaskStatus::Running,
+                ..TaskUpdate::default()
+            })]
+        );
+        assert!(parser.has_running_tasks());
+
+        let progress = parser.events(&line(json!({
+            "type": "system", "subtype": "task_progress", "task_id": "t1",
+            "tool_use_id": "toolu_t1", "description": "review t1",
+            "usage": {"total_tokens": 1200, "tool_uses": 4, "duration_ms": 9000},
+            "last_tool_name": "Grep", "summary": "Searching the transport"
+        })));
+        let [ProviderEvent::Task(progress)] = progress.as_slice() else {
+            panic!("{progress:?}")
+        };
+        assert_eq!(progress.status, TaskStatus::Running);
+        assert_eq!(progress.last_tool.as_deref(), Some("Grep"));
+        assert_eq!(progress.tool_uses, Some(4));
+        assert_eq!(progress.tokens, Some(1200));
+        assert_eq!(progress.duration_ms, Some(9000));
+
+        let finished = parser.events(&line(json!({
+            "type": "system", "subtype": "task_notification", "task_id": "t1",
+            "tool_use_id": "toolu_t1", "status": "completed", "output_file": "/tmp/t1",
+            "summary": "Agent finished", "usage": {"total_tokens": 1500, "tool_uses": 6,
+            "duration_ms": 12000}
+        })));
+        let [ProviderEvent::Task(finished)] = finished.as_slice() else {
+            panic!("{finished:?}")
+        };
+        assert_eq!(finished.status, TaskStatus::Completed);
+        assert_eq!(finished.summary.as_deref(), Some("Agent finished"));
+        assert!(!parser.has_running_tasks());
+        // Told once: a repeated notification is not a second ending.
+        assert!(
+            parser
+                .events(&line(
+                    json!({"type": "system", "subtype": "task_notification",
+                                      "task_id": "t1", "status": "completed"})
+                ))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_task_frame_is_kept_whatever_its_parent() {
+        // Subagent narration is dropped by its `parent_tool_use_id`. A task
+        // frame must not be: it is the main session's record of the task.
+        let mut parser = ClaudeStreamParser::new();
+        let mut frame = task_started("t1", true);
+        frame["parent_tool_use_id"] = json!("toolu_parent");
+        assert_eq!(parser.events(&line(frame)).len(), 1);
+        assert!(parser.has_running_tasks());
+    }
+
+    #[test]
+    fn a_foreground_call_is_not_a_background_task_until_it_moves_there() {
+        let mut parser = ClaudeStreamParser::new();
+        assert!(parser.events(&line(task_started("t1", false))).is_empty());
+        assert!(!parser.has_running_tasks());
+        let moved = parser.events(&line(json!({"type": "system", "subtype": "task_updated",
+            "task_id": "t1", "patch": {"is_backgrounded": true}})));
+        assert!(
+            matches!(moved.as_slice(), [ProviderEvent::Task(task)] if task.description.as_deref() == Some("review t1")),
+            "{moved:?}"
+        );
+        assert!(parser.has_running_tasks());
+        // A terminal patch ends it, even before the notification arrives.
+        let ended = parser.events(&line(json!({"type": "system", "subtype": "task_updated",
+            "task_id": "t1", "patch": {"status": "killed"}})));
+        assert!(
+            matches!(ended.as_slice(), [ProviderEvent::Task(task)] if task.status == TaskStatus::Stopped)
+        );
+        assert!(!parser.has_running_tasks());
+    }
+
+    #[test]
+    fn ambient_housekeeping_is_not_a_task() {
+        let mut parser = ClaudeStreamParser::new();
+        let mut frame = task_started("dream", true);
+        frame["ambient"] = json!(true);
+        assert!(parser.events(&line(frame)).is_empty());
+        assert!(!parser.has_running_tasks());
+    }
+
+    #[test]
+    fn a_follow_up_turn_reports_its_own_text_and_result() {
+        // A notification is answered as a new turn. Its echo and its `result`
+        // used to be swallowed as repeats of the first turn's.
+        let mut parser = ClaudeStreamParser::new();
+        let mut events = Vec::new();
+        for frame in [
+            json!({"type": "system", "subtype": "init"}),
+            json!({"type": "assistant", "message": {"content": [{"type": "text", "text": "started"}]}}),
+            json!({"type": "result", "subtype": "success", "num_turns": 2, "usage": {}}),
+            json!({"type": "system", "subtype": "init"}),
+            json!({"type": "assistant", "message": {"content": [{"type": "text", "text": "finished"}]}}),
+            json!({"type": "result", "subtype": "success", "num_turns": 1,
+                   "origin": {"kind": "task-notification"}, "usage": {}}),
+        ] {
+            events.extend(parser.events(&line(frame)));
+        }
+        assert!(events.contains(&ProviderEvent::Text("finished".into())));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ProviderEvent::Done { .. }))
+                .count(),
+            2,
+            "{events:?}"
+        );
     }
 
     #[test]

@@ -84,6 +84,9 @@ impl FxAnimation {
     pub const ACTIVITY_FRAME: Duration = Duration::from_millis(33);
     /// One step of the three-dot typing indicator.
     pub const TYPING_STEP: Duration = Duration::from_millis(350);
+    /// How often a running clock repaints. Elapsed times are shown in whole
+    /// seconds, so anything faster is a repaint that changes nothing.
+    pub const CLOCK_TICK: Duration = Duration::from_secs(1);
 
     /// Decelerating ease, matching `easeOut`.
     pub fn ease_out() -> impl Fn(f32) -> f32 + 'static {

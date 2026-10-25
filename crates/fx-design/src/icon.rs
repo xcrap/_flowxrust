@@ -150,6 +150,8 @@ icons! {
     PLUS_CIRCLE => "plus.circle",
     CHECKMARK => "checkmark",
     CHECKMARK_CIRCLE_FILL => "checkmark.circle.fill",
+    CIRCLE => "circle",
+    CHECKLIST => "checklist",
     ARROW_UP => "arrow.up",
     ARROW_UP_CIRCLE_FILL => "arrow.up.circle.fill",
     ARROW_UP_RIGHT_SQUARE => "arrow.up.right.square",

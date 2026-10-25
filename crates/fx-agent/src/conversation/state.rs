@@ -16,15 +16,18 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use fx_core::{AgentAccess, ConversationMessage, MessageRole, Timestamp};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::provider::{ProviderEvent, RiskLevel, Usage};
+use crate::provider::{ProviderEvent, RiskLevel, TaskStatus, TaskUpdate, Usage};
 
 /// How many messages a conversation retains.
 pub const MAX_RETAINED_MESSAGES: usize = 250;
+/// How many background tasks one conversation shows.
+pub const MAX_BACKGROUND_TASKS: usize = 64;
 /// How many pending approvals are tracked before the oldest is forgotten.
 pub const MAX_PENDING_APPROVALS: usize = 64;
 /// How many completed tool ids are remembered for de-duplication.
@@ -168,6 +171,105 @@ pub struct RuntimeActivity {
     pub is_session: bool,
 }
 
+/// Work a turn started in the background: a subagent, or a command it ran
+/// with `run_in_background`.
+///
+/// Kept for the latest turn that started any, running and finished alike, so
+/// the transcript can show what came back and what did not. Live only: a task
+/// belongs to the process that ran it, so nothing here is saved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackgroundTask {
+    pub id: String,
+    pub tool_use_id: Option<String>,
+    pub description: String,
+    /// What runs it, in the provider's words: `local_bash`, `local_agent`.
+    pub kind: Option<String>,
+    pub subagent_type: Option<String>,
+    pub status: TaskStatus,
+    pub summary: Option<String>,
+    pub last_tool: Option<String>,
+    pub tool_uses: Option<u64>,
+    pub tokens: Option<u64>,
+    /// How long the provider last said it had been running.
+    pub reported_duration: Option<Duration>,
+    /// When FlowX heard it start, which is what a running task's clock reads.
+    pub started_at: Instant,
+    pub finished_at: Option<Instant>,
+}
+
+impl BackgroundTask {
+    fn new(update: &TaskUpdate, now: Instant) -> Self {
+        Self {
+            id: update.id.clone(),
+            tool_use_id: None,
+            description: String::new(),
+            kind: None,
+            subagent_type: None,
+            status: TaskStatus::Running,
+            summary: None,
+            last_tool: None,
+            tool_uses: None,
+            tokens: None,
+            reported_duration: None,
+            started_at: now,
+            finished_at: None,
+        }
+    }
+
+    /// Fold one report in, keeping whatever it did not say.
+    fn merge(&mut self, update: TaskUpdate, now: Instant) {
+        if let Some(id) = update.tool_use_id {
+            self.tool_use_id = Some(id);
+        }
+        if let Some(description) = update.description {
+            self.description = description;
+        }
+        if let Some(kind) = update.kind {
+            self.kind = Some(kind);
+        }
+        if let Some(subagent_type) = update.subagent_type {
+            self.subagent_type = Some(subagent_type);
+        }
+        if let Some(summary) = update.summary {
+            self.summary = Some(summary);
+        }
+        if let Some(tool) = update.last_tool {
+            self.last_tool = Some(tool);
+        }
+        if let Some(count) = update.tool_uses {
+            self.tool_uses = Some(count);
+        }
+        if let Some(tokens) = update.tokens {
+            self.tokens = Some(tokens);
+        }
+        if let Some(duration) = update.duration_ms {
+            self.reported_duration = Some(Duration::from_millis(duration));
+        }
+        // A finished task stays finished: a late progress frame is not a
+        // second life.
+        if self.status.is_running() && !update.status.is_running() {
+            self.status = update.status;
+            self.finished_at = Some(now);
+        }
+    }
+
+    /// How long the task has run, or ran.
+    ///
+    /// A running task reads the clock. A finished one prefers the provider's
+    /// own figure, which does not include the time its report took to arrive.
+    pub fn elapsed(&self, now: Instant) -> Duration {
+        let observed = self
+            .finished_at
+            .unwrap_or(now)
+            .saturating_duration_since(self.started_at);
+        match (self.finished_at, self.reported_duration) {
+            (Some(_), Some(reported)) => reported,
+            (None, Some(reported)) => observed.max(reported),
+            _ => observed,
+        }
+    }
+}
+
 /// A prompt that failed to send, kept so the user can retry it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UnsentPrompt {
@@ -256,8 +358,18 @@ pub struct Conversation {
     /// duplicate a row.
     completed_tool_ids: VecDeque<String>,
     activities: VecDeque<RuntimeActivity>,
+    /// Background work the latest turn started, oldest first.
+    tasks: Vec<BackgroundTask>,
+    /// Bumped whenever a task is added or reports anything.
+    tasks_revision: u64,
     /// The provider's session, once known.
     session_id: Option<String>,
+    /// When the current or most recent turn began, for its elapsed time.
+    turn_started_at: Option<Timestamp>,
+    /// When the turn last moved on to something new: a call, a result, or a
+    /// reply starting to stream. A tool call's own start is its message's
+    /// timestamp; this covers the stretches between calls.
+    step_started_at: Option<Timestamp>,
     /// Bumped whenever anything a view renders changes.
     revision: u64,
 }
@@ -417,6 +529,9 @@ impl Conversation {
             return false;
         }
         if self.phase != phase {
+            if !self.is_busy() && !matches!(phase, Phase::Idle | Phase::Failed) {
+                self.start_turn_clock();
+            }
             self.phase = phase;
             self.touch();
         }
@@ -684,6 +799,165 @@ impl Conversation {
         self.activities.iter()
     }
 
+    // ── Turn progress ───────────────────────────────────────────────────────
+
+    /// When the current or most recent turn began.
+    ///
+    /// Set when the conversation goes from settled to busy, which is the same
+    /// moment for every provider, and kept after the turn ends.
+    pub fn turn_started_at(&self) -> Option<Timestamp> {
+        self.turn_started_at
+    }
+
+    /// When the turn last moved on to something new.
+    pub fn step_started_at(&self) -> Option<Timestamp> {
+        self.step_started_at
+    }
+
+    fn start_turn_clock(&mut self) {
+        let now = fx_core::models::now();
+        self.turn_started_at = Some(now);
+        self.step_started_at = Some(now);
+    }
+
+    /// Remember when the turn moved on, before the event is applied.
+    fn note_step(&mut self, event: &ProviderEvent) {
+        let moved_on = match event {
+            ProviderEvent::ToolUse { .. } | ProviderEvent::ToolResult { .. } => true,
+            // Only the first delta of a reply starts a step; the rest continue it.
+            ProviderEvent::TextDelta(_) => self.streaming_text.is_empty(),
+            _ => false,
+        };
+        if moved_on {
+            self.step_started_at = Some(fx_core::models::now());
+        }
+    }
+
+    /// Record a plan that arrived as a notification as the call it stands for.
+    ///
+    /// Codex's model calls `update_plan`, but the server reports it only as
+    /// `turn/plan/updated`. Recording the call puts the plan in the transcript
+    /// where it happened, exactly where Claude's `TodoWrite` already is, so the
+    /// view reads one kind of plan and a finished turn keeps its own. A repeat
+    /// of the plan the turn already holds adds nothing.
+    fn record_plan(&mut self, plan: &fx_core::policy::TurnPlan) {
+        let input = plan.to_tool_input();
+        let unchanged = self
+            .messages
+            .iter()
+            .rev()
+            .take_while(|message| message.role != MessageRole::User)
+            .flat_map(|message| message.content.iter().rev())
+            .find_map(|block| match block {
+                fx_core::MessageContent::ToolUse { name, input, .. }
+                    if fx_core::policy::TurnPlan::is_plan_tool(name) =>
+                {
+                    Some(input)
+                }
+                _ => None,
+            })
+            .is_some_and(|latest| *latest == input);
+        if unchanged {
+            return;
+        }
+        self.append(ConversationMessage::new(
+            MessageRole::Assistant,
+            vec![fx_core::MessageContent::ToolUse {
+                id: format!("plan-{}", Uuid::new_v4()),
+                name: fx_core::policy::turn_plan::PLAN_TOOL_NAME.to_string(),
+                input,
+            }],
+        ));
+    }
+
+    // ── Background tasks ────────────────────────────────────────────────────
+
+    /// The latest turn's background tasks, oldest first.
+    pub fn tasks(&self) -> &[BackgroundTask] {
+        &self.tasks
+    }
+
+    /// Bumped whenever a task is added or reports anything, which is what a
+    /// view keys its re-measuring on. A running task's clock does not move it.
+    pub fn tasks_revision(&self) -> u64 {
+        self.tasks_revision
+    }
+
+    pub fn has_running_tasks(&self) -> bool {
+        self.tasks.iter().any(|task| task.status.is_running())
+    }
+
+    pub fn running_task_count(&self) -> usize {
+        self.tasks
+            .iter()
+            .filter(|task| task.status.is_running())
+            .count()
+    }
+
+    /// Fold in one report about a task.
+    ///
+    /// A task is added only by a report that it is running. An ending for a
+    /// task never seen starting belongs to another process, and showing it
+    /// would claim work this turn never did.
+    pub fn apply_task(&mut self, update: TaskUpdate) {
+        let now = Instant::now();
+        match self.tasks.iter_mut().find(|task| task.id == update.id) {
+            Some(task) => task.merge(update, now),
+            None if update.status.is_running() && !update.id.is_empty() => {
+                let mut task = BackgroundTask::new(&update, now);
+                task.merge(update, now);
+                self.tasks.push(task);
+                while self.tasks.len() > MAX_BACKGROUND_TASKS {
+                    // The oldest finished task goes first; a running one is
+                    // only dropped when nothing else can be.
+                    let index = self
+                        .tasks
+                        .iter()
+                        .position(|task| !task.status.is_running())
+                        .unwrap_or(0);
+                    self.tasks.remove(index);
+                }
+            }
+            None => return,
+        }
+        self.tasks_revision += 1;
+        self.touch();
+    }
+
+    /// Mark every task still running as stopped, with the reason.
+    ///
+    /// For a turn that ended while they ran: stopped, failed, or given up on.
+    /// Their process is gone, so a spinner left on them would never stop.
+    pub fn stop_running_tasks(&mut self, reason: &str) {
+        let now = Instant::now();
+        let mut changed = false;
+        for task in self
+            .tasks
+            .iter_mut()
+            .filter(|task| task.status.is_running())
+        {
+            task.status = TaskStatus::Stopped;
+            task.finished_at = Some(now);
+            if !reason.is_empty() {
+                task.summary = Some(reason.to_string());
+            }
+            changed = true;
+        }
+        if changed {
+            self.tasks_revision += 1;
+            self.touch();
+        }
+    }
+
+    /// Forget the previous turn's tasks, as a new turn starts.
+    pub fn clear_tasks(&mut self) {
+        if !self.tasks.is_empty() {
+            self.tasks.clear();
+            self.tasks_revision += 1;
+            self.touch();
+        }
+    }
+
     // ── Tool de-duplication ─────────────────────────────────────────────────
 
     /// Whether a tool id has not been reported yet, recording it if so.
@@ -715,6 +989,7 @@ impl Conversation {
 
     /// Apply one provider event.
     pub fn apply(&mut self, event: ProviderEvent) {
+        self.note_step(&event);
         match event {
             ProviderEvent::Lifecycle(lifecycle) => {
                 use crate::provider::Lifecycle as L;
@@ -765,10 +1040,9 @@ impl Conversation {
                         input: input.clone(),
                     }],
                 ));
-                // Claimed for the activity row's spinner, *not* as an append
-                // guard. The result arrives with the same id, so a gate here
-                // would reject every legitimate first result.
-                self.claim_tool_id(&id);
+                // Not claimed here: the claim is what tells a view the call has
+                // finished, and claiming it as it starts made every running call
+                // read as done. The result claims it, and gates nothing.
                 self.record_activity(format!("Running {name}"), false);
                 self.set_phase(Phase::Running);
             }
@@ -832,6 +1106,7 @@ impl Conversation {
                     is_other: request.questions.first().is_some_and(|q| q.is_other),
                 });
             }
+            ProviderEvent::PlanUpdated(plan) => self.record_plan(&plan),
             ProviderEvent::Usage(usage) => self.record_usage(usage),
             ProviderEvent::CumulativeUsage(usage) => self.record_cumulative_usage(usage),
             ProviderEvent::ContextUsage { used, window } => self.record_context(used, window),
@@ -846,10 +1121,19 @@ impl Conversation {
                 // Commit, not clear. Clearing discards the turn's last prose, so
                 // the final answer never reaches the transcript at all.
                 self.commit_streaming();
-                if self.phase != Phase::WaitingForApproval && self.phase != Phase::WaitingForInput {
+                // A background task still running will answer as a turn of its
+                // own, so the thread is still working rather than ready.
+                if self.has_running_tasks() {
+                    if !self.is_waiting_for_user() {
+                        self.set_phase(Phase::Running);
+                    }
+                } else if self.phase != Phase::WaitingForApproval
+                    && self.phase != Phase::WaitingForInput
+                {
                     self.set_phase(Phase::Idle);
                 }
             }
+            ProviderEvent::Task(update) => self.apply_task(update),
         }
     }
 
@@ -1611,6 +1895,120 @@ mod tests {
     }
 
     #[test]
+    fn a_call_is_finished_when_its_result_arrives_not_when_it_starts() {
+        // A view reads the claim as "this call is done". Claiming the call as
+        // it started made every running call look finished, so nothing could
+        // say which one was still going.
+        let mut c = Conversation::new(Uuid::nil());
+        c.apply(ProviderEvent::ToolUse {
+            id: "t1".into(),
+            name: "Bash".into(),
+            input: "{}".into(),
+        });
+        assert!(!c.has_completed_tool("t1"), "a running call read as done");
+        // A result with nothing to say is not a row, but it does finish the call.
+        c.apply(ProviderEvent::ToolResult {
+            id: "t1".into(),
+            content: TRIVIAL_TOOL_RESULT.into(),
+            is_error: false,
+        });
+        assert!(c.has_completed_tool("t1"));
+        assert_eq!(c.message_count(), 1);
+    }
+
+    #[test]
+    fn a_turn_clock_starts_when_work_starts_and_survives_waiting_on_the_reader() {
+        let mut c = Conversation::new(Uuid::nil());
+        assert_eq!(c.turn_started_at(), None, "nothing has run yet");
+        c.set_phase(Phase::Starting);
+        let started = c.turn_started_at().expect("a busy turn has a start");
+        assert_eq!(c.step_started_at(), Some(started));
+
+        // Waiting on an approval is still the same turn.
+        c.set_phase(Phase::WaitingForApproval);
+        c.set_phase(Phase::Running);
+        assert_eq!(c.turn_started_at(), Some(started));
+
+        // The record outlives the turn, and the next turn starts its own.
+        c.set_phase(Phase::Idle);
+        assert_eq!(c.turn_started_at(), Some(started));
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        c.apply(ProviderEvent::Lifecycle(
+            crate::provider::Lifecycle::TurnStarted,
+        ));
+        assert!(c.turn_started_at().unwrap() > started);
+    }
+
+    #[test]
+    fn the_step_clock_moves_on_calls_results_and_the_start_of_a_reply() {
+        let mut c = Conversation::new(Uuid::nil());
+        c.apply(ProviderEvent::Lifecycle(
+            crate::provider::Lifecycle::TurnStarted,
+        ));
+        let mut last = c.step_started_at().unwrap();
+        let mut moved = |c: &mut Conversation, event: ProviderEvent| {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            c.apply(event);
+            let now = c.step_started_at().unwrap();
+            let moved = now > last;
+            last = now;
+            moved
+        };
+        assert!(moved(
+            &mut c,
+            ProviderEvent::ToolUse {
+                id: "t1".into(),
+                name: "Bash".into(),
+                input: "{}".into(),
+            }
+        ));
+        assert!(moved(
+            &mut c,
+            ProviderEvent::ToolResult {
+                id: "t1".into(),
+                content: "Completed".into(),
+                is_error: false,
+            }
+        ));
+        assert!(moved(&mut c, ProviderEvent::TextDelta("Found".into())));
+        assert!(
+            !moved(&mut c, ProviderEvent::TextDelta(" it".into())),
+            "a later delta continues the same reply"
+        );
+    }
+
+    #[test]
+    fn a_plan_update_is_recorded_as_the_call_it_stands_for_once() {
+        use fx_core::policy::{PlanStatus, PlanStep, TurnPlan};
+        let plan = |status| TurnPlan {
+            explanation: None,
+            steps: vec![PlanStep {
+                text: "Fix the bug".into(),
+                active_text: None,
+                status,
+            }],
+        };
+        let mut c = Conversation::new(Uuid::nil());
+        c.append(user_message("fix it"));
+        c.apply(ProviderEvent::PlanUpdated(plan(PlanStatus::InProgress)));
+        c.apply(ProviderEvent::PlanUpdated(plan(PlanStatus::InProgress)));
+        assert_eq!(c.message_count(), 2, "a repeated plan added a second row");
+        c.apply(ProviderEvent::PlanUpdated(plan(PlanStatus::Completed)));
+        assert_eq!(c.message_count(), 3);
+
+        let recorded = c.messages().last().unwrap();
+        let [fx_core::MessageContent::ToolUse { name, input, .. }] = recorded.content.as_slice()
+        else {
+            panic!("expected a tool call, got {recorded:?}");
+        };
+        assert_eq!(
+            TurnPlan::from_tool_call(name, input),
+            Some(plan(PlanStatus::Completed))
+        );
+        assert!(!c.is_streaming());
+    }
+
+    #[test]
     fn every_phase_has_a_human_readable_label() {
         for phase in [
             Phase::Idle,
@@ -1624,5 +2022,104 @@ mod tests {
         ] {
             assert!(!phase.label().is_empty(), "{phase:?} has no label");
         }
+    }
+
+    fn task(id: &str, status: TaskStatus) -> TaskUpdate {
+        TaskUpdate {
+            id: id.into(),
+            status,
+            ..TaskUpdate::default()
+        }
+    }
+
+    #[test]
+    fn a_task_report_fills_in_only_what_it_says() {
+        let mut c = Conversation::new(Uuid::nil());
+        c.apply(ProviderEvent::Task(TaskUpdate {
+            description: Some("review the transport".into()),
+            subagent_type: Some("general-purpose".into()),
+            ..task("t1", TaskStatus::Running)
+        }));
+        c.apply(ProviderEvent::Task(TaskUpdate {
+            last_tool: Some("Grep".into()),
+            tool_uses: Some(3),
+            ..task("t1", TaskStatus::Running)
+        }));
+        let [task_seen] = c.tasks() else {
+            panic!("{:?}", c.tasks())
+        };
+        assert_eq!(task_seen.description, "review the transport");
+        assert_eq!(task_seen.subagent_type.as_deref(), Some("general-purpose"));
+        assert_eq!(task_seen.last_tool.as_deref(), Some("Grep"));
+        assert_eq!(task_seen.tool_uses, Some(3));
+        assert!(c.has_running_tasks());
+
+        let revision = c.tasks_revision();
+        c.apply(ProviderEvent::Task(TaskUpdate {
+            summary: Some("found two bugs".into()),
+            duration_ms: Some(4_000),
+            ..task("t1", TaskStatus::Completed)
+        }));
+        assert!(c.tasks_revision() > revision);
+        assert_eq!(c.tasks()[0].status, TaskStatus::Completed);
+        assert_eq!(c.tasks()[0].summary.as_deref(), Some("found two bugs"));
+        assert_eq!(
+            c.tasks()[0].elapsed(Instant::now()),
+            Duration::from_secs(4),
+            "a finished task reads the provider's own duration"
+        );
+        // Finished stays finished.
+        c.apply(ProviderEvent::Task(task("t1", TaskStatus::Running)));
+        assert!(!c.has_running_tasks());
+    }
+
+    #[test]
+    fn a_task_never_seen_starting_is_not_shown() {
+        let mut c = Conversation::new(Uuid::nil());
+        c.apply(ProviderEvent::Task(task("lost", TaskStatus::Stopped)));
+        assert!(c.tasks().is_empty());
+    }
+
+    #[test]
+    fn a_result_with_a_task_running_leaves_the_thread_working() {
+        // The thread read "Ready" while six reviews were still running.
+        let mut c = Conversation::new(Uuid::nil());
+        c.apply(ProviderEvent::Lifecycle(
+            crate::provider::Lifecycle::TurnStarted,
+        ));
+        c.apply(ProviderEvent::Task(task("t1", TaskStatus::Running)));
+        c.apply(ProviderEvent::TextDelta("started".into()));
+        c.apply(ProviderEvent::Done {
+            stop_reason: "end_turn".into(),
+        });
+        assert_eq!(c.phase(), Phase::Running);
+        assert_eq!(c.last_text().as_deref(), Some("started"));
+
+        c.apply(ProviderEvent::Task(task("t1", TaskStatus::Completed)));
+        c.apply(ProviderEvent::Done {
+            stop_reason: "end_turn".into(),
+        });
+        assert_eq!(c.phase(), Phase::Idle);
+    }
+
+    #[test]
+    fn stopping_running_tasks_says_why_and_leaves_finished_ones_alone() {
+        let mut c = Conversation::new(Uuid::nil());
+        c.apply(ProviderEvent::Task(task("done", TaskStatus::Running)));
+        c.apply(ProviderEvent::Task(TaskUpdate {
+            summary: Some("ok".into()),
+            ..task("done", TaskStatus::Completed)
+        }));
+        c.apply(ProviderEvent::Task(task("live", TaskStatus::Running)));
+        c.stop_running_tasks("Stopped with the turn.");
+        assert_eq!(c.running_task_count(), 0);
+        assert_eq!(c.tasks()[0].summary.as_deref(), Some("ok"));
+        assert_eq!(c.tasks()[1].status, TaskStatus::Stopped);
+        assert_eq!(
+            c.tasks()[1].summary.as_deref(),
+            Some("Stopped with the turn.")
+        );
+        c.clear_tasks();
+        assert!(c.tasks().is_empty());
     }
 }

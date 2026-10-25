@@ -17,14 +17,20 @@ use std::process::Command;
 /// launched with — because the two things worth pinning are the shape of what
 /// FlowX writes and the flags it writes it under.
 const SOURCE: &str = r#"
-import json, os, sys
+import json, os, sys, threading, time
 
 RECEIVED = "RECEIVED_LOG"
 EXITED = "EXITED_LOG"
+RELEASE = os.path.join(os.path.dirname(RECEIVED), "release-background")
+
+# Background tasks write from their own threads, so a line is never split.
+LOCK = threading.Lock()
+workers = []
 
 def send(obj):
-    sys.stdout.write(json.dumps(obj) + "\n")
-    sys.stdout.flush()
+    with LOCK:
+        sys.stdout.write(json.dumps(obj) + "\n")
+        sys.stdout.flush()
 
 def record(obj):
     with open(RECEIVED, "a") as handle:
@@ -66,6 +72,45 @@ def die(code, message):
         sys.stderr.flush()
     sys.exit(code)
 
+def background_task():
+    # The shape Claude Code 2.1.283 writes: the task's end, then a turn of its
+    # own that answers the notification, closed by a `result` whose origin says
+    # so. Held until the test releases it, so what happens in between is
+    # observable rather than a race.
+    while not os.path.exists(RELEASE):
+        time.sleep(0.01)
+    send({"type": "system", "subtype": "task_progress", "task_id": "task-1",
+          "tool_use_id": "tool-bg", "description": "sleep 6; echo done",
+          "usage": {"total_tokens": 0, "tool_uses": 1, "duration_ms": 50},
+          "last_tool_name": "Bash"})
+    send({"type": "system", "subtype": "task_updated", "task_id": "task-1",
+          "patch": {"status": "completed", "end_time": 1}})
+    send({"type": "system", "subtype": "task_notification", "task_id": "task-1",
+          "tool_use_id": "tool-bg", "status": "completed", "output_file": "/tmp/task-1",
+          "summary": "Background command \"sleep 6; echo done\" completed (exit code 0)"})
+    emit_init()
+    send({"type": "stream_event", "event": {"type": "content_block_delta",
+         "delta": {"type": "text_delta", "text": "finished"}}})
+    send({"type": "assistant", "message": {"content": [{"type": "text", "text": "finished"}]}})
+    send({"type": "result", "subtype": "success", "num_turns": 1,
+          "origin": {"kind": "task-notification"},
+          "usage": {"input_tokens": 7, "output_tokens": 1}})
+
+def start_background():
+    emit_init()
+    send({"type": "assistant", "message": {"content": [{"type": "tool_use",
+          "id": "tool-bg", "name": "Bash",
+          "input": {"command": "sleep 6; echo done", "run_in_background": True}}]}})
+    send({"type": "system", "subtype": "task_started", "task_id": "task-1",
+          "tool_use_id": "tool-bg", "description": "sleep 6; echo done",
+          "is_backgrounded": True, "task_type": "local_bash"})
+    send({"type": "user", "message": {"content": [{"type": "tool_result",
+          "tool_use_id": "tool-bg", "content": "Command running in background with ID: task-1."}]}})
+    worker = threading.Thread(target=background_task)
+    worker.start()
+    workers.append(worker)
+    emit_result("started")
+
 for line in sys.stdin:
     line = line.strip()
     if not line:
@@ -85,6 +130,8 @@ for line in sys.stdin:
         if behaviour == "answer":
             emit_init()
             emit_result(rest or "hello from the fake server")
+        elif behaviour == "background":
+            start_background()
         elif behaviour == "ask-tool":
             emit_init()
             request_control("req-1", "Bash", "tool-1", {"command": "cargo test"})
@@ -150,6 +197,10 @@ for line in sys.stdin:
             emit_result("answered")
 
 # Reached only on end of input: the exit is what FlowX's closing stdin caused.
+# Like Claude in print mode, a closed input still waits for running tasks and
+# answers their notifications before the process exits.
+for worker in workers:
+    worker.join()
 with open(EXITED, "w") as handle:
     handle.write(json.dumps({"code": 0}) + "\n")
 "#;
@@ -248,6 +299,13 @@ impl FakeClaude {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Let the task `!background` started finish, which is what produces its
+    /// notification and the follow-up turn that answers it.
+    pub fn release_background(&self) {
+        std::fs::write(self.received.with_file_name("release-background"), "go")
+            .expect("the release file");
     }
 
     /// The pid of the tool `!spawn-and-hang` started, once it has started.

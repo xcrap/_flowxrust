@@ -6,6 +6,7 @@
 //! process.
 
 use fx_core::AgentAccess;
+use fx_core::policy::TurnPlan;
 use serde_json::{Value, json};
 
 use crate::conversation::state::TRIVIAL_TOOL_RESULT;
@@ -713,6 +714,13 @@ pub fn parse_notification(method: &str, params: &Value) -> Vec<ProviderEvent> {
             vec![ProviderEvent::UserInput(parse_user_input(params))]
         }
 
+        // The whole plan, every time it changes: the arguments of the model's
+        // own `update_plan` call, which never arrives as an item.
+        "turn/plan/updated" => TurnPlan::from_value(params)
+            .map(ProviderEvent::PlanUpdated)
+            .into_iter()
+            .collect(),
+
         "model/rerouted" => {
             let model = params
                 .get("toModel")
@@ -1222,6 +1230,42 @@ mod tests {
     fn an_unknown_notification_is_silently_ignored() {
         // Providers add methods over time; an unknown one must not break a turn.
         assert!(parse_notification("thread/something/new", &json!({"a": 1})).is_empty());
+    }
+
+    #[test]
+    fn a_plan_update_becomes_the_plan_it_carries() {
+        // The shape the app-server sends: the arguments of the model's own
+        // `update_plan` call, with the v2 camel-case status.
+        let events = parse_notification(
+            "turn/plan/updated",
+            &json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "explanation": null,
+                "plan": [
+                    { "step": "Read the parser", "status": "completed" },
+                    { "step": "Fix the bug", "status": "inProgress" },
+                    { "step": "Run the tests", "status": "pending" },
+                ],
+            }),
+        );
+        let [ProviderEvent::PlanUpdated(plan)] = events.as_slice() else {
+            panic!("expected one plan update, got {events:?}");
+        };
+        assert_eq!(plan.explanation, None);
+        assert_eq!(
+            plan.steps
+                .iter()
+                .map(|step| (step.text.as_str(), step.status))
+                .collect::<Vec<_>>(),
+            [
+                ("Read the parser", fx_core::policy::PlanStatus::Completed),
+                ("Fix the bug", fx_core::policy::PlanStatus::InProgress),
+                ("Run the tests", fx_core::policy::PlanStatus::Pending),
+            ]
+        );
+        // A notification with no plan in it is not an empty plan.
+        assert!(parse_notification("turn/plan/updated", &json!({ "turnId": "t" })).is_empty());
     }
 
     #[test]

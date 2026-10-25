@@ -8,7 +8,9 @@
 
 use fx_design::components::context_meter::context_meter_palette;
 use fx_design::components::provider_status::provider_status_palette;
-use fx_design::components::{ActivityState, ContextUsage, ProviderIdentity};
+use fx_design::components::{
+    ActivityState, ChecklistMark, ContextUsage, ProviderIdentity, checklist_ink, checklist_surface,
+};
 use fx_design::theme::{
     AccentColor, AppearanceMode, BaseTone, Colors, Rgba, TextSizePreset, Theme, composite,
     contrast, h,
@@ -179,6 +181,35 @@ fn warning_ink_clears_non_text_contrast_on_elevated_surfaces_and_stays_amber() {
         );
         if mode == AppearanceMode::Dark {
             assert_eq!(ink, Colors::warning(&t), "dark mode needs no step down");
+        }
+    }
+}
+
+#[test]
+fn every_checklist_row_is_legible_on_its_surface_with_every_accent() {
+    // Text clears AA, a done row included: receding is not the same as
+    // illegible. Each mark is the only thing that says where its step is, so it
+    // clears the 3:1 non-text floor.
+    for (tone, mode) in all_theme_combinations() {
+        for accent in AccentColor::ALL {
+            let t = Theme {
+                accent_color: accent,
+                ..theme_for(tone, mode)
+            };
+            let surface = checklist_surface(&t);
+            for mark in ChecklistMark::ALL {
+                let ink = checklist_ink(mark, &t);
+                let text = contrast(ink.text, surface);
+                let glyph = contrast(ink.mark, surface);
+                assert!(
+                    text >= 4.5,
+                    "{tone:?} {mode:?} {accent:?}: {mark:?} text is {text}:1"
+                );
+                assert!(
+                    glyph >= 3.0,
+                    "{tone:?} {mode:?} {accent:?}: {mark:?} mark is {glyph}:1"
+                );
+            }
         }
     }
 }

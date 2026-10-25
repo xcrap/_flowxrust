@@ -12,6 +12,7 @@ pub mod file_index;
 pub mod image_correlation;
 pub mod transcript_grouping;
 pub mod transcript_presentation;
+pub mod turn_plan;
 
 pub use conversation_scroll::{
     ConversationScrollPolicy, ConversationScrollRestoration, ScrollMetrics,
@@ -25,3 +26,4 @@ pub use diff_row_layout::{DiffRowLayout, Location};
 pub use file_index::{ProjectFileIndexPolicy, SKIPPED_DIRECTORY_NAMES};
 pub use image_correlation::{ConversationImageCorrelation, ImageCorrelationKey};
 pub use transcript_grouping::{TranscriptActivityGroupingPolicy, TranscriptActivitySegment};
+pub use turn_plan::{PlanStatus, PlanStep, TurnPlan};

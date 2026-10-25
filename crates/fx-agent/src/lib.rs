@@ -17,6 +17,6 @@ pub mod title;
 
 pub use conversation::{Conversation, DeltaPolicy, Phase};
 pub use provider::{
-    Model, Provider, ProviderError, ProviderEvent, ProviderHealth, StreamSink, ThreadIdentity,
-    ThreadSummary,
+    Model, Provider, ProviderError, ProviderEvent, ProviderHealth, StreamSink, TaskStatus,
+    TaskUpdate, ThreadIdentity, ThreadSummary,
 };

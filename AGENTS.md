@@ -101,6 +101,9 @@ touching any foreground, background, or accent token.
   composer at every fill level. Light-mode `warning` is too pale for that arc,
   so it uses `warning_ink`.
 - Selected transcript text stays readable over `text_selection`.
+- Checklist text clears 4.5:1 and every checklist mark 3:1 on its surface, with
+  every accent. Light-mode emerald and orange fall short, so the active mark
+  falls back to `fg` there, as a badge's label does.
 
 One documented shortfall, recorded rather than hidden: where a status hue is
 used as an *icon on its own tint*, light-mode `warning` bottoms out at 2.29:1
@@ -137,6 +140,7 @@ before styling a screen ad hoc.
 |---|---|
 | `button` | Labelled button (primary/secondary/ghost/danger), icon button, compact action button (with an on/disabled variant, `compact_action_toggle`), and `glyph_button` for rows too dense for an icon button's 28 pt hit target. Hover and press are declarative `.hover`/`.active` refinements, so a button repaints without re-rendering. |
 | `checkbox` | A labelled checkbox whose whole row toggles. |
+| `checklist` | A read-only checklist: done, active (spinning while live) and pending rows on one surface. |
 | `surface` | Card, panel, divider, banner, empty state, section header. |
 | `status` | Badge, activity dot, typing indicator, pulsing dot, context-usage ring. |
 | `segmented` | Segmented control for exclusive choices. |
@@ -409,6 +413,26 @@ Two more, for how a turn ends:
   group, a short grace, then SIGKILL. A turn that finished normally only stops
   the server, so a dev server the agent started on purpose keeps running.
 
+Claude's background tasks (`Agent` or `Bash` with `run_in_background`) change
+what "completion" means, and each rule here was a lost result first:
+
+- **A `result` with a task running is not the end.** Claude reports the task's
+  end as `task_notification`, then answers it as a turn of its own (`init`, text,
+  a `result` whose `origin.kind` is `task-notification`). stdin stays open while
+  a task runs, so the wait can be steered; it closes at the first `result` with
+  nothing running, and the turn then reads to the process's exit, because a
+  notification that arrived *before* that `result` is still answered after it.
+  `BackgroundWait` in `session.rs` holds these rules.
+- **FlowX applies the CLI's wait ceiling.** The CLI only applies
+  `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` (default 10 min) once its input is
+  closed, which FlowX no longer does while tasks run. At the ceiling the turn
+  completes with a note and the process group is stopped.
+- **A resumed session's lost tasks are not this turn's.** Resuming a session
+  whose tasks were killed opens with a `stopped` notification per task and an
+  `init` plus a zero-turn `result` per batch, before the prompt is read. Those
+  neither end the turn nor prove the prompt was read; only tasks started in this
+  process are tracked.
+
 Read-only command checks for both providers go through one classifier,
 `fx-agent::shell`, which fails closed on control operators, substitutions and
 the write flags of otherwise read-only tools (`find -delete`, `sort -o`,
@@ -435,7 +459,9 @@ strip above it. Four rules, each of which is a bug that was written first:
   the prose. Errors are always recorded.
 - **`claim_tool_id` must not gate the append.** The `ToolUse` and the matching
   `ToolResult` carry the *same* id, so a dedup gate on it rejects every legitimate
-  first result. It tracks completion for the spinner; that is all.
+  first result. It tracks completion for the spinner; that is all — so only
+  the result claims it. Claiming the call as it started made every running call
+  read as finished.
 
 Tool output is read from `aggregatedOutput` first, then `output`, `result`,
 `error`, `contentItems`, `changes`, `results`, `agentsStates` — that order is the
@@ -448,6 +474,22 @@ Codex sends `"error": null` on every successful MCP call.
 Whether a row is prose or a collapsed activity is a *view* decision, made by
 `TranscriptActivityGroupingPolicy` in `fx-core`. It reads content only, never
 role; the caller excludes user messages before asking it to segment.
+
+A running turn shows its progress in three places, all read from the
+conversation rather than kept by the view:
+
+- **The live group's step.** Under the header, open or closed: the latest
+  unanswered call with its elapsed time, or "Thinking…" / "Writing…" between
+  calls. A call starts at its message's timestamp; the turn and the stretches
+  between calls start at `turn_started_at` and `step_started_at`.
+- **One tick a second**, from the executor's timer, aligned to the turn's own
+  seconds. A tick changes no row's stamp and the clocks sit on fixed-height
+  lines, so it re-measures nothing.
+- **The plan.** `fx-core::policy::TurnPlan` reads Claude's `TodoWrite` and
+  Codex's `update_plan` alike. Codex reports the latter only as
+  `turn/plan/updated`, so the conversation records it as the `update_plan`
+  call it stands for, and one checklist card per turn follows the turn's last
+  burst of work. Plan calls are not rows or counted actions.
 
 ## Two queues, and why they are bounded
 
