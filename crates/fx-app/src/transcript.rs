@@ -3047,15 +3047,28 @@ fn background_task_row(task: &BackgroundTask, now: Instant, frame: u32) -> AnyEl
         .map(|summary| summarize_line(summary, DETAIL_CHARACTER_LIMIT))
         .filter(|summary| !summary.is_empty())
     {
+        let text = StyledText::new(SharedString::from(summary));
+        #[cfg(test)]
+        tests::TASK_SUMMARIES.with(|layouts| layouts.borrow_mut().push(text.layout().clone()));
+        // A flexible child of a row, as the description above it is. Sized as
+        // a full-width block, GPUI measured it once at no width at all and
+        // kept that, so every summary drew as a lone "…".
         column = column.child(
             div()
                 .w_full()
                 .min_w_0()
+                .flex()
+                .flex_row()
                 .pl(px_len(Spacing::LG + Spacing::SM))
-                .truncate()
-                .fx_caption()
-                .text_color(Colors::fg_secondary(&theme))
-                .child(SharedString::from(summary)),
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .fx_caption()
+                        .text_color(Colors::fg_secondary(&theme))
+                        .child(text),
+                ),
         );
     }
     column.into_any_element()
@@ -4476,6 +4489,9 @@ mod tests {
         pub(super) static ROWS_BUILT: Cell<usize> = const { Cell::new(0) };
         /// Every splice this thread has told a list about.
         pub(super) static SPLICES: RefCell<Vec<(Range<usize>, usize)>> =
+            const { RefCell::new(Vec::new()) };
+        /// The layout of every background task's summary line built here.
+        pub(super) static TASK_SUMMARIES: RefCell<Vec<gpui::TextLayout>> =
             const { RefCell::new(Vec::new()) };
     }
 
@@ -7147,6 +7163,31 @@ mod tests {
         conversation.apply(task_event("t-fail", TaskStatus::Failed));
         conversation.apply(task_event("t-stop", TaskStatus::Stopped));
         conversation
+    }
+
+    #[test]
+    fn a_tasks_summary_line_shows_its_text_not_only_an_ellipsis() {
+        TASK_SUMMARIES.with(|layouts| layouts.borrow_mut().clear());
+        let mut test = TestAppContext::single();
+        let window = test.add_window(|_, _| Harness {
+            conversation: tasks_conversation(),
+        });
+        let visual = VisualTestContext::from_window(*window.deref(), &test);
+        visual.simulate_resize(size(px(900.0), px(900.0)));
+        redraw(&mut test);
+        let drawn: Vec<String> = TASK_SUMMARIES.with(|layouts| {
+            layouts
+                .borrow()
+                .iter()
+                .map(|layout| layout.text())
+                .collect()
+        });
+        assert!(
+            drawn
+                .iter()
+                .any(|text| text == "Found two bugs in the framer"),
+            "{drawn:?}"
+        );
     }
 
     #[test]

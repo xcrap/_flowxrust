@@ -1393,26 +1393,23 @@ const STEER_SETTLE: Duration = Duration::from_secs(2);
 /// background tasks, in milliseconds; `0` waits indefinitely.
 const BACKGROUND_CEILING_VARIABLE: &str = "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS";
 
-/// Claude Code's own default for that wait.
-const DEFAULT_BACKGROUND_CEILING: Duration = Duration::from_secs(600);
-
-/// How long a Claude turn waits on background tasks, from the environment it
-/// is launched with: the CLI's own setting, read the way the CLI reads it.
+/// How long a Claude turn waits on background tasks, or `None` for as long as
+/// they run.
 ///
-/// The CLI applies it only once its input is closed, and FlowX keeps the input
-/// open while tasks run so the turn can still be steered. So FlowX applies it
-/// instead, from the same setting.
+/// Only a ceiling the user set in the environment applies. The CLI's own
+/// default of ten minutes is for a `-p` run that has to end with nobody
+/// watching; FlowX keeps the input open while tasks run, the tasks are on
+/// screen, and Stop ends them. Applying that default here stopped six fix
+/// agents mid-edit ten minutes after the turn's last reply, with nothing
+/// wrong. Like the CLI, `0` and a value that does not parse mean no ceiling.
 fn background_ceiling<'a>(
     mut environment: impl Iterator<Item = (&'a String, &'a String)>,
 ) -> Option<Duration> {
-    let configured = environment
+    environment
         .find(|(key, _)| key.as_str() == BACKGROUND_CEILING_VARIABLE)
-        .and_then(|(_, value)| value.trim().parse::<u64>().ok());
-    match configured {
-        Some(0) => None,
-        Some(milliseconds) => Some(Duration::from_millis(milliseconds)),
-        None => Some(DEFAULT_BACKGROUND_CEILING),
-    }
+        .and_then(|(_, value)| value.trim().parse::<u64>().ok())
+        .filter(|milliseconds| *milliseconds > 0)
+        .map(Duration::from_millis)
 }
 
 /// What a Claude turn knows about the background work it started, in the order
@@ -4179,7 +4176,7 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn the_background_ceiling_is_the_clis_own_setting() {
+    fn background_tasks_are_waited_for_unless_a_ceiling_was_set() {
         let read = |pairs: &[(&str, &str)]| {
             let environment: std::collections::BTreeMap<String, String> = pairs
                 .iter()
@@ -4187,16 +4184,15 @@ for line in sys.stdin:
                 .collect();
             background_ceiling(environment.iter())
         };
-        assert_eq!(read(&[]), Some(DEFAULT_BACKGROUND_CEILING));
+        // The CLI's own ten-minute default is for an unattended `-p` run. Here
+        // it stopped agents that were still working.
+        assert_eq!(read(&[]), None);
         assert_eq!(
             read(&[(BACKGROUND_CEILING_VARIABLE, "1500")]),
             Some(Duration::from_millis(1500))
         );
         assert_eq!(read(&[(BACKGROUND_CEILING_VARIABLE, "0")]), None);
-        assert_eq!(
-            read(&[(BACKGROUND_CEILING_VARIABLE, "soon")]),
-            Some(DEFAULT_BACKGROUND_CEILING)
-        );
+        assert_eq!(read(&[(BACKGROUND_CEILING_VARIABLE, "soon")]), None);
         assert_eq!(spoken_duration(Duration::from_secs(600)), "10 min");
         assert_eq!(spoken_duration(Duration::from_millis(400)), "400 ms");
     }

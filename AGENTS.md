@@ -444,12 +444,13 @@ what "completion" means, and each rule here was a lost result first:
 - **A steer may be answered after the `result` it raced.** Once guidance has
   been written, a `result` reads to the process's exit rather than stopping it,
   or the answer to a steer reported as accepted is killed 750 ms later.
-- **FlowX applies the CLI's wait ceiling.** The CLI only applies
-  `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` (default 10 min) once its input is
-  closed, which FlowX no longer does while tasks run. It is measured from each
-  idle `result` and again from each task's end, and is off while a steer is
-  being answered. At the ceiling the turn completes with a note and the process
-  group is stopped.
+- **Background tasks run until they end or Stop.** The CLI's
+  `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` defaults to 10 minutes because a `-p`
+  run has to end unattended; applied by default here, it stopped six working
+  agents mid-edit. FlowX applies a ceiling only when the variable is set in the
+  environment. Then it is measured from each idle `result` and again from each
+  task's end, is off while a steer is being answered, and at the ceiling the
+  turn completes with a note and the process group is stopped.
 - **A resumed session's lost tasks are not this turn's.** Resuming a session
   whose tasks were killed opens with a `stopped` notification per task and an
   `init` plus a zero-turn `result` per batch, before the prompt is read. Those
