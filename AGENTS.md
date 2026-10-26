@@ -339,6 +339,16 @@ explicit empty list, so removing a failed prompt's image stays removed after
 relaunch. Image ids participate in the save version; checkpoints share the bytes
 with the writer instead of copying them on the UI thread.
 
+Images imported while a draft loads are merged with its saved images. The save
+version remembers only the disk's image ids, so that merge is saved even without
+a text edit. Each import owns a ticket; an in-place Reset, Delete and project
+removal revoke its tickets and release its composer buffers. A late result cannot
+attach to a reset thread or consume a newer import's ticket.
+
+A goal belongs to its provider session. Restart clears the retired session's
+goal and counters; Resume keeps them. Queued prompts keep their images when a
+caption is removed, so saving an image-only edit is valid.
+
 Recovering a queue keeps every saved character and image, even when several
 valid prompts exceed one composer's ordinary limits. Recovery reports that
 case and allows the draft to be edited without growing until it is back under

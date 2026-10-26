@@ -760,6 +760,7 @@ impl AppState {
             return Some(fresh);
         }
         let conversation = self.conversation(project_id, agent_id);
+        self.release_composer(agent_id);
         *conversation
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Conversation::new(agent_id);
@@ -768,9 +769,6 @@ impl AppState {
         // which, having nothing worth keeping, deletes the file.
         self.saved_conversations.remove(&agent_id);
         self.clear_draft(agent_id, cx);
-        self.composer.attachments.remove(&agent_id);
-        self.composer.retry_attachments.remove(&agent_id);
-        self.composer.notices.remove(&agent_id);
         self.save_conversations();
         self.save();
         Some(agent_id)
@@ -979,6 +977,7 @@ impl AppState {
             return false;
         }
         self.deleted_agents.insert(agent_id);
+        self.release_composer(agent_id);
         self.title_jobs.remove(&agent_id);
         self.conversations.remove(&agent_id);
         self.drafts.remove(&agent_id);
@@ -1152,10 +1151,20 @@ impl AppState {
         if let Some(goal) = goal {
             self.composer.goals.insert(agent_id, goal);
         }
-        self.composer
-            .attachments
-            .entry(agent_id)
-            .or_insert_with(|| Arc::new(attachments));
+        let saved_image_ids = attachments.iter().map(|image| image.id).collect();
+        // An import can finish before the transcript read. Keep both sets,
+        // with saved images first, without applying admission limits to work
+        // that was already saved or accepted into this composer.
+        let mut images = attachments;
+        if let Some(pending) = self.composer.attachments.remove(&agent_id) {
+            let mut ids: HashSet<Uuid> = images.iter().map(|image| image.id).collect();
+            images.extend(
+                Arc::unwrap_or_clone(pending)
+                    .into_iter()
+                    .filter(|image| ids.insert(image.id)),
+            );
+        }
+        self.composer.attachments.insert(agent_id, Arc::new(images));
         if let Some(reason) = failure {
             self.protected_conversations.insert(agent_id);
             self.last_error = Some(format!(
@@ -1188,19 +1197,14 @@ impl AppState {
             {
                 self.set_composer_notice(agent_id, Some("Recovered prompts exceed the usual composer limits. All text and images were kept; review them before sending.".into()));
             }
-            // The file holds exactly this, so opening a thread is not a reason
-            // to write it back.
+            // Remember only the images read from disk. Images imported during
+            // loading still need saving, even if the text never changes.
             self.saved_conversations.insert(
                 agent_id,
                 (
                     conversation.revision(),
                     draft.clone(),
-                    Some(
-                        self.attachments(agent_id)
-                            .iter()
-                            .map(|image| image.id)
-                            .collect(),
-                    ),
+                    Some(saved_image_ids),
                 ),
             );
             self.restored_drafts.insert(agent_id, draft);
@@ -1395,6 +1399,7 @@ impl AppState {
     /// Only reached for idle threads: `remove_project` refuses while any of its
     /// threads is busy, so no running turn loses its conversation or runner.
     fn release_thread(&mut self, agent_id: Uuid) {
+        self.release_composer(agent_id);
         self.title_jobs.remove(&agent_id);
         self.conversations.remove(&agent_id);
         self.drafts.remove(&agent_id);
@@ -2011,6 +2016,10 @@ impl AppState {
         }
         self.native_sync.history_due.remove(&agent_id);
         self.native_sync.loaded_revisions.remove(&agent_id);
+        // Goals belong to the provider session. The new session has not been
+        // given this objective or consumed its budget.
+        self.composer.goals.remove(&agent_id);
+        self.composer.goal_prompts.remove(&agent_id);
         self.save();
         self.save_conversations();
         prompt
@@ -3030,7 +3039,9 @@ const COMPOSER_MAX_CHARACTERS: usize = 32_000;
 #[derive(Default)]
 pub struct ComposerStore {
     attachments: HashMap<Uuid, Arc<Vec<fx_core::Attachment>>>,
-    preparing: HashMap<Uuid, usize>,
+    /// Live import tickets per thread. Removing them invalidates late results
+    /// without confusing them with imports begun after a reset.
+    preparing: HashMap<Uuid, HashSet<Uuid>>,
     notices: HashMap<Uuid, String>,
     /// Images of an unaccepted prompt, put back with its text.
     retry_attachments: HashMap<Uuid, Vec<fx_core::Attachment>>,
@@ -3120,12 +3131,45 @@ impl AppState {
             .unwrap_or_default()
     }
 
+    /// Release the composer's buffers and invalidate in-flight imports before
+    /// its conversation is reset or removed. Do not dispatch a deleted queue.
+    fn release_composer(&mut self, agent_id: Uuid) {
+        if let Some(conversation) = self.conversations.get(&agent_id) {
+            let conversation = conversation
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            for prompt in conversation.queued() {
+                self.composer.queued_attachments.remove(&prompt.id);
+            }
+        }
+        self.composer.attachments.remove(&agent_id);
+        self.composer.preparing.remove(&agent_id);
+        self.composer.notices.remove(&agent_id);
+        self.composer.retry_attachments.remove(&agent_id);
+        self.composer.steers.remove(&agent_id);
+        self.composer
+            .accepted_steers
+            .retain(|(agent, _)| *agent != agent_id);
+        self.composer.goals.remove(&agent_id);
+        self.composer.goal_prompts.remove(&agent_id);
+        self.composer.dispatch.retain(|agent| *agent != agent_id);
+        self.composer.held_queues.remove(&agent_id);
+        if self
+            .composer
+            .editor
+            .as_ref()
+            .is_some_and(|editor| editor.agent_id == agent_id)
+        {
+            self.composer.editor = None;
+        }
+    }
+
     /// Whether images are still being read for this thread.
     pub fn is_preparing_attachments(&self, agent_id: Uuid) -> bool {
         self.composer
             .preparing
             .get(&agent_id)
-            .is_some_and(|count| *count > 0)
+            .is_some_and(|tickets| !tickets.is_empty())
     }
 
     /// What the composer should say about its last attach, send, or steer.
@@ -3140,21 +3184,34 @@ impl AppState {
         };
     }
 
-    /// Note that a batch of images is being read for this thread.
-    pub fn begin_preparing_attachments(&mut self, agent_id: Uuid) {
-        *self.composer.preparing.entry(agent_id).or_default() += 1;
+    /// Start a batch and return the ticket its completion must still own.
+    pub fn begin_preparing_attachments(&mut self, agent_id: Uuid) -> Uuid {
+        let ticket = Uuid::new_v4();
+        self.composer
+            .preparing
+            .entry(agent_id)
+            .or_default()
+            .insert(ticket);
+        ticket
     }
 
     /// Admit a prepared batch under the composer's limits.
     pub fn finish_preparing_attachments(
         &mut self,
         agent_id: Uuid,
+        ticket: Uuid,
         prepared: crate::attachments::Prepared,
     ) {
-        if let Some(count) = self.composer.preparing.get_mut(&agent_id) {
-            *count = count.saturating_sub(1);
+        let Some(pending) = self.composer.preparing.get_mut(&agent_id) else {
+            return;
+        };
+        if !pending.remove(&ticket) {
+            return;
         }
-        if self.deleted_agents.contains(&agent_id) {
+        if pending.is_empty() {
+            self.composer.preparing.remove(&agent_id);
+        }
+        if self.deleted_agents.contains(&agent_id) || self.thread(agent_id).is_none() {
             return;
         }
         let pending = self.composer.attachments.entry(agent_id).or_default();
@@ -3174,8 +3231,8 @@ impl AppState {
                 errors: vec![error],
             },
         };
-        self.begin_preparing_attachments(agent_id);
-        self.finish_preparing_attachments(agent_id, prepared);
+        let ticket = self.begin_preparing_attachments(agent_id);
+        self.finish_preparing_attachments(agent_id, ticket, prepared);
     }
 
     pub fn remove_attachment(&mut self, agent_id: Uuid, attachment_id: Uuid) {
@@ -3353,8 +3410,8 @@ impl AppState {
         }
     }
 
-    /// Save the open edit. An edit that leaves only whitespace is refused and
-    /// the editor stays open: emptying a prompt is what Remove is for.
+    /// Save the open edit. Without images, an edit that leaves only whitespace
+    /// is refused: emptying a prompt is what Remove is for.
     pub fn save_queued_edit(&mut self, cx: &App) -> bool {
         let Some(editor) = self.composer.editor.clone() else {
             return false;
@@ -5433,14 +5490,112 @@ mod persistence_tests {
     }
 
     fn attach(state: &mut AppState, agent: Uuid, images: Vec<fx_core::Attachment>) {
-        state.begin_preparing_attachments(agent);
+        let ticket = state.begin_preparing_attachments(agent);
         state.finish_preparing_attachments(
             agent,
+            ticket,
             crate::attachments::Prepared {
                 attachments: images,
                 errors: Vec::new(),
             },
         );
+    }
+
+    #[test]
+    fn images_imported_before_a_draft_load_are_merged_and_saved_without_typing() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, project, agent, _) = test.update(|cx| workspace(cx, &paths));
+        let original = image(1);
+        let imported = image(2);
+        let expected = vec![original.clone(), imported.clone()];
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                let mut saved = PersistedConversation::from_messages(agent, Vec::new());
+                saved.draft_text = "Compare these".into();
+                saved.draft_attachments = Some(vec![original.clone()]);
+                state
+                    .store
+                    .save_conversation(project, agent, &saved)
+                    .unwrap();
+                // Hold the read result while an import finishes, as can happen
+                // when a large transcript is read in the background.
+                let loaded = read_conversation(&state.store, project, agent);
+                attach(state, agent, vec![imported]);
+                state.adopt_conversation(project, agent, loaded);
+                assert_eq!(state.attachments(agent), expected);
+                assert_eq!(state.draft(agent, cx).read(cx).value(), "Compare these");
+                state.save_all(cx);
+                assert_eq!(
+                    state
+                        .store
+                        .load_conversation(project, agent)
+                        .unwrap()
+                        .unwrap()
+                        .draft_attachments,
+                    Some(expected.clone()),
+                    "the imported image must save without a text edit"
+                );
+            });
+        });
+        let reopened = test.update(|cx| cx.new(|cx| AppState::restore(paths, cx)));
+        test.update(|cx| {
+            reopened.update(cx, |state, _| {
+                state.conversation(project, agent);
+                assert_eq!(state.attachments(agent), expected);
+            })
+        });
+    }
+
+    #[test]
+    fn resetting_invalidates_old_imports_without_cancelling_new_ones() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, project, agent, _) = test.update(|cx| workspace(cx, &paths));
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                state.conversation(project, agent);
+                let old = state.begin_preparing_attachments(agent);
+                assert_eq!(state.reset_conversation(agent, cx), Some(agent));
+                assert!(!state.is_preparing_attachments(agent));
+                let first = state.begin_preparing_attachments(agent);
+                let second = state.begin_preparing_attachments(agent);
+                let prepared = |fill| crate::attachments::Prepared {
+                    attachments: vec![image(fill)],
+                    errors: Vec::new(),
+                };
+                state.finish_preparing_attachments(
+                    agent,
+                    old,
+                    crate::attachments::Prepared {
+                        attachments: vec![image(1)],
+                        errors: vec!["stale import error".into()],
+                    },
+                );
+                assert!(state.attachments(agent).is_empty());
+                assert!(state.composer_notice(agent).is_none());
+                assert!(state.is_preparing_attachments(agent));
+                state.finish_preparing_attachments(agent, second, prepared(2));
+                assert!(state.is_preparing_attachments(agent));
+                // Even a duplicate completion cannot spend another batch's ticket.
+                state.finish_preparing_attachments(agent, second, prepared(9));
+                state.finish_preparing_attachments(agent, first, prepared(3));
+                assert!(!state.is_preparing_attachments(agent));
+                assert!(same_images(state.attachments(agent), &[image(2), image(3)]));
+                state.save_all(cx);
+                let saved = state
+                    .store
+                    .load_conversation(project, agent)
+                    .unwrap()
+                    .unwrap();
+                assert!(same_images(
+                    &saved.draft_attachments.unwrap(),
+                    &[image(2), image(3)]
+                ));
+            })
+        });
     }
 
     #[test]
@@ -5935,6 +6090,39 @@ mod persistence_tests {
                 );
             })
         });
+    }
+
+    #[test]
+    fn a_queued_image_prompt_can_save_without_a_caption_and_resume_its_queue() {
+        for caption in ["Remove this caption", ""] {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = AppPaths::at(temp.path().join("state"));
+            let test = gpui::TestAppContext::single();
+            let (state, project, agent, _) = test.update(|cx| workspace(cx, &paths));
+            test.update(|cx| {
+                state.update(cx, |state, cx| {
+                    state.conversation(project, agent);
+                    state
+                        .enqueue_prompt(agent, caption, vec![image(1)], cx)
+                        .unwrap();
+                    let id = queued_ids(state, project, agent)[0];
+                    state.begin_editing_queued(agent, id, cx);
+                    assert!(state.dequeue_prompt(agent).is_none());
+                    state
+                        .queue_editor()
+                        .unwrap()
+                        .field
+                        .clone()
+                        .update(cx, |field, cx| field.set_value(" \n", cx));
+                    assert!(state.save_queued_edit(cx));
+                    assert!(state.queue_editor().is_none());
+                    assert_eq!(state.take_ready_queues(), vec![agent]);
+                    let (text, images) = state.dequeue_prompt(agent).unwrap();
+                    assert!(text.is_empty());
+                    assert!(same_images(&images, &[image(1)]));
+                })
+            });
+        }
     }
 
     #[test]
@@ -6686,6 +6874,52 @@ mod persistence_tests {
     }
 
     #[test]
+    fn restarting_forgets_the_retired_goal_but_keeps_the_next_draft() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, project, agent, _) = test.update(|cx| workspace(cx, &paths));
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+            assert!(state.prepare_prompt(agent, "Continue the objective", cx));
+            let conversation = state.conversation(project, agent);
+            {
+                let mut conversation = conversation.lock().unwrap();
+                conversation.set_session_id("expired");
+                conversation.clear_unsent();
+                conversation.set_error("Thread not found");
+            }
+            state.update_sender_for(agent)(SessionUpdate::GoalChanged {
+                goal: fx_core::models::ConversationGoal::from_codex(&serde_json::json!({
+                    "threadId": "expired", "objective": "Previous objective", "status": "active",
+                    "tokensUsed": 10, "tokenBudget": 100,
+                })),
+            });
+            state.drain_updates();
+            assert!(state.goal(agent).is_some());
+            assert_eq!(state.resume_session(agent).as_deref(), Some("continue"));
+            assert!(state.goal(agent).is_some(), "Resume keeps the same session's goal");
+            attach(state, agent, vec![image(3)]);
+            assert_eq!(state.restart_session(agent).as_deref(), Some("Continue the objective"));
+            assert!(state.goal(agent).is_none());
+            assert!(same_images(state.attachments(agent), &[image(3)]));
+            state.save_all(cx);
+        })
+        });
+        let reopened = test.update(|cx| cx.new(|cx| AppState::restore(paths, cx)));
+        test.update(|cx| {
+            reopened.update(cx, |state, _| {
+                state.conversation(project, agent);
+                assert!(
+                    state.goal(agent).is_none(),
+                    "the old goal must not return after relaunch"
+                );
+                assert!(same_images(state.attachments(agent), &[image(3)]));
+            })
+        });
+    }
+
+    #[test]
     fn deleting_a_thread_forgets_its_transcript_memory() {
         let temp = tempfile::tempdir().unwrap();
         let paths = AppPaths::at(temp.path().join("state"));
@@ -6702,6 +6936,50 @@ mod persistence_tests {
                     !crate::transcript::remembers(id),
                     "a deleted thread's view memory outlived it"
                 );
+            })
+        });
+    }
+
+    #[test]
+    fn deleting_a_thread_frees_draft_and_queued_images_and_invalidates_imports() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, project, agent, kept) = test.update(|cx| workspace(cx, &paths));
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                state.conversation(project, agent);
+                state.conversation(project, kept);
+                attach(state, agent, vec![image(1)]);
+                attach(state, kept, vec![image(2)]);
+                state
+                    .enqueue_prompt(agent, "queued", vec![image(3)], cx)
+                    .unwrap();
+                let id = queued_ids(state, project, agent)[0];
+                state.begin_editing_queued(agent, id, cx);
+                assert!(state.dequeue_prompt(agent).is_none());
+                let draft = Arc::downgrade(state.composer.attachments.get(&agent).unwrap());
+                let queued = Arc::downgrade(state.composer.queued_attachments.get(&id).unwrap());
+                let late = state.begin_preparing_attachments(agent);
+                assert!(state.delete_thread(agent));
+                assert!(draft.upgrade().is_none(), "draft buffers stayed allocated");
+                assert!(
+                    queued.upgrade().is_none(),
+                    "queued buffers stayed allocated"
+                );
+                assert!(state.queue_editor().is_none());
+                assert!(!state.is_preparing_attachments(agent));
+                assert!(!state.has_ready_queues());
+                state.finish_preparing_attachments(
+                    agent,
+                    late,
+                    crate::attachments::Prepared {
+                        attachments: vec![image(4)],
+                        errors: Vec::new(),
+                    },
+                );
+                assert!(state.attachments(agent).is_empty());
+                assert!(same_images(state.attachments(kept), &[image(2)]));
             })
         });
     }
@@ -8363,6 +8641,14 @@ mod project_lifecycle_tests {
                     (kept_id, kept.id),
                 ] {
                     state.conversation(project, agent);
+                    state.composer.attachments.insert(
+                        agent,
+                        Arc::new(vec![fx_core::Attachment::new(
+                            vec![1, 2, 3],
+                            "image/png",
+                            "draft.png",
+                        )]),
+                    );
                     let draft = state.draft(agent, cx);
                     draft.update(cx, |field, cx| field.set_value("Unsent work", cx));
                 }
@@ -8415,10 +8701,25 @@ mod project_lifecycle_tests {
                     .unwrap()
                     .set_phase(fx_agent::conversation::Phase::Idle);
 
+                let late = state.begin_preparing_attachments(first.id);
                 state.remove_project(removed_id);
+                state.finish_preparing_attachments(
+                    first.id,
+                    late,
+                    crate::attachments::Prepared {
+                        attachments: vec![fx_core::Attachment::new(
+                            vec![4],
+                            "image/png",
+                            "late.png",
+                        )],
+                        errors: Vec::new(),
+                    },
+                );
                 assert!(state.project(removed_id).is_none());
                 assert_eq!(state.snapshot.active_project_id, Some(kept_id));
                 for agent in [first.id, second.id] {
+                    assert!(state.attachments(agent).is_empty());
+                    assert!(!state.is_preparing_attachments(agent));
                     assert!(!state.conversations.contains_key(&agent));
                     assert!(!state.drafts.contains_key(&agent));
                     assert!(!state.saved_conversations.contains_key(&agent));
@@ -8432,6 +8733,7 @@ mod project_lifecycle_tests {
                     assert!(!state.native_sync.completed_turns.contains_key(&agent));
                 }
                 // The surviving project's thread is untouched.
+                assert_eq!(state.attachments(kept.id).len(), 1);
                 assert!(state.conversations.contains_key(&kept.id));
                 assert!(state.drafts.contains_key(&kept.id));
                 assert!(state.saved_conversations.contains_key(&kept.id));
@@ -8444,6 +8746,7 @@ mod project_lifecycle_tests {
             .expect("the removed project's transcript is kept");
         assert_eq!(saved.draft_text, "Unsent work");
         assert_eq!(saved.messages.len(), 1);
+        assert_eq!(saved.draft_attachments.unwrap().len(), 1);
     }
 }
 
@@ -8493,9 +8796,10 @@ mod reset_tests {
     }
 
     fn draft_image(state: &mut AppState, agent: Uuid) {
-        state.begin_preparing_attachments(agent);
+        let ticket = state.begin_preparing_attachments(agent);
         state.finish_preparing_attachments(
             agent,
+            ticket,
             crate::attachments::Prepared {
                 attachments: vec![fx_core::Attachment::new(
                     vec![1, 2, 3],

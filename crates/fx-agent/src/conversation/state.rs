@@ -703,16 +703,16 @@ impl Conversation {
 
     /// Replace a queued prompt's text in place, keeping its place and its id.
     ///
-    /// Trimmed, and refused when nothing is left: an edit that empties a
-    /// queued prompt is a removal, which is a different control.
+    /// Trimmed, and refused when neither text nor images remain: removing a
+    /// caption leaves a valid image-only prompt.
     pub fn update_queued(&mut self, id: Uuid, text: &str) -> bool {
         let text = text.trim();
-        if text.is_empty() {
-            return false;
-        }
         let Some(queued) = self.queued.iter_mut().find(|queued| queued.id == id) else {
             return false;
         };
+        if text.is_empty() && queued.attachment_count == 0 {
+            return false;
+        }
         if queued.text != text {
             queued.text = text.to_string();
             self.touch();

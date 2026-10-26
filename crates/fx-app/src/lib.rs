@@ -1489,9 +1489,10 @@ fn attach_paths(
     if paths.is_empty() {
         return;
     }
-    state.update(cx, |state, cx| {
-        state.begin_preparing_attachments(agent_id);
+    let ticket = state.update(cx, |state, cx| {
+        let ticket = state.begin_preparing_attachments(agent_id);
         cx.notify();
+        ticket
     });
     let read = cx
         .background_executor()
@@ -1501,7 +1502,7 @@ fn attach_paths(
         let prepared = read.await;
         let _ = cx.update(|cx| {
             state.update(cx, |state, cx| {
-                state.finish_preparing_attachments(agent_id, prepared);
+                state.finish_preparing_attachments(agent_id, ticket, prepared);
                 cx.notify();
             })
         });
@@ -3075,9 +3076,10 @@ mod tests {
             // Images cannot go with a command.
             field.update(cx, |field, cx| field.set_value("/compact", cx));
             state.update(cx, |state, _| {
-                state.begin_preparing_attachments(agent.id);
+                let ticket = state.begin_preparing_attachments(agent.id);
                 state.finish_preparing_attachments(
                     agent.id,
+                    ticket,
                     attachments::Prepared {
                         attachments: vec![png_image(1)],
                         errors: Vec::new(),
@@ -3143,9 +3145,10 @@ mod tests {
         let agent = test.read(|cx| state.read(cx).active_agent().unwrap().id);
         test.update(|cx| {
             state.update(cx, |state, _| {
-                state.begin_preparing_attachments(agent);
+                let ticket = state.begin_preparing_attachments(agent);
                 state.finish_preparing_attachments(
                     agent,
+                    ticket,
                     attachments::Prepared {
                         attachments: vec![png_image(3)],
                         errors: Vec::new(),
