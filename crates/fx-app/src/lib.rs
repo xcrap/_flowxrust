@@ -1541,11 +1541,11 @@ pub(crate) fn recover_turn(
     let Some((agent, root)) = state.read(cx).recovery_target(agent_id) else {
         return;
     };
-    // Resending the unsent prompt keeps its images, and with them its row:
-    // the same text without them would be a new prompt.
+    // Retry and Restart resend the complete prompt, even when the provider
+    // accepted it before failing. A new session needs its images again too.
     let attachments = match recovery {
         Some(transcript::Recovery::Retry | transcript::Recovery::Restart) => {
-            state.read(cx).unsent_images(agent_id)
+            state.read(cx).recovery_images(agent_id)
         }
         _ => Vec::new(),
     };

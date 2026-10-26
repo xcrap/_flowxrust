@@ -1517,11 +1517,7 @@ pub(crate) fn snapshot(conversation: &crate::Conversation) -> Snapshot {
         RecoveryFacts {
             unsent: conversation.unsent().is_some(),
             session: conversation.session_id().is_some_and(|id| !id.is_empty()),
-            prompt: messages
-                .iter()
-                .rev()
-                .find(|message| message.role == MessageRole::User)
-                .is_some_and(|message| !message.text_content().trim().is_empty()),
+            prompt: crate::state::recovery_prompt(conversation).is_some(),
         }
     } else {
         RecoveryFacts::default()
@@ -6924,6 +6920,21 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn an_image_only_prompt_without_a_session_offers_retry() {
+        let mut conversation = Conversation::new(Uuid::new_v4());
+        conversation.append(ConversationMessage::new(
+            MessageRole::User,
+            vec![MessageContent::Image {
+                data: Vec::new(),
+                mime_type: "image/png".into(),
+            }],
+        ));
+        conversation.set_error("provider disconnected");
+        let (_test, mut visual) = open(conversation, 900.0, 600.0);
+        assert!(visual.debug_bounds("transcript.recovery:Retry").is_some());
     }
 
     #[test]

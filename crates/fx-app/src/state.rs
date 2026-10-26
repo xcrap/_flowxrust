@@ -768,6 +768,9 @@ impl AppState {
         // which, having nothing worth keeping, deletes the file.
         self.saved_conversations.remove(&agent_id);
         self.clear_draft(agent_id, cx);
+        self.composer.attachments.remove(&agent_id);
+        self.composer.retry_attachments.remove(&agent_id);
+        self.composer.notices.remove(&agent_id);
         self.save_conversations();
         self.save();
         Some(agent_id)
@@ -1930,15 +1933,17 @@ impl AppState {
 
     /// The images of the prompt a retry or restart resends, read from its own
     /// transcript row.
-    pub fn unsent_images(&self, agent_id: Uuid) -> Vec<fx_core::Attachment> {
+    pub fn recovery_images(&self, agent_id: Uuid) -> Vec<fx_core::Attachment> {
         self.conversations
             .get(&agent_id)
             .map(|conversation| {
-                unsent_attachments(
+                recovery_message(
                     &conversation
                         .lock()
                         .unwrap_or_else(|error| error.into_inner()),
                 )
+                .map(crate::attachments::attachments_in)
+                .unwrap_or_default()
             })
             .unwrap_or_default()
     }
@@ -1950,11 +1955,7 @@ impl AppState {
         let mut conversation = conversation
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let prompt = conversation
-            .unsent()
-            .map(|prompt| prompt.text.clone())
-            .or_else(|| conversation.last_user_prompt())
-            .filter(|prompt| !prompt.trim().is_empty())?;
+        let prompt = recovery_prompt(&conversation)?;
         self.release_turn_error(&mut conversation);
         Some(prompt)
     }
@@ -1987,11 +1988,7 @@ impl AppState {
             conversation.clear_session_id();
             self.release_turn_error(&mut conversation);
             conversation.record_activity("Session restarted", false);
-            conversation
-                .unsent()
-                .map(|prompt| prompt.text.clone())
-                .or_else(|| conversation.last_user_prompt())
-                .filter(|prompt| !prompt.trim().is_empty())
+            recovery_prompt(&conversation)
         };
         for record in &mut self.snapshot.projects {
             let retired: Vec<fx_store::format::PersistedNativeIdentity> = record
@@ -3330,6 +3327,7 @@ impl AppState {
             },
         )
         .detach();
+        self.close_queue_editor();
         self.composer.editor = Some(QueueEditor {
             agent_id,
             queued_id: queued.id,
@@ -3947,6 +3945,40 @@ fn native_contains_local_tail<'a>(
     prose_blocks(local).into_iter().all(|(role, text)| {
         native.any(|(native_role, native_text)| native_role == role && native_text.contains(&text))
     })
+}
+
+/// The user row whose text and images a retry or restart resends. An unsent
+/// prompt must match that row; otherwise an older prompt's images could attach
+/// to a different request.
+fn recovery_message(conversation: &Conversation) -> Option<&fx_core::ConversationMessage> {
+    conversation
+        .messages()
+        .filter(|message| message.role == fx_core::MessageRole::User)
+        .last()
+        .filter(|message| {
+            conversation
+                .unsent()
+                .is_none_or(|unsent| message.text_content() == unsent.text)
+        })
+}
+
+/// Recovery accepts the same image-only prompts as the composer. The banner
+/// uses this too, so an offered Retry always has a prompt it can resend.
+pub(crate) fn recovery_prompt(conversation: &Conversation) -> Option<String> {
+    let message = recovery_message(conversation);
+    conversation
+        .unsent()
+        .map(|prompt| prompt.text.clone())
+        .or_else(|| message.map(fx_core::ConversationMessage::text_content))
+        .filter(|prompt| {
+            !prompt.trim().is_empty()
+                || message.is_some_and(|message| {
+                    message
+                        .content
+                        .iter()
+                        .any(|content| matches!(content, fx_core::MessageContent::Image { .. }))
+                })
+        })
 }
 
 /// The images of a conversation's unsent prompt, read back from its user row.
@@ -5906,6 +5938,42 @@ mod persistence_tests {
     }
 
     #[test]
+    fn switching_queue_editors_releases_the_previous_threads_queue() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, project, first, second) = test.update(|cx| workspace(cx, &paths));
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                for agent in [first, second] {
+                    state.conversation(project, agent);
+                    state
+                        .enqueue_prompt(agent, "waiting", Vec::new(), cx)
+                        .unwrap();
+                }
+                let first_id = queued_ids(state, project, first)[0];
+                let second_id = queued_ids(state, project, second)[0];
+                state.begin_editing_queued(first, first_id, cx);
+                assert!(state.dequeue_prompt(first).is_none());
+
+                // A stale click must not close a valid edit or release its queue.
+                state.begin_editing_queued(second, Uuid::new_v4(), cx);
+                assert_eq!(state.queue_editor().unwrap().agent_id, first);
+                assert!(state.take_ready_queues().is_empty());
+
+                state.begin_editing_queued(second, second_id, cx);
+                assert_eq!(state.take_ready_queues(), vec![first]);
+                assert_eq!(state.dequeue_prompt(first).unwrap().0, "waiting");
+                assert!(state.dequeue_prompt(second).is_none());
+                state.cancel_editing_queued();
+                assert_eq!(state.take_ready_queues(), vec![second]);
+                assert_eq!(state.dequeue_prompt(second).unwrap().0, "waiting");
+                assert!(state.take_ready_queues().is_empty());
+            })
+        });
+    }
+
+    #[test]
     fn removing_a_queued_prompt_takes_the_one_named_even_after_the_queue_moved() {
         let temp = tempfile::tempdir().unwrap();
         let paths = AppPaths::at(temp.path().join("state"));
@@ -6354,7 +6422,7 @@ mod persistence_tests {
                 let conversation = state.conversation(project, agent);
                 conversation.lock().unwrap().set_error("launch failed");
                 assert_eq!(state.retry_prompt(agent).as_deref(), Some("what is this"));
-                let resent = state.unsent_images(agent);
+                let resent = state.recovery_images(agent);
                 assert!(same_images(&resent, &images), "the images were not resent");
                 assert!(state.prepare_prompt_with(agent, "what is this", &resent, cx));
                 let users = conversation
@@ -6366,6 +6434,92 @@ mod persistence_tests {
                 assert_eq!(users, 1, "the retry added a second prompt row");
             })
         });
+    }
+
+    #[test]
+    fn recovery_preserves_an_accepted_prompts_images() {
+        for restart in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = AppPaths::at(temp.path().join("state"));
+            let test = gpui::TestAppContext::single();
+            let (state, project, agent, _) = test.update(|cx| workspace(cx, &paths));
+            test.update(|cx| {
+                state.update(cx, |state, cx| {
+                    let images = vec![image(1), image(2)];
+                    assert!(state.prepare_prompt_with(agent, "compare these", &images, cx));
+                    let conversation = state.conversation(project, agent);
+                    {
+                        let mut conversation = conversation.lock().unwrap();
+                        conversation.clear_unsent();
+                        conversation.set_session_id("missing-session");
+                        conversation.append(fx_core::ConversationMessage::new(
+                            fx_core::MessageRole::Assistant,
+                            vec![fx_core::MessageContent::Text {
+                                text: "Looking…".into(),
+                            }],
+                        ));
+                        conversation.set_error("Thread not found");
+                        assert!(unsent_attachments(&conversation).is_empty());
+                    }
+                    let prompt = if restart {
+                        state.restart_session(agent)
+                    } else {
+                        state.retry_prompt(agent)
+                    };
+                    assert_eq!(prompt.as_deref(), Some("compare these"));
+                    let resent = state.recovery_images(agent);
+                    assert!(same_images(&resent, &images));
+                    assert!(state.prepare_prompt_with(agent, &prompt.unwrap(), &resent, cx));
+                    let conversation = conversation.lock().unwrap();
+                    let sent = conversation.messages().last().unwrap();
+                    assert!(same_images(
+                        &crate::attachments::attachments_in(sent),
+                        &images
+                    ));
+                    if restart {
+                        assert!(conversation.session_id().is_none());
+                    }
+                })
+            });
+        }
+    }
+
+    #[test]
+    fn recovery_retries_image_only_prompts_before_and_after_acceptance() {
+        for accepted in [false, true] {
+            for restart in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let paths = AppPaths::at(temp.path().join("state"));
+                let test = gpui::TestAppContext::single();
+                let (state, project, agent, _) = test.update(|cx| workspace(cx, &paths));
+                test.update(|cx| {
+                    state.update(cx, |state, cx| {
+                        let images = vec![image(1)];
+                        assert!(state.prepare_prompt_with(agent, "", &images, cx));
+                        let conversation = state.conversation(project, agent);
+                        {
+                            let mut conversation = conversation.lock().unwrap();
+                            conversation.set_session_id("thread");
+                            if accepted {
+                                conversation.clear_unsent();
+                            }
+                            conversation.set_error("provider disconnected");
+                        }
+                        let prompt = if restart {
+                            state.restart_session(agent)
+                        } else {
+                            state.retry_prompt(agent)
+                        };
+                        assert_eq!(prompt.as_deref(), Some(""));
+                        let resent = state.recovery_images(agent);
+                        assert!(same_images(&resent, &images));
+                        assert!(state.prepare_prompt_with(agent, &prompt.unwrap(), &resent, cx));
+                        let conversation = conversation.lock().unwrap();
+                        assert_eq!(conversation.message_count(), if accepted { 2 } else { 1 });
+                    })
+                });
+            }
+        }
     }
 
     #[test]
@@ -8338,6 +8492,22 @@ mod reset_tests {
         ));
     }
 
+    fn draft_image(state: &mut AppState, agent: Uuid) {
+        state.begin_preparing_attachments(agent);
+        state.finish_preparing_attachments(
+            agent,
+            crate::attachments::Prepared {
+                attachments: vec![fx_core::Attachment::new(
+                    vec![1, 2, 3],
+                    "image/png",
+                    "draft.png",
+                )],
+                errors: Vec::new(),
+            },
+        );
+        assert_eq!(state.attachments(agent).len(), 1);
+    }
+
     #[test]
     fn resetting_a_flowx_only_thread_empties_it_in_place_and_deletes_its_cache() {
         let dir = tempfile::tempdir().unwrap();
@@ -8354,6 +8524,7 @@ mod reset_tests {
                     .set_session_id("local-session");
                 let draft = state.draft(first, cx);
                 draft.update(cx, |field, cx| field.set_value("unsent", cx));
+                draft_image(state, first);
                 state.save_all(cx);
             })
         });
@@ -8370,6 +8541,7 @@ mod reset_tests {
             assert_eq!(conversation.message_count(), 0);
             assert_eq!(conversation.session_id(), None, "a new session next turn");
             assert_eq!(state.drafts[&first].read(cx).value(), "");
+            assert!(state.attachments(first).is_empty());
             assert_eq!(state.active_agents().len(), 2, "no thread was added");
         });
         assert!(
@@ -8393,6 +8565,7 @@ mod reset_tests {
                     .unwrap()
                     .set_session_id("provider-session");
                 state.bind_local_session(first);
+                draft_image(state, first);
             })
         });
 
@@ -8410,6 +8583,8 @@ mod reset_tests {
             // The provider's thread is left exactly as it was.
             let original = state.conversation_by_agent(first).unwrap();
             assert_eq!(original.lock().unwrap().message_count(), 1);
+            assert_eq!(state.attachments(first).len(), 1);
+            assert!(state.attachments(fresh).is_empty());
             assert_eq!(state.active_agents().len(), 3);
         });
         let saved = Store::new(paths).load_app().unwrap();
