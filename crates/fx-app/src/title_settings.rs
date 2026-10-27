@@ -1,12 +1,10 @@
 //! Reversible settings for the shared provider that names all new chats.
 
 use fx_agent::Model;
-use fx_design::components::segmented::{SegmentedOption, segmented_control};
 use fx_design::components::{
-    MenuItem, MenuLayer, MenuModel, MenuSection, MenuTrigger, card, menu_trigger, section_header,
+    MenuItem, MenuLayer, MenuModel, MenuSection, MenuTrigger, menu_trigger, settings_group,
+    settings_row, settings_section, switch,
 };
-use fx_design::styled::{FxStyled, px_len};
-use fx_design::theme::{Colors, Spacing, global};
 use fx_store::AutoTitlePreferences;
 use gpui::prelude::*;
 use gpui::{AnyElement, App, Context, Entity, Render, SharedString, Window, div};
@@ -94,53 +92,29 @@ impl TitleSettings {
         true
     }
 
-    fn picker_row(
-        &self,
-        field: &str,
-        label: &'static str,
-        display: String,
-        model: MenuModel,
-        cx: &App,
-    ) -> AnyElement {
-        let theme = global::current();
+    /// The dropdown at a row's trailing edge.
+    fn picker(&self, field: &str, display: String, model: MenuModel, cx: &App) -> AnyElement {
         let owner = format!("{PREFIX}{field}");
         let selector = owner.clone();
         let expanded = self.menu_layer.read(cx).is_owner(&owner);
         div()
-            .w_full()
             .min_w_0()
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap(px_len(Spacing::MD))
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .fx_caption()
-                    .text_color(Colors::fg_secondary(&theme))
-                    .child(label),
-            )
-            .child(
-                div()
-                    .min_w_0()
-                    .debug_selector(move || selector.clone())
-                    .child(menu_trigger(
-                        MenuTrigger::new(
-                            model,
-                            SharedString::from(owner),
-                            SharedString::from(display),
-                        )
-                        .expanded(expanded),
-                        &self.menu_layer,
-                    )),
-            )
+            .debug_selector(move || selector.clone())
+            .child(menu_trigger(
+                MenuTrigger::new(
+                    model,
+                    SharedString::from(owner),
+                    SharedString::from(display),
+                )
+                .expanded(expanded),
+                &self.menu_layer,
+            ))
             .into_any_element()
     }
 }
 
 impl Render for TitleSettings {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = global::current();
         let this = cx.entity();
         let provider = &self.draft.provider_id;
         let models = provider_catalog::models(provider);
@@ -153,26 +127,61 @@ impl Render for TitleSettings {
                     self.draft.model_id.clone()
                 }
             });
-        div().w_full().min_w_0().flex().flex_col().gap(px_len(Spacing::MD))
-            .debug_selector(|| "settings-chat-names".into())
-            .child(section_header("Chat names"))
-            .child(div().fx_caption().text_color(Colors::fg_secondary(&theme)).child("Name every new chat from its first prompt using the same provider and model."))
-            .child(card(
-                div().w_full().min_w_0().flex().flex_col().gap(px_len(Spacing::SM))
-                    .child(
-                        div().w_full().flex().items_center().justify_between().gap(px_len(Spacing::MD))
-                            .child(div().fx_body().child("Automatic names"))
-                            .child(div().debug_selector(|| "settings-titles-enabled".into()).child(segmented_control(
-                                &[SegmentedOption::new(false, "Off"), SegmentedOption::new(true, "On")],
-                                &self.draft.enabled,
-                                move |enabled, _, cx| this.update(cx, |editor, cx| editor.set_enabled(*enabled, cx)),
-                            ))),
-                    )
-                    .child(self.picker_row("provider", "Provider", if provider == "claude" { "Claude" } else { "Codex" }.into(), provider_menu(provider), cx))
-                    .child(self.picker_row("model", "Model", display, model_menu(provider, &self.draft.model_id, &models), cx)),
-                Spacing::MD,
-            ))
-            .child(div().fx_caption().text_color(Colors::fg_tertiary(&theme)).child("One naming request per new chat. Names you set yourself are kept."))
+        let enabled = self.draft.enabled;
+        settings_section(
+            "Chat names",
+            Some(
+                "Name every new chat from its first prompt using the same provider and model."
+                    .into(),
+            ),
+            settings_group([
+                settings_row(
+                    "Automatic names",
+                    Some(
+                        "One naming request per new chat. Names you set yourself are kept.".into(),
+                    ),
+                    div()
+                        .debug_selector(|| "settings-titles-enabled".into())
+                        .child(switch(
+                            "settings-titles-enabled",
+                            enabled,
+                            true,
+                            move |_, _, cx| {
+                                this.update(cx, |editor, cx| editor.set_enabled(!enabled, cx))
+                            },
+                        )),
+                )
+                .into_any_element(),
+                settings_row(
+                    "Provider",
+                    None,
+                    self.picker(
+                        "provider",
+                        if provider == "claude" {
+                            "Claude"
+                        } else {
+                            "Codex"
+                        }
+                        .into(),
+                        provider_menu(provider),
+                        cx,
+                    ),
+                )
+                .into_any_element(),
+                settings_row(
+                    "Model",
+                    None,
+                    self.picker(
+                        "model",
+                        display,
+                        model_menu(provider, &self.draft.model_id, &models),
+                        cx,
+                    ),
+                )
+                .into_any_element(),
+            ]),
+        )
+        .debug_selector(|| "settings-chat-names".into())
     }
 }
 

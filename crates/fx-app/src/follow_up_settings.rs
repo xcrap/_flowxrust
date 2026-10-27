@@ -6,9 +6,7 @@
 //! a choice.
 
 use fx_design::components::segmented::{SegmentedOption, segmented_control};
-use fx_design::components::{card, section_header};
-use fx_design::styled::{FxStyled, px_len};
-use fx_design::theme::{Colors, Spacing, global};
+use fx_design::components::{settings_group, settings_row, settings_section};
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, Render, Window, div};
 
@@ -56,46 +54,27 @@ fn explanation(mode: FollowUp) -> &'static str {
 
 impl Render for FollowUpSettings {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = global::current();
         let this = cx.entity();
-        div()
-            .w_full()
-            .min_w_0()
-            .flex()
-            .flex_col()
-            .gap(px_len(Spacing::MD))
-            .debug_selector(|| "settings-follow-up".into())
-            .child(section_header("While responding"))
-            .child(card(
+        settings_section(
+            "While responding",
+            Some("What a prompt sent during a turn does.".into()),
+            settings_group([settings_row(
+                "Command-Return",
+                Some(explanation(self.draft).into()),
                 div()
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap(px_len(Spacing::MD))
-                    .child(div().fx_body().child("Command-Return"))
-                    .child(
-                        div()
-                            .debug_selector(|| "settings-follow-up-mode".into())
-                            .child(segmented_control(
-                                &[
-                                    SegmentedOption::new(FollowUp::Steer, FollowUp::Steer.label()),
-                                    SegmentedOption::new(FollowUp::Queue, FollowUp::Queue.label()),
-                                ],
-                                &self.draft,
-                                move |mode, _, cx| {
-                                    this.update(cx, |editor, cx| editor.set(*mode, cx))
-                                },
-                            )),
-                    ),
-                Spacing::MD,
-            ))
-            .child(
-                div()
-                    .fx_caption()
-                    .text_color(Colors::fg_tertiary(&theme))
-                    .child(explanation(self.draft)),
+                    .debug_selector(|| "settings-follow-up-mode".into())
+                    .child(segmented_control(
+                        &[
+                            SegmentedOption::new(FollowUp::Steer, FollowUp::Steer.label()),
+                            SegmentedOption::new(FollowUp::Queue, FollowUp::Queue.label()),
+                        ],
+                        &self.draft,
+                        move |mode, _, cx| this.update(cx, |editor, cx| editor.set(*mode, cx)),
+                    )),
             )
+            .into_any_element()]),
+        )
+        .debug_selector(|| "settings-follow-up".into())
     }
 }
 

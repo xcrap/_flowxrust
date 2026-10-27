@@ -1,6 +1,6 @@
 //! Recovery for archived chats, reachable only from Settings.
 
-use fx_design::components::{ButtonStyle, button, divider};
+use fx_design::components::{ButtonStyle, button, settings_group, settings_row_custom};
 use fx_design::styled::{FxStyled, px_len};
 use fx_design::theme::{Colors, Spacing, global};
 use gpui::prelude::*;
@@ -71,7 +71,7 @@ impl Render for ArchivedChats {
         let query = self.search.read(cx).value().trim().to_lowercase();
         let mut count = 0;
         let mut visible = 0;
-        let mut rows = div().flex().flex_col().gap(px_len(Spacing::SM));
+        let mut rows = Vec::new();
         for record in &state.snapshot.projects {
             let Some(project) = &record.project else {
                 continue;
@@ -106,64 +106,57 @@ impl Render for ArchivedChats {
                 };
                 let this = cx.entity();
                 let full_title = title.to_owned();
-                rows = rows
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("archived-chat:{id}")))
-                            .debug_selector(move || format!("archived-chat:{id}"))
-                            .flex()
-                            .items_center()
-                            .gap(px_len(Spacing::MD))
-                            .py(px_len(Spacing::SM))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px_len(Spacing::XXS))
-                                    .child(
-                                        div()
-                                            .id("archive-title")
-                                            .overflow_hidden()
-                                            .whitespace_nowrap()
-                                            .text_ellipsis()
-                                            .fx_body()
-                                            .text_color(Colors::fg(&theme))
-                                            .child(SharedString::from(title.to_owned()))
-                                            .tooltip(move |window, cx| {
-                                                fx_design::components::tooltip(
-                                                    full_title.clone(),
-                                                    window,
-                                                    cx,
-                                                )
-                                            }),
-                                    )
-                                    .child(
-                                        div()
-                                            .fx_caption()
-                                            .text_color(Colors::fg_secondary(&theme))
-                                            .child(SharedString::from(format!(
-                                                "{} · {provider}",
-                                                project.name
-                                            ))),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .debug_selector(move || format!("restore-archived:{id}"))
-                                    .child(button(
-                                        "Restore",
-                                        ButtonStyle::Secondary,
-                                        !state.is_thread_busy(id),
-                                        move |_, _, cx| {
-                                            this.update(cx, |this, cx| this.restore(id, cx))
-                                        },
-                                    )),
-                            ),
-                    )
-                    .child(divider());
+                rows.push(
+                    div()
+                        .id(SharedString::from(format!("archived-chat:{id}")))
+                        .debug_selector(move || format!("archived-chat:{id}"))
+                        .w_full()
+                        .child(settings_row_custom(
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap(px_len(Spacing::XXXS))
+                                .child(
+                                    div()
+                                        .id("archive-title")
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .fx_body_medium()
+                                        .text_color(Colors::fg(&theme))
+                                        .child(SharedString::from(title.to_owned()))
+                                        .tooltip(move |window, cx| {
+                                            fx_design::components::tooltip(
+                                                full_title.clone(),
+                                                window,
+                                                cx,
+                                            )
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .fx_caption()
+                                        .text_color(Colors::fg_secondary(&theme))
+                                        .child(SharedString::from(format!(
+                                            "{} · {provider}",
+                                            project.name
+                                        ))),
+                                ),
+                            div()
+                                .debug_selector(move || format!("restore-archived:{id}"))
+                                .child(button(
+                                    "Restore",
+                                    ButtonStyle::Secondary,
+                                    !state.is_thread_busy(id),
+                                    move |_, _, cx| {
+                                        this.update(cx, |this, cx| this.restore(id, cx))
+                                    },
+                                )),
+                        ))
+                        .into_any_element(),
+                );
             }
         }
         let mut body = div()
@@ -181,9 +174,9 @@ impl Render for ArchivedChats {
             );
         }
         if visible == 0 {
-            body = body.child(
+            body = body.child(settings_group([settings_row_custom(
                 div()
-                    .py(px_len(Spacing::XL))
+                    .py(px_len(Spacing::SM))
                     .fx_body()
                     .text_color(Colors::fg_secondary(&theme))
                     .child(if count == 0 {
@@ -191,9 +184,11 @@ impl Render for ArchivedChats {
                     } else {
                         "No matching archived chats"
                     }),
-            );
+                div(),
+            )
+            .into_any_element()]));
         } else {
-            body = body.child(rows);
+            body = body.child(settings_group(rows));
         }
         body
     }

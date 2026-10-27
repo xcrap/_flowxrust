@@ -31,7 +31,7 @@ const DISABLED_OPACITY: f32 = 0.52;
 /// The original scaled the control to 0.97. GPUI's style refinement cannot
 /// transform an element, so press feedback is an opacity dip instead — which
 /// also avoids re-running layout on every press.
-const PRESSED_OPACITY: f32 = 0.94;
+pub(crate) const PRESSED_OPACITY: f32 = 0.94;
 
 /// How a button looks, as a function of style and hover.
 ///

@@ -146,9 +146,15 @@ impl Layout {
     pub const SIDEBAR_MIN_WIDTH: f32 = 200.0;
     pub const SIDEBAR_MAX_WIDTH: f32 = 400.0;
     pub const SETTINGS_PANEL_WIDTH: f32 = 560.0;
-    pub const SETTINGS_WINDOW_WIDTH: f32 = 800.0;
-    pub const SETTINGS_NAV_WIDTH: f32 = 176.0;
-    pub const SETTINGS_BODY_HEIGHT: f32 = 512.0;
+    /// The settings sheet at its widest; a narrower window shrinks it.
+    pub const SETTINGS_WINDOW_WIDTH: f32 = 1040.0;
+    /// The settings sheet at its tallest; a shorter window shrinks it.
+    pub const SETTINGS_WINDOW_HEIGHT: f32 = 680.0;
+    pub const SETTINGS_NAV_WIDTH: f32 = 224.0;
+    /// The measure of a settings page's column of groups.
+    pub const SETTINGS_CONTENT_WIDTH: f32 = 640.0;
+    pub const SWITCH_WIDTH: f32 = 36.0;
+    pub const SWITCH_HEIGHT: f32 = 20.0;
     pub const CONTROL_HEIGHT: f32 = 30.0;
     pub const CONTROL_COMPACT_HEIGHT: f32 = 28.0;
     pub const COMPOSER_ACTION_SIZE: f32 = 36.0;

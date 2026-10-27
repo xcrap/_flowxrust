@@ -159,6 +159,7 @@ before styling a screen ad hoc.
 | `surface` | Card, panel, divider, banner, empty state, section header. |
 | `status` | Badge, activity dot, typing indicator, pulsing dot, context-usage ring. |
 | `segmented` | Segmented control for exclusive choices. |
+| `settings` | The preferences vocabulary: a section heading over a group card whose rows (title, description, trailing control) are split by hairlines, the navigation's group label and search field, a breadcrumb, and an on/off `switch`. |
 | `tooltip` | Hover tooltip body. |
 | `menu` | Dropdown and context-menu panels, plus `MenuLayer`, the one-open-menu-at-a-time owner. |
 | `menu_model` | `MenuItem` / `MenuSection` / `MenuModel`, and the highlight and keyboard-navigation rules. |

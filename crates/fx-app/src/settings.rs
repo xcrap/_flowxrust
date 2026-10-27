@@ -20,20 +20,24 @@ use std::path::{Path, PathBuf};
 use fx_core::services::runtime::{BinaryHealth, BinarySpec, expand_glob};
 use fx_design::components::segmented::{SegmentedOption, segmented_control};
 use fx_design::components::{
-    BadgeTone, ButtonStyle, DividerAxis, IconButtonProps, badge, button, button_with_icon, card,
-    divider, divider_with_axis, icon_button, navigation_button, panel, section_header, tooltip,
+    BadgeTone, ButtonStyle, DividerAxis, IconButtonProps, badge, breadcrumb, button,
+    button_with_icon, divider, divider_with_axis, icon_button, navigation_button, settings_group,
+    settings_nav_label, settings_row, settings_row_custom, settings_row_dense, settings_search,
+    settings_section, settings_section_with_action, tooltip,
 };
 use fx_design::icon::Icon;
 use fx_design::styled::{FxStyled, px_len};
 use fx_design::theme::{
-    AccentColor, AppearanceMode, BaseTone, Colors, Layout, Shadow, Spacing, TextRole,
-    TextSizePreset, Theme, global,
+    AccentColor, AppearanceMode, BaseTone, BorderWidth, Colors, Layout, Radii, Shadow, Spacing,
+    TextRole, TextSizePreset, Theme, global,
 };
 use gpui::prelude::*;
 use gpui::{
     AnyElement, App, Context, Entity, FocusHandle, KeyDownEvent, MouseButton, Render, SharedString,
     Subscription, Window, div, px,
 };
+
+use crate::text_field::TextField;
 
 // ── The draft ──────────────────────────────────────────────────────────────
 
@@ -411,24 +415,108 @@ type RecheckHandler = Box<dyn Fn(&mut Window, &mut App)>;
 /// Element id of the container that owns the sheet's keys.
 const SHEET_ID: &str = "settings.sheet";
 
+/// A search names a setting; it is never a paragraph.
+const SEARCH_MAX_LEN: usize = 64;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum SettingsPage {
-    ChatDefaults,
     #[default]
     Appearance,
-    Providers,
+    ChatDefaults,
     Shortcuts,
+    Providers,
     Archives,
 }
 
 impl SettingsPage {
+    #[cfg(test)]
     const ALL: [Self; 5] = [
-        Self::ChatDefaults,
         Self::Appearance,
-        Self::Providers,
+        Self::ChatDefaults,
         Self::Shortcuts,
+        Self::Providers,
         Self::Archives,
     ];
+
+    /// The navigation's runs, in order, each under its label.
+    const GROUPS: [(Option<&'static str>, &'static [Self]); 3] = [
+        (
+            None,
+            &[Self::Appearance, Self::ChatDefaults, Self::Shortcuts],
+        ),
+        (Some("Agents"), &[Self::Providers]),
+        (Some("History"), &[Self::Archives]),
+    ];
+
+    /// Words a reader might search for that the label does not say: the
+    /// settings on the page and the values they take.
+    fn search_terms(self) -> &'static [&'static str] {
+        match self {
+            Self::Appearance => &[
+                "theme",
+                "light",
+                "dark",
+                "system",
+                "mode",
+                "base color",
+                "tone",
+                "slate",
+                "zinc",
+                "neutral",
+                "stone",
+                "accent",
+                "violet",
+                "blue",
+                "emerald",
+                "orange",
+                "rose",
+                "text size",
+                "font",
+            ],
+            Self::ChatDefaults => &[
+                "codex",
+                "claude",
+                "model",
+                "reasoning",
+                "effort",
+                "access",
+                "permissions",
+                "supervised",
+                "while responding",
+                "steer",
+                "queue",
+                "command-return",
+                "chat names",
+                "titles",
+                "automatic names",
+            ],
+            Self::Shortcuts => &["keys", "keyboard", "bindings", "hotkeys"],
+            Self::Providers => &[
+                "cli",
+                "codex",
+                "claude",
+                "binary",
+                "path",
+                "installed",
+                "quarantine",
+                "check again",
+                "runtime",
+            ],
+            Self::Archives => &["archive", "restore", "history"],
+        }
+    }
+
+    /// Whether the page offers what `query` asks for. `query` is already
+    /// trimmed and lowercased; an empty one matches every page.
+    fn matches(self, query: &str) -> bool {
+        query.is_empty()
+            || self.label().to_lowercase().contains(query)
+            || self.search_terms().iter().any(|term| term.contains(query))
+            || (self == Self::Shortcuts
+                && crate::commands::key_bindings()
+                    .iter()
+                    .any(|shortcut| shortcut.label.to_lowercase().contains(query)))
+    }
 
     fn label(self) -> &'static str {
         match self {
@@ -489,6 +577,9 @@ pub struct SettingsSheet {
     follow_up_subscription: Option<Subscription>,
     archives: Option<Entity<crate::archived_chats::ArchivedChats>>,
     page: SettingsPage,
+    /// Narrows the navigation to the pages that offer what it names.
+    search: Entity<TextField>,
+    _search_subscription: Subscription,
     /// Set once either outcome has been reported.
     ///
     /// The caller unmounts on the first callback and reacts to it, not the
@@ -514,27 +605,65 @@ impl SettingsSheet {
         // nothing else would ever hold focus.
         focus.tab_stop = true;
 
-        cx.new(|_cx| Self {
-            baseline: draft,
-            draft,
-            rows: Vec::new(),
-            focus,
-            on_apply,
-            on_dismiss,
-            on_recheck,
-            provider_defaults: None,
-            provider_defaults_dirty: false,
-            provider_defaults_subscription: None,
-            title_settings: None,
-            title_settings_dirty: false,
-            title_settings_subscription: None,
-            follow_up: None,
-            follow_up_dirty: false,
-            follow_up_subscription: None,
-            archives: None,
-            page: SettingsPage::default(),
-            settled: false,
+        cx.new(|cx| {
+            let search = cx.new(|cx| {
+                TextField::new(cx)
+                    .bare()
+                    .placeholder("Search")
+                    .max_len(SEARCH_MAX_LEN)
+            });
+            let search_subscription = cx.observe(&search, |_, _, cx| cx.notify());
+            Self {
+                baseline: draft,
+                draft,
+                rows: Vec::new(),
+                focus,
+                on_apply,
+                on_dismiss,
+                on_recheck,
+                provider_defaults: None,
+                provider_defaults_dirty: false,
+                provider_defaults_subscription: None,
+                title_settings: None,
+                title_settings_dirty: false,
+                title_settings_subscription: None,
+                follow_up: None,
+                follow_up_dirty: false,
+                follow_up_subscription: None,
+                archives: None,
+                page: SettingsPage::default(),
+                search,
+                _search_subscription: search_subscription,
+                settled: false,
+            }
         })
+    }
+
+    /// The search as the pages are matched against it.
+    fn search_query(&self, cx: &App) -> String {
+        self.search.read(cx).value().trim().to_lowercase()
+    }
+
+    /// The pages the navigation shows, in its order.
+    fn visible_pages(&self, cx: &App) -> Vec<SettingsPage> {
+        let query = self.search_query(cx);
+        SettingsPage::GROUPS
+            .iter()
+            .flat_map(|(_, pages)| pages.iter().copied())
+            .filter(|page| self.page_available(*page) && page.matches(&query))
+            .collect()
+    }
+
+    /// Return from the search to the first page it found, if any.
+    fn open_first_match(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(page) = self.visible_pages(cx).first().copied() {
+            self.select_page(page, window, cx);
+        }
+    }
+
+    fn clear_search(&mut self, cx: &mut Context<Self>) {
+        self.search
+            .update(cx, |search, cx| search.set_value("", cx));
     }
 
     /// Build a sheet and put focus on it.
@@ -824,10 +953,18 @@ impl Render for SettingsSheet {
                 }
             });
 
-        // The settings window reserves room for its own page navigation.
+        // As large as a preferences window, and never closer to the window's
+        // edge than a margin: the backdrop around it is how the reader backs
+        // out with the pointer.
+        let viewport = window.viewport_size();
+        let width = px(Layout::SETTINGS_WINDOW_WIDTH)
+            .min(viewport.width - px(Spacing::XXL * 2.0))
+            .max(px(Layout::SETTINGS_NAV_WIDTH * 2.0));
+        let height = px(Layout::SETTINGS_WINDOW_HEIGHT)
+            .min(viewport.height - px(Spacing::HUGE * 2.0))
+            .max(px(Spacing::HUGE * 4.0));
         let sheet = div()
-            .w(px_len(Layout::SETTINGS_WINDOW_WIDTH))
-            .max_w_full()
+            .w(width)
             // Padding around the panel so the shadow has somewhere to land: a
             // styled element's shadow is clipped to the element's own bounds.
             .p(px_len(Spacing::SM))
@@ -837,13 +974,16 @@ impl Render for SettingsSheet {
             .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
                 cx.stop_propagation();
             })
-            .child(panel(
-                self.body(
-                    &this,
-                    (window.viewport_size().height - px(Spacing::HUGE * 4.0))
-                        .max(px(Spacing::HUGE * 2.0)),
-                ),
-            ));
+            .child(
+                div()
+                    .w_full()
+                    .h(height - px(Spacing::SM * 2.0))
+                    .bg(Colors::content_bg(&theme))
+                    .rounded(px_len(Radii::XL))
+                    .border(px_len(BorderWidth::HAIRLINE))
+                    .border_color(Colors::border_medium(&theme))
+                    .child(self.body(&this, cx)),
+            );
 
         div()
             .id("settings-overlay")
@@ -869,11 +1009,26 @@ impl Render for SettingsSheet {
                                 // and arrow keys until this picker closes.
                                 return;
                             }
-                            // Searching archives must not submit the settings.
+                            let sheet = this.read(cx);
+                            let search = sheet.search.read(cx);
+                            let searching = search.focus_handle().is_focused(window);
                             let action = match event.keystroke.key.as_str() {
+                                // A search is cleared before it is left.
+                                "escape" if searching && !search.value().is_empty() => {
+                                    Some(Action::ClearSearch)
+                                }
                                 "escape" => Some(Action::Dismiss),
-                                "enter" if this.read(cx).page != SettingsPage::Archives => {
+                                "enter" if searching => Some(Action::OpenFirstMatch),
+                                // Searching archives must not submit the settings.
+                                "enter" if sheet.page != SettingsPage::Archives => {
                                     Some(Action::Confirm)
+                                }
+                                // Only while no field has the keys, so a slash
+                                // can still be typed into one.
+                                "/" if !event.keystroke.modifiers.modified()
+                                    && sheet.focus.is_focused(window) =>
+                                {
+                                    Some(Action::Search)
                                 }
                                 _ => None,
                             };
@@ -887,6 +1042,11 @@ impl Render for SettingsSheet {
                                 match action {
                                     Action::Dismiss => sheet.dismiss(window, cx),
                                     Action::Confirm => sheet.confirm(window, cx),
+                                    Action::ClearSearch => sheet.clear_search(cx),
+                                    Action::OpenFirstMatch => sheet.open_first_match(window, cx),
+                                    Action::Search => {
+                                        sheet.search.read(cx).focus_handle().focus(window)
+                                    }
                                 }
                                 cx.notify();
                             });
@@ -898,20 +1058,20 @@ impl Render for SettingsSheet {
     }
 }
 
-/// Which of the sheet's two outcomes a key asks for.
+/// What a key asks the sheet for: one of its two outcomes, or a move in and
+/// out of the navigation's search.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Action {
     Confirm,
     Dismiss,
+    ClearSearch,
+    OpenFirstMatch,
+    Search,
 }
 
 impl SettingsSheet {
     /// Navigation, header and footer stay put while the selected page scrolls.
-    fn body(
-        &self,
-        this: &Entity<SettingsSheet>,
-        max_body_height: gpui::Pixels,
-    ) -> impl IntoElement {
+    fn body(&self, this: &Entity<SettingsSheet>, cx: &App) -> impl IntoElement {
         let theme = global::current();
         let for_reset = this.clone();
         let for_done = this.clone();
@@ -922,7 +1082,7 @@ impl SettingsSheet {
                 .min_w_0()
                 .flex()
                 .flex_col()
-                .gap(px_len(Spacing::XXL))
+                .gap(px_len(Spacing::XXXL))
                 .children(self.provider_defaults.clone())
                 .children(self.follow_up.clone())
                 .children(self.title_settings.clone())
@@ -930,91 +1090,58 @@ impl SettingsSheet {
             SettingsPage::Appearance => self.appearance_section(this),
             SettingsPage::Providers => self.provider_section(this),
             SettingsPage::Shortcuts => shortcuts_section(),
-            SettingsPage::Archives => div()
-                .w_full()
-                .flex()
-                .flex_col()
-                .gap(px_len(Spacing::MD))
-                .child(section_header("Archived chats"))
-                .child(
-                    div()
-                        .fx_caption()
-                        .text_color(Colors::fg_secondary(&theme))
-                        .child("Find and restore chats from your projects."),
-                )
-                .children(self.archives.clone())
-                .into_any_element(),
+            SettingsPage::Archives => settings_section(
+                "Archived chats",
+                Some("Find and restore chats from your projects.".into()),
+                div().w_full().children(self.archives.clone()),
+            )
+            .into_any_element(),
         };
         let page = self.page;
-        div()
+        let dirty = self.is_dirty();
+        let header = div()
             .w_full()
-            .min_w_0()
             .flex()
-            .flex_col()
+            .items_center()
+            .justify_between()
+            .gap(px_len(Spacing::MD))
+            .px(px_len(Spacing::XXL))
+            .h(px_len(Layout::PANE_HEADER_HEIGHT + Spacing::SM))
+            .flex_shrink_0()
+            .child(breadcrumb(&["Settings".into(), page.label().into()]))
+            .child(icon_button(
+                IconButtonProps::new(Icon::XMARK, "Close settings"),
+                move |_, window, cx| {
+                    for_close.update(cx, |sheet, cx| {
+                        sheet.dismiss(window, cx);
+                        cx.notify();
+                    });
+                },
+            ));
+        let footer = div()
+            .w_full()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px_len(Spacing::MD))
+            .px(px_len(Spacing::XXL))
+            .py(px_len(Spacing::MD))
+            .flex_shrink_0()
             .child(
                 div()
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap(px_len(Spacing::MD))
-                    .px(px_len(Spacing::XXL))
-                    .py(px_len(Spacing::XL))
-                    .flex_shrink_0()
-                    .child(div().fx_title2().child("Settings"))
-                    .child(icon_button(
-                        IconButtonProps::new(Icon::XMARK, "Close settings"),
-                        move |_, window, cx| {
-                            for_close.update(cx, |sheet, cx| {
-                                sheet.dismiss(window, cx);
-                                cx.notify();
-                            });
-                        },
-                    )),
-            )
-            .child(divider())
-            .child(
-                div()
-                    .w_full()
                     .min_w_0()
-                    .h(px(Layout::SETTINGS_BODY_HEIGHT).min(max_body_height))
-                    .flex()
-                    .overflow_hidden()
-                    .child(self.navigation(this))
-                    .child(divider_with_axis(DividerAxis::Vertical))
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("settings-page-{}", page.key())))
-                            .debug_selector(move || format!("settings-page-{}", page.key()))
-                            .flex_1()
-                            .min_w_0()
-                            .h_full()
-                            .overflow_y_scroll()
-                            .child(
-                                div()
-                                    .w_full()
-                                    .min_w_0()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px_len(Spacing::XXL))
-                                    .p(px_len(Spacing::XXL))
-                                    .child(content),
-                            ),
-                    ),
+                    .fx_caption()
+                    .text_color(Colors::fg_tertiary(&theme))
+                    .when(dirty, |note| note.child("Unsaved changes")),
             )
-            .child(divider())
             .child(
                 div()
-                    .w_full()
                     .flex()
                     .items_center()
-                    .justify_between()
-                    .gap(px_len(Spacing::MD))
-                    .px(px_len(Spacing::XXL))
-                    .py(px_len(Spacing::LG))
-                    .flex_shrink_0()
-                    .child(button(
+                    .gap(px_len(Spacing::SM))
+                    .child(button_with_icon(
                         "Reset changes",
+                        Some(Icon::ARROW_COUNTERCLOCKWISE),
                         ButtonStyle::Ghost,
                         self.can_reset(),
                         move |_, _, cx| {
@@ -1032,10 +1159,58 @@ impl SettingsSheet {
                             });
                         },
                     )),
+            );
+        div()
+            .size_full()
+            .min_w_0()
+            .flex()
+            .child(self.navigation(this, cx))
+            .child(divider_with_axis(DividerAxis::Vertical))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .flex()
+                    .flex_col()
+                    .child(header)
+                    .child(divider())
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("settings-page-{}", page.key())))
+                            .debug_selector(move || format!("settings-page-{}", page.key()))
+                            .flex_1()
+                            .min_h(px(0.0))
+                            .w_full()
+                            .min_w_0()
+                            .overflow_y_scroll()
+                            .child(
+                                div()
+                                    .w_full()
+                                    .flex()
+                                    .justify_center()
+                                    .px(px_len(Spacing::XXL))
+                                    .py(px_len(Spacing::XXL))
+                                    .child(
+                                        div()
+                                            .w_full()
+                                            .max_w(px_len(Layout::SETTINGS_CONTENT_WIDTH))
+                                            .min_w_0()
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px_len(Spacing::XXXL))
+                                            .child(content),
+                                    ),
+                            ),
+                    )
+                    .child(divider())
+                    .child(footer),
             )
     }
 
-    fn navigation(&self, this: &Entity<SettingsSheet>) -> AnyElement {
+    fn navigation(&self, this: &Entity<SettingsSheet>, cx: &App) -> AnyElement {
+        let theme = global::current();
+        let query = self.search_query(cx);
         let mut navigation = div()
             .debug_selector(|| "settings-navigation".into())
             .w(px_len(Layout::SETTINGS_NAV_WIDTH))
@@ -1043,35 +1218,66 @@ impl SettingsSheet {
             .flex_shrink_0()
             .flex()
             .flex_col()
-            .gap(px_len(Spacing::XS))
-            .p(px_len(Spacing::MD));
-        for page in SettingsPage::ALL {
-            if !self.page_available(page) {
+            .gap(px_len(Spacing::XXXS))
+            .p(px_len(Spacing::MD))
+            .bg(Colors::sidebar_bg(&theme))
+            // The panel's corners; the content side keeps its own fill.
+            .rounded_l(px_len(Radii::XL))
+            .child(
+                div()
+                    .debug_selector(|| "settings-search".into())
+                    .pb(px_len(Spacing::SM))
+                    .child(settings_search(self.search.clone(), "/")),
+            );
+        let mut shown = 0;
+        for (label, pages) in SettingsPage::GROUPS {
+            let pages: Vec<_> = pages
+                .iter()
+                .copied()
+                .filter(|page| self.page_available(*page) && page.matches(&query))
+                .collect();
+            if pages.is_empty() {
                 continue;
             }
-            let this = this.clone();
-            let selected = self.page == page;
-            let item = div()
-                .w_full()
-                .debug_selector(move || format!("settings-nav-{}", page.key()))
-                .child(navigation_button(
-                    page.label(),
-                    page.icon(),
-                    selected,
-                    move |_, window, cx| {
-                        this.update(cx, |sheet, cx| sheet.select_page(page, window, cx));
-                    },
-                ));
-            // Keep the recovery entry's established automation selector.
-            navigation = if page == SettingsPage::Archives {
-                navigation.child(
-                    div()
-                        .debug_selector(|| "manage-archived-chats".into())
-                        .child(item),
-                )
-            } else {
-                navigation.child(item)
-            };
+            if let Some(label) = label {
+                navigation = navigation.child(settings_nav_label(label));
+            }
+            for page in pages {
+                shown += 1;
+                let this = this.clone();
+                let selected = self.page == page;
+                let item = div()
+                    .w_full()
+                    .debug_selector(move || format!("settings-nav-{}", page.key()))
+                    .child(navigation_button(
+                        page.label(),
+                        page.icon(),
+                        selected,
+                        move |_, window, cx| {
+                            this.update(cx, |sheet, cx| sheet.select_page(page, window, cx));
+                        },
+                    ));
+                // Keep the recovery entry's established automation selector.
+                navigation = if page == SettingsPage::Archives {
+                    navigation.child(
+                        div()
+                            .debug_selector(|| "manage-archived-chats".into())
+                            .child(item),
+                    )
+                } else {
+                    navigation.child(item)
+                };
+            }
+        }
+        if shown == 0 {
+            navigation = navigation.child(
+                div()
+                    .px(px_len(Spacing::MD))
+                    .py(px_len(Spacing::SM))
+                    .fx_caption()
+                    .text_color(Colors::fg_tertiary(&theme))
+                    .child("No matching settings"),
+            );
         }
         navigation.into_any_element()
     }
@@ -1081,83 +1287,119 @@ impl SettingsSheet {
         let theme = global::current();
         let for_recheck = this.clone();
 
-        let mut rows = div().flex().flex_col().gap(px_len(Spacing::SM));
-        if self.rows.is_empty() {
-            rows = rows.child(
-                div()
-                    .fx_caption()
-                    .child(SharedString::from("No provider has been looked for yet.")),
-            );
-        }
-        for row in &self.rows {
-            rows = rows.child(card(provider_row(row, &theme), Spacing::MD));
-        }
+        let rows: Vec<AnyElement> = if self.rows.is_empty() {
+            vec![
+                settings_row_custom(
+                    div()
+                        .fx_body()
+                        .text_color(Colors::fg_secondary(&theme))
+                        .child("No provider has been looked for yet."),
+                    div(),
+                )
+                .into_any_element(),
+            ]
+        } else {
+            self.rows
+                .iter()
+                .map(|row| {
+                    settings_row_custom(
+                        provider_row(row, &theme),
+                        badge(
+                            SharedString::from(row.badge.clone()),
+                            badge_tone(row.tone),
+                            true,
+                        ),
+                    )
+                    .into_any_element()
+                })
+                .collect()
+        };
 
-        div()
-            .flex()
-            .flex_col()
-            .gap(px_len(Spacing::MD))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px_len(Spacing::SM))
-                    .child(div().flex_1().min_w_0().child(section_header("Providers")))
-                    .child(button_with_icon(
-                        "Check again",
-                        Some(Icon::ARROW_CLOCKWISE),
-                        ButtonStyle::Ghost,
-                        // Never disabled: someone who has just installed a CLI
-                        // should not have to relaunch to find out.
-                        true,
-                        move |_event, window, cx| {
-                            for_recheck.update(cx, |sheet, cx| {
-                                sheet.recheck(window, cx);
-                                cx.notify();
-                            });
-                        },
-                    )),
-            )
-            .child(rows)
-            .into_any_element()
+        settings_section_with_action(
+            "Provider CLIs",
+            Some("FlowX runs the Codex and Claude Code installed on this Mac.".into()),
+            Some(
+                button_with_icon(
+                    "Check again",
+                    Some(Icon::ARROW_CLOCKWISE),
+                    ButtonStyle::Ghost,
+                    // Never disabled: someone who has just installed a CLI
+                    // should not have to relaunch to find out.
+                    true,
+                    move |_event, window, cx| {
+                        for_recheck.update(cx, |sheet, cx| {
+                            sheet.recheck(window, cx);
+                            cx.notify();
+                        });
+                    },
+                )
+                .into_any_element(),
+            ),
+            settings_group(rows),
+        )
+        .into_any_element()
     }
 
-    /// Appearance choices share one horizontal label/control rhythm.
+    /// The theme's four choices, as two groups: color, then text.
     fn appearance_section(&self, this: &Entity<SettingsSheet>) -> AnyElement {
         div()
             .w_full()
             .flex()
             .flex_col()
-            .gap(px_len(Spacing::MD))
-            .child(section_header("Appearance"))
-            .child(choice_row(
+            .gap(px_len(Spacing::XXXL))
+            .child(settings_section(
                 "Theme",
-                &appearance_choices(),
-                &self.draft.appearance,
-                this,
-                SettingsSheet::set_appearance,
+                None,
+                settings_group([
+                    settings_row(
+                        "Appearance",
+                        Some("Follow the system, or stay light or dark.".into()),
+                        choice_control(
+                            &appearance_choices(),
+                            &self.draft.appearance,
+                            this,
+                            SettingsSheet::set_appearance,
+                        ),
+                    )
+                    .into_any_element(),
+                    settings_row(
+                        "Base color",
+                        Some("The neutral tone behind every surface.".into()),
+                        choice_control(
+                            &tone_choices(),
+                            &self.draft.base_tone,
+                            this,
+                            SettingsSheet::set_tone,
+                        ),
+                    )
+                    .into_any_element(),
+                    settings_row(
+                        "Accent",
+                        Some("Selection, focus and primary buttons.".into()),
+                        choice_control(
+                            &accent_choices(),
+                            &self.draft.accent,
+                            this,
+                            SettingsSheet::set_accent,
+                        ),
+                    )
+                    .into_any_element(),
+                ]),
             ))
-            .child(choice_row(
-                "Base color",
-                &tone_choices(),
-                &self.draft.base_tone,
-                this,
-                SettingsSheet::set_tone,
-            ))
-            .child(choice_row(
-                "Accent",
-                &accent_choices(),
-                &self.draft.accent,
-                this,
-                SettingsSheet::set_accent,
-            ))
-            .child(choice_row(
-                "Text size",
-                &text_size_choices(),
-                &self.draft.text_size,
-                this,
-                SettingsSheet::set_text_size,
+            .child(settings_section(
+                "Text",
+                None,
+                settings_group([settings_row(
+                    "Text size",
+                    Some("Scales every text style in the app.".into()),
+                    choice_control(
+                        &text_size_choices(),
+                        &self.draft.text_size,
+                        this,
+                        SettingsSheet::set_text_size,
+                    ),
+                )
+                .into_any_element()]),
             ))
             .into_any_element()
     }
@@ -1170,63 +1412,41 @@ impl SettingsSheet {
 fn shortcuts_section() -> AnyElement {
     let theme = global::current();
     let table = crate::commands::key_bindings();
-    let mut section = div()
-        .w_full()
-        .flex()
-        .flex_col()
-        .gap(px_len(Spacing::LG))
-        .child(section_header("Shortcuts"))
-        .child(
-            div()
-                .fx_caption()
-                .text_color(Colors::fg_secondary(&theme))
-                .child("The menus show the same keys beside each command."),
-        );
+    let mut section = div().w_full().flex().flex_col().gap(px_len(Spacing::XXXL));
+    let mut first = true;
     for group in crate::commands::ShortcutGroup::ALL {
-        let rows: Vec<_> = table
+        let rows: Vec<AnyElement> = table
             .iter()
             .filter(|shortcut| shortcut.group == group)
+            .map(|shortcut| {
+                let keys = shortcut.symbols();
+                let selector = format!("shortcut:{keys}");
+                settings_row_dense(
+                    div()
+                        .fx_body()
+                        .text_color(Colors::fg(&theme))
+                        .child(SharedString::from(shortcut.label.clone())),
+                    fx_design::components::shortcut_chip(keys),
+                )
+                .debug_selector(move || selector.clone())
+                .into_any_element()
+            })
             .collect();
         if rows.is_empty() {
             continue;
         }
-        let mut list = div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .gap(px_len(Spacing::XS))
-            .child(
-                div()
-                    .fx_overline()
-                    .text_color(Colors::fg_tertiary(&theme))
-                    .child(group.title()),
-            );
-        for shortcut in rows {
-            let keys = shortcut.symbols();
-            let selector = format!("shortcut:{keys}");
-            list = list.child(
-                div()
-                    .debug_selector(move || selector.clone())
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap(px_len(Spacing::MD))
-                    .child(
-                        div()
-                            .fx_body()
-                            .text_color(Colors::fg_secondary(&theme))
-                            .child(SharedString::from(shortcut.label.clone())),
-                    )
-                    .child(fx_design::components::shortcut_chip(keys)),
-            );
-        }
-        section = section.child(list);
+        let description = first.then(|| "The menus show the same keys beside each command.".into());
+        first = false;
+        section = section.child(settings_section(
+            group.title(),
+            description,
+            settings_group(rows),
+        ));
     }
     section.into_any_element()
 }
 
-/// One provider: its name, its badge, where it was found, and what to do.
+/// One provider: its name, where it was found, and what to do.
 fn provider_row(row: &HealthRow, theme: &Theme) -> AnyElement {
     let mut column = div()
         .w_full()
@@ -1237,6 +1457,7 @@ fn provider_row(row: &HealthRow, theme: &Theme) -> AnyElement {
         .child(
             div()
                 .fx_body_medium()
+                .text_color(Colors::fg(theme))
                 .child(SharedString::from(row.title.clone())),
         );
 
@@ -1260,23 +1481,7 @@ fn provider_row(row: &HealthRow, theme: &Theme) -> AnyElement {
         );
     }
 
-    div()
-        .flex()
-        .flex_col()
-        .gap(px_len(Spacing::XXS))
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px_len(Spacing::SM))
-                .child(div().flex_1().min_w_0().child(column))
-                .child(badge(
-                    SharedString::from(row.badge.clone()),
-                    badge_tone(row.tone),
-                    true,
-                )),
-        )
+    column
         .child(
             div()
                 .fx_caption()
@@ -1317,13 +1522,12 @@ fn runtime_path_label(path: &str, home: Option<&Path>) -> String {
     format!("{prefix}…{suffix}")
 }
 
-/// A labelled group of exclusive choices.
+/// A group of exclusive choices, for the trailing edge of a settings row.
 ///
 /// `select` is a plain function pointer so one body serves all four groups: the
 /// alternative is a generic closure type per call site and four near-identical
 /// bodies.
-fn choice_row<T: Clone + PartialEq + 'static>(
-    label: &'static str,
+fn choice_control<T: Clone + PartialEq + 'static>(
     choices: &[Choice<T>],
     selected: &T,
     this: &Entity<SettingsSheet>,
@@ -1337,32 +1541,15 @@ fn choice_row<T: Clone + PartialEq + 'static>(
     // `'static`, and a borrow of the caller's entity cannot outlive this call.
     let for_select = this.clone();
 
-    div()
-        .w_full()
-        .flex()
-        .items_center()
-        .justify_between()
-        .gap(px_len(Spacing::MD))
-        .child(
-            div()
-                .flex_shrink_0()
-                .fx_body()
-                .text_color(Colors::fg_secondary(&global::current()))
-                .child(SharedString::from(label)),
-        )
-        .child(segmented_control(
-            &options,
-            selected,
-            move |value, _window, cx| {
-                let this = for_select.clone();
-                this.update(cx, |sheet, cx| {
-                    select(sheet, value.clone());
-                    cx.refresh_windows();
-                    cx.notify();
-                });
-            },
-        ))
-        .into_any_element()
+    segmented_control(&options, selected, move |value, _window, cx| {
+        let this = for_select.clone();
+        this.update(cx, |sheet, cx| {
+            select(sheet, value.clone());
+            cx.refresh_windows();
+            cx.notify();
+        });
+    })
+    .into_any_element()
 }
 
 #[cfg(test)]
@@ -2544,6 +2731,99 @@ mod tests {
         assert!(label.starts_with("~/.local/"));
         assert!(label.contains('…'));
         assert!(label.ends_with("-codex"));
+    }
+
+    #[test]
+    fn the_navigation_groups_hold_every_page_exactly_once() {
+        let grouped: Vec<_> = SettingsPage::GROUPS
+            .iter()
+            .flat_map(|(_, pages)| pages.iter().copied())
+            .collect();
+        for page in SettingsPage::ALL {
+            assert_eq!(
+                grouped.iter().filter(|grouped| **grouped == page).count(),
+                1,
+                "{page:?}"
+            );
+        }
+        assert_eq!(grouped.len(), SettingsPage::ALL.len());
+    }
+
+    #[test]
+    fn a_search_finds_pages_by_what_they_hold_not_only_their_name() {
+        assert!(SettingsPage::Appearance.matches("accent"));
+        assert!(SettingsPage::ChatDefaults.matches("reasoning"));
+        assert!(SettingsPage::Providers.matches("quarantine"));
+        assert!(!SettingsPage::Shortcuts.matches("accent"));
+        // Every command a shortcut names finds the page that lists it.
+        for shortcut in crate::commands::key_bindings() {
+            assert!(
+                SettingsPage::Shortcuts.matches(&shortcut.label.to_lowercase()),
+                "{}",
+                shortcut.label
+            );
+        }
+        for page in SettingsPage::ALL {
+            assert!(page.matches(""), "an empty search hides {page:?}");
+        }
+    }
+
+    #[test]
+    fn slash_searches_return_opens_the_first_match_and_escape_clears_first() {
+        let mut mounted = mount();
+        mounted.press("/");
+        let search = mounted.read(|sheet| sheet.search.clone());
+        let searching = || {
+            let search = search.clone();
+            move |window: &mut Window, cx: &mut App| {
+                search.read(cx).focus_handle().is_focused(window)
+            }
+        };
+        let focused = mounted
+            .window
+            .update(&mut mounted.test, {
+                let searching = searching();
+                move |_, window, cx| searching(window, cx)
+            })
+            .unwrap();
+        assert!(focused, "slash moves the keys to the search");
+
+        mounted.test.simulate_input(mounted.window, "short");
+        mounted.test.refresh().unwrap();
+        assert_eq!(
+            mounted
+                .test
+                .read(|cx| mounted.sheet.read(cx).visible_pages(cx)),
+            vec![SettingsPage::Shortcuts]
+        );
+
+        // The first Escape empties the search; the sheet stays open.
+        mounted.press("escape");
+        assert_eq!(mounted.dismissed(), 0);
+        assert_eq!(
+            mounted.test.read(|cx| search.read(cx).value().to_owned()),
+            ""
+        );
+
+        mounted.test.simulate_input(mounted.window, "accent");
+        mounted.press("enter");
+        assert_eq!(mounted.read(|sheet| sheet.page), SettingsPage::Appearance);
+        assert!(mounted.applied().is_empty(), "return in the search applied");
+        let focused = mounted
+            .window
+            .update(&mut mounted.test, {
+                let searching = searching();
+                move |_, window, cx| searching(window, cx)
+            })
+            .unwrap();
+        assert!(!focused, "opening a match hands the keys back to the sheet");
+
+        // Nothing matching leaves the page where it was.
+        mounted.press("/");
+        mounted.test.simulate_input(mounted.window, "zzz");
+        mounted.press("enter");
+        assert_eq!(mounted.read(|sheet| sheet.page), SettingsPage::Appearance);
+        assert!(mounted.applied().is_empty());
     }
 
     #[test]

@@ -3,10 +3,11 @@
 use fx_agent::Model;
 use fx_core::AgentAccess;
 use fx_design::components::{
-    MenuItem, MenuLayer, MenuModel, MenuSection, MenuTrigger, card, menu_trigger, section_header,
+    MenuItem, MenuLayer, MenuModel, MenuSection, MenuTrigger, menu_trigger, settings_group,
+    settings_row, settings_section,
 };
-use fx_design::styled::{FxStyled, px_len};
-use fx_design::theme::{Colors, Spacing, global};
+use fx_design::styled::px_len;
+use fx_design::theme::Spacing;
 use fx_store::ProviderDefaults;
 use gpui::prelude::*;
 use gpui::{AnyElement, App, Context, Entity, Render, SharedString, Window, div};
@@ -95,7 +96,6 @@ impl ProviderSettings {
         title: &'static str,
         cx: &App,
     ) -> AnyElement {
-        let theme = global::current();
         let defaults = if provider == "codex" {
             &self.codex
         } else {
@@ -104,116 +104,103 @@ impl ProviderSettings {
         let models = provider_catalog::models(provider);
         let selected = selected_model(provider, defaults);
         let capabilities = selected_capabilities(provider, defaults);
-        let mut content = div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .gap(px_len(Spacing::SM))
-            .child(div().fx_body().child(title))
-            .child(self.picker_row(
-                provider,
-                "model",
-                "Model",
-                model_label(provider, defaults, selected.as_ref()),
-                model_menu(provider, defaults, &models),
-                cx,
-            ))
-            .child(
-                self.picker_row(
-                    provider,
-                    "effort",
-                    "Reasoning",
-                    defaults
-                        .effort
-                        .as_deref()
-                        .map(effort_label)
-                        .unwrap_or_else(|| "Model default".into()),
-                    effort_menu(defaults, capabilities.as_ref()),
-                    cx,
-                ),
-            )
-            .child(self.picker_row(
-                provider,
-                "access",
-                "Access",
-                defaults.agent_access.unwrap_or_default().label().into(),
-                access_menu(defaults),
-                cx,
-            ))
-            .child(
-                div()
-                    .fx_caption()
-                    .text_color(Colors::fg_secondary(&theme))
-                    .child(defaults.agent_access.unwrap_or_default().explanation()),
-            );
-        if capabilities
+        let reasoning = if capabilities
             .as_ref()
             .is_some_and(|model| model.supported_efforts.is_empty())
         {
-            content = content.child(
-                div()
-                    .fx_caption()
-                    .text_color(Colors::fg_tertiary(&theme))
-                    .child("This model uses its provider’s reasoning settings."),
-            );
-        }
-        card(content, Spacing::MD).into_any_element()
+            "This model uses its provider’s reasoning settings."
+        } else {
+            "How much the model thinks before it answers."
+        };
+        settings_section(
+            title,
+            Some(
+                format!("Where new {title} chats start. Existing chats keep their own settings.")
+                    .into(),
+            ),
+            settings_group([
+                settings_row(
+                    "Model",
+                    None,
+                    self.picker(
+                        provider,
+                        "model",
+                        model_label(provider, defaults, selected.as_ref()),
+                        model_menu(provider, defaults, &models),
+                        cx,
+                    ),
+                )
+                .into_any_element(),
+                settings_row(
+                    "Reasoning",
+                    Some(reasoning.into()),
+                    self.picker(
+                        provider,
+                        "effort",
+                        defaults
+                            .effort
+                            .as_deref()
+                            .map(effort_label)
+                            .unwrap_or_else(|| "Model default".into()),
+                        effort_menu(defaults, capabilities.as_ref()),
+                        cx,
+                    ),
+                )
+                .into_any_element(),
+                settings_row(
+                    "Access",
+                    Some(
+                        defaults
+                            .agent_access
+                            .unwrap_or_default()
+                            .explanation()
+                            .into(),
+                    ),
+                    self.picker(
+                        provider,
+                        "access",
+                        defaults.agent_access.unwrap_or_default().label().into(),
+                        access_menu(defaults),
+                        cx,
+                    ),
+                )
+                .into_any_element(),
+            ]),
+        )
+        .into_any_element()
     }
 
-    fn picker_row(
+    /// The dropdown at a row's trailing edge.
+    fn picker(
         &self,
         provider: &str,
         field: &str,
-        title: &'static str,
         label: String,
         model: MenuModel,
         cx: &App,
     ) -> AnyElement {
-        let theme = global::current();
         let owner = format!("{PREFIX}{provider}:{field}");
         let selector = owner.clone();
         let expanded = self.menu_layer.read(cx).is_owner(&owner);
         div()
-            .w_full()
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap(px_len(Spacing::MD))
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .fx_caption()
-                    .text_color(Colors::fg_secondary(&theme))
-                    .child(title),
-            )
-            .child(
-                div()
-                    .min_w_0()
-                    .debug_selector(move || selector.clone())
-                    .child(menu_trigger(
-                        MenuTrigger::new(
-                            model,
-                            SharedString::from(owner),
-                            SharedString::from(label),
-                        )
-                        .expanded(expanded),
-                        &self.menu_layer,
-                    )),
-            )
+            .min_w_0()
+            .debug_selector(move || selector.clone())
+            .child(menu_trigger(
+                MenuTrigger::new(model, SharedString::from(owner), SharedString::from(label))
+                    .expanded(expanded),
+                &self.menu_layer,
+            ))
             .into_any_element()
     }
 }
 
 impl Render for ProviderSettings {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = global::current();
         div()
             .w_full()
             .flex()
             .flex_col()
-            .gap(px_len(Spacing::MD))
-            .child(section_header("Chat defaults"))
-            .child(div().fx_caption().text_color(Colors::fg_secondary(&theme)).child("Choose the starting settings for new chats. Existing chats keep their own settings."))
+            .gap(px_len(Spacing::XXXL))
             .child(self.provider_section("codex", "Codex", cx))
             .child(self.provider_section("claude", "Claude", cx))
     }

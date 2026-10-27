@@ -18,6 +18,7 @@ pub mod palette;
 pub mod provider_status;
 pub mod rich_text;
 pub mod segmented;
+pub mod settings;
 pub mod status;
 pub mod surface;
 pub mod tooltip;
@@ -55,6 +56,11 @@ pub use checklist::{
     ChecklistInk, ChecklistMark, checklist, checklist_ink, checklist_row, checklist_surface,
 };
 pub use segmented::{SegmentedOption, segmented_control};
+pub use settings::{
+    SettingsGroupPalette, SwitchPalette, breadcrumb, settings_group, settings_group_palette,
+    settings_nav_label, settings_row, settings_row_custom, settings_row_dense, settings_row_label,
+    settings_search, settings_section, settings_section_with_action, switch, switch_palette,
+};
 pub use status::{
     ActivityState, BadgeTone, activity_dot, badge, context_ring_color, context_ring_icon,
     pulsing_dot, spinner_arc, static_ring, typing_indicator,
