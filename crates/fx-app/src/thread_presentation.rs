@@ -68,11 +68,20 @@ pub(crate) fn context_usage(
 /// A settled thread reads its saved outcome whether or not its conversation is
 /// loaded. Deciding from the loaded history instead made a row change from a
 /// dot to a checkmark the moment it was clicked, with nothing having happened.
+///
+/// `elsewhere` is what another app's turn on this thread is waiting for, as
+/// its provider reports it. It outranks everything but a turn FlowX runs:
+/// the reader cannot answer it here, and without the mark a mirrored thread
+/// blocked on a permission looked finished.
 pub(crate) fn activity(
     phase: Option<Phase>,
     busy: bool,
     saved: AgentExecutionState,
+    elsewhere: Option<&str>,
 ) -> (ActivityState, &'static str) {
+    if elsewhere.is_some() && !busy {
+        return (ActivityState::Waiting, "Waiting for you in another app");
+    }
     match phase {
         Some(Phase::WaitingForApproval) => (ActivityState::Waiting, "Waiting for approval"),
         Some(Phase::WaitingForInput) => (ActivityState::Waiting, "Waiting for input"),
@@ -209,7 +218,7 @@ mod tests {
             (Phase::Failed, ActivityState::Error),
         ] {
             assert_eq!(
-                activity(Some(phase), true, AgentExecutionState::Idle).0,
+                activity(Some(phase), true, AgentExecutionState::Idle, None).0,
                 expected
             );
         }
@@ -218,19 +227,24 @@ mod tests {
     #[test]
     fn startup_and_ready_states_follow_the_conversation_lifecycle() {
         assert_eq!(
-            activity(Some(Phase::Idle), false, AgentExecutionState::Idle),
+            activity(Some(Phase::Idle), false, AgentExecutionState::Idle, None),
             (ActivityState::Idle, "Idle")
         );
         assert_eq!(
-            activity(Some(Phase::Idle), true, AgentExecutionState::Idle),
+            activity(Some(Phase::Idle), true, AgentExecutionState::Idle, None),
             (ActivityState::Running, "Starting")
         );
         assert_eq!(
-            activity(Some(Phase::Running), true, AgentExecutionState::Success),
+            activity(
+                Some(Phase::Running),
+                true,
+                AgentExecutionState::Success,
+                None
+            ),
             (ActivityState::Running, "Working")
         );
         assert_eq!(
-            activity(Some(Phase::Idle), false, AgentExecutionState::Success),
+            activity(Some(Phase::Idle), false, AgentExecutionState::Success, None),
             (ActivityState::Completed, "Ready")
         );
     }
@@ -239,15 +253,39 @@ mod tests {
     fn a_settled_thread_shows_the_same_status_loaded_or_not() {
         for saved in AgentExecutionState::ALL {
             assert_eq!(
-                activity(Some(Phase::Idle), false, saved),
-                activity(None, false, saved),
+                activity(Some(Phase::Idle), false, saved, None),
+                activity(None, false, saved, None),
                 "{saved:?}"
             );
         }
         // A saved in-flight state is stale once nothing is running.
         assert_eq!(
-            activity(None, false, AgentExecutionState::Running).0,
+            activity(None, false, AgentExecutionState::Running, None).0,
             ActivityState::Idle
+        );
+    }
+
+    #[test]
+    fn a_thread_waiting_in_another_app_shows_waiting_until_flowx_runs_it() {
+        for saved in AgentExecutionState::ALL {
+            for phase in [None, Some(Phase::Idle), Some(Phase::Failed)] {
+                assert_eq!(
+                    activity(phase, false, saved, Some("permission prompt")).0,
+                    ActivityState::Waiting,
+                    "{phase:?} {saved:?}"
+                );
+            }
+        }
+        // A turn FlowX runs reports its own state.
+        assert_eq!(
+            activity(
+                Some(Phase::Running),
+                true,
+                AgentExecutionState::Idle,
+                Some("permission prompt")
+            )
+            .0,
+            ActivityState::Running
         );
     }
 

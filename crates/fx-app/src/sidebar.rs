@@ -642,6 +642,12 @@ fn thread_row(
     let busy = state.read(cx).is_thread_busy(agent_id);
     let provider = crate::thread_presentation::provider(state.read(cx), &agent);
     let conversation = state.read(cx).conversation_by_agent(agent_id);
+    // Read before the conversation is locked: it asks whether the thread is
+    // busy, which locks the same conversation, and the lock is not reentrant.
+    let elsewhere = state
+        .read(cx)
+        .waiting_elsewhere(agent_id)
+        .map(str::to_owned);
     let (activity, activity_label) = {
         let conversation = conversation.as_ref().map(|conversation| {
             conversation
@@ -654,6 +660,7 @@ fn thread_row(
                 .map(|conversation| conversation.phase()),
             busy,
             agent.execution_state,
+            elsewhere.as_deref(),
         )
     };
     let unseen = crate::thread_presentation::shows_unseen_completion(unseen, selected, activity);

@@ -2540,6 +2540,10 @@ for line in sys.stdin:
                 send({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"long-tool","content":"Build finished"}]}})
             finish("finished after quiet work")
             continue
+        if prompt=="elicitation":
+            # An MCP server's form, relayed as Claude Code 2.1.283 does.
+            send({"type":"control_request","request_id":"control-e","request":{"subtype":"elicitation","mcp_server_name":"probe","message":"Who is asking?","mode":"form","requested_schema":{"type":"object","properties":{"name":{"type":"string","title":"Name"}},"required":["name"]}}})
+            continue
         if prompt in ("tool", "questions"):
             tool="Bash" if prompt=="tool" else "AskUserQuestion"
             data={"command":"cargo test"} if prompt=="tool" else {"questions":[
@@ -2904,6 +2908,51 @@ for worker in workers: worker.join()
         let answers = &response["response"]["response"]["updatedInput"]["answers"];
         assert_eq!(answers["Which database?"], "SQLite");
         assert_eq!(answers["Which region?"], "eu-west");
+        assert!(lock(&conversation).pending_questions().is_empty());
+    }
+
+    #[test]
+    fn claude_full_access_still_asks_an_mcp_server_s_question() {
+        // Full Access answers tool permissions, but an elicitation asks for
+        // what only the reader has. Refused, it reached the server as a cancel.
+        let Some(server) = ClaudeFixture::new() else {
+            return;
+        };
+        let conversation = conversation();
+        let (runner, recorder) =
+            server.start(&conversation, "elicitation", AgentAccess::FullAccess);
+        let ProviderEvent::UserInput(request) = wait_for_interaction(&recorder) else {
+            panic!("the elicitation was not asked")
+        };
+        assert_eq!(request.source.as_deref(), Some("probe"));
+        assert_eq!(lock(&conversation).phase(), Phase::WaitingForInput);
+        assert!(
+            !server
+                .received()
+                .iter()
+                .any(|item| item["type"] == "control_response"),
+            "answered before the reader did"
+        );
+        runner.respond(UserResponse::Questions {
+            id: request.id.clone(),
+            answers: vec![("name".into(), "Ada".into())],
+        });
+        let updates = recorder.wait_for_end(TURN_BUDGET);
+        assert!(
+            matches!(updates.last(), Some(SessionUpdate::Finished { outcome }) if outcome.is_completed()),
+            "{updates:?}"
+        );
+        assert!(updates.contains(&SessionUpdate::InteractionResolved { id: request.id }));
+        let response = server
+            .received()
+            .into_iter()
+            .find(|item| item["type"] == "control_response")
+            .unwrap();
+        assert_eq!(response["response"]["request_id"], "control-e");
+        assert_eq!(
+            response["response"]["response"],
+            serde_json::json!({"action": "accept", "content": {"name": "Ada"}})
+        );
         assert!(lock(&conversation).pending_questions().is_empty());
     }
 

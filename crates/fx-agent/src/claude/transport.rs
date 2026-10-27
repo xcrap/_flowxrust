@@ -1825,6 +1825,15 @@ mod process {
     }
 
     /// The refusals the server was sent, polled until `count` have arrived.
+    /// The control responses written so far, without waiting for any.
+    fn control_responses_now(server: &FakeClaude) -> Vec<Value> {
+        server
+            .received()
+            .into_iter()
+            .filter(|message| message["type"] == "control_response")
+            .collect()
+    }
+
     async fn control_responses(server: &FakeClaude, count: usize) -> Vec<Value> {
         server
             .received_matching(count, Duration::from_secs(5), |message| {
@@ -2249,6 +2258,73 @@ mod process {
             .as_object()
             .expect("answers keyed by question");
         assert_eq!(answers["Which database?"], "Postgres");
+        let end = tokio::time::timeout(Duration::from_secs(5), reader.wait_for_end())
+            .await
+            .expect("the turn ended");
+        assert!(end.is_completed(), "{end:?}");
+    }
+
+    #[tokio::test]
+    async fn an_mcp_elicitation_is_asked_and_its_answer_reaches_claude() {
+        let Some(server) = FakeClaude::new() else {
+            return;
+        };
+        let mut transport = connect(&server).await.expect("started");
+        let reader = transport.reader().await;
+        transport
+            .send_prompt("!ask-elicitation", &[] as &[&Path])
+            .await
+            .expect("written");
+
+        let Control::Question(id) = next_control(&reader).await else {
+            panic!("an elicitation is a question");
+        };
+        // Nothing was refused on its behalf while it waited.
+        assert!(control_responses_now(&server).is_empty());
+        transport
+            .answer_questions(
+                &id,
+                &[("name".into(), "Ada".into()), ("agree".into(), "No".into())],
+            )
+            .await
+            .expect("answered");
+
+        let responses = control_responses(&server, 1).await;
+        assert_eq!(responses[0]["response"]["request_id"], "req-e");
+        assert_eq!(
+            responses[0]["response"]["response"],
+            json!({"action": "accept", "content": {"name": "Ada", "agree": false}})
+        );
+        let end = tokio::time::timeout(Duration::from_secs(5), reader.wait_for_end())
+            .await
+            .expect("the turn ended");
+        assert!(end.is_completed(), "{end:?}");
+    }
+
+    #[tokio::test]
+    async fn declining_an_mcp_elicitation_still_ends_the_wait() {
+        let Some(server) = FakeClaude::new() else {
+            return;
+        };
+        let mut transport = connect(&server).await.expect("started");
+        let reader = transport.reader().await;
+        transport
+            .send_prompt("!ask-elicitation", &[] as &[&Path])
+            .await
+            .expect("written");
+        let Control::Question(id) = next_control(&reader).await else {
+            panic!("an elicitation is a question");
+        };
+        assert!(matches!(
+            transport.approve(&id, true).await,
+            Err(TransportError::NotAControl { .. })
+        ));
+        transport.decline_questions(&id).await.expect("declined");
+        let responses = control_responses(&server, 1).await;
+        assert_eq!(
+            responses[0]["response"]["response"],
+            json!({"action": "decline"})
+        );
         let end = tokio::time::timeout(Duration::from_secs(5), reader.wait_for_end())
             .await
             .expect("the turn ended");

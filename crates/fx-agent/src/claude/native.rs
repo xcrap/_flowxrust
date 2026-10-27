@@ -197,6 +197,18 @@ impl ClaudeNativeStore {
                 .any(|directory| path.parent() == Some(directory))
                 || current_paths.contains(path)
         });
+        // Claude's own record of every live session says which are blocked
+        // on the user. Unreadable, it costs only the waiting marks.
+        match self.waiting_sessions() {
+            Ok(waiting) => {
+                for (id, entry) in &mut found {
+                    entry.waiting_elsewhere = waiting.get(id).cloned();
+                }
+            }
+            Err(error) => result
+                .warnings
+                .push(format!("Claude session activity is unavailable: {error}")),
+        }
         result.threads = found.into_values().collect();
         result.threads.sort_by(|a, b| {
             b.summary
@@ -210,6 +222,57 @@ impl ClaudeNativeStore {
                 })
         });
         Ok(result)
+    }
+
+    /// The sessions a live Claude Code process reports as waiting on the
+    /// user, with what it says it is waiting for.
+    ///
+    /// Every Claude process — the terminal, the desktop app, an SDK host —
+    /// keeps `<config>/sessions/<pid>.json` current: `status` is `busy`,
+    /// `idle` or `waiting`, and `waitingFor` names the prompt ("permission
+    /// prompt", "input needed", "dialog open"). `claude agents --json` reports
+    /// the same record; reading it here costs no process per poll. A file
+    /// whose process has exited is ignored, since a crash leaves it behind.
+    pub fn waiting_sessions(&self) -> Result<HashMap<String, String>, ProviderError> {
+        let mut waiting = HashMap::new();
+        for path in children(&self.config_root.join("sessions"))? {
+            let Some(pid) = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_suffix(".json"))
+                .and_then(|pid| pid.parse::<i32>().ok())
+                .filter(|pid| *pid > 0)
+            else {
+                continue;
+            };
+            let Ok(record) = read_session_record(&path) else {
+                continue;
+            };
+            if record.get("pid").and_then(Value::as_i64) != Some(i64::from(pid))
+                || record.get("status").and_then(Value::as_str) != Some("waiting")
+                || !process_alive(pid)
+            {
+                continue;
+            }
+            let Some(session) = record
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .and_then(safe_session_id)
+            else {
+                continue;
+            };
+            let reason = record
+                .get("waitingFor")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|reason| !reason.is_empty())
+                .unwrap_or("input")
+                .chars()
+                .take(120)
+                .collect();
+            waiting.insert(session, reason);
+        }
+        Ok(waiting)
     }
 
     pub fn read(
@@ -534,6 +597,7 @@ fn make_entry(
             is_archived: desktop.is_some_and(|state| state.0),
         },
         defaults: parsed.defaults.clone(),
+        waiting_elsewhere: None,
         revision: format!(
             "{}:{}",
             fingerprint.revision(path),
@@ -1114,6 +1178,26 @@ fn checked_file(path: &Path, expected: &Fingerprint) -> Result<File, ProviderErr
     }
     Ok(file)
 }
+/// One `sessions/<pid>.json` record, bounded and never through a symlink.
+fn read_session_record(path: &Path) -> Result<Value, ProviderError> {
+    let fingerprint = regular_fingerprint(path)?;
+    if fingerprint.size > MAX_METADATA_BYTES {
+        return Err(protocol("Claude session record exceeds the 1 MiB limit"));
+    }
+    let mut data = Vec::new();
+    checked_file(path, &fingerprint)?
+        .take(MAX_METADATA_BYTES + 1)
+        .read_to_end(&mut data)?;
+    serde_json::from_slice(&data).map_err(|_| protocol("Invalid Claude session record"))
+}
+
+/// Whether a process exists. `EPERM` means it does, under another user.
+fn process_alive(pid: i32) -> bool {
+    // SAFETY: signal 0 performs only the existence and permission checks.
+    let signalled = unsafe { libc::kill(pid, 0) };
+    signalled == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
 fn read_metadata(
     path: &Path,
     fingerprint: &Fingerprint,
@@ -1241,6 +1325,82 @@ mod tests {
             ]
         );
         assert_eq!(thread.entry.summary.title, "Run the reviewers");
+    }
+
+    /// A `sessions/<pid>.json` record as Claude Code 2.1.283 kept it while a
+    /// live probe session waited on a permission prompt.
+    fn session_record(pid: u32, session: &str, status: &str) -> Value {
+        json!({"pid": pid, "sessionId": session, "cwd": "/tmp/probe", "startedAt": 1793135521916_u64,
+               "version": "2.1.283", "kind": "interactive", "entrypoint": "claude-desktop",
+               "status": status, "waitingFor": "permission prompt",
+               "updatedAt": 1793135523000_u64, "statusUpdatedAt": 1793135523000_u64})
+    }
+
+    #[test]
+    fn a_live_session_waiting_on_the_user_marks_its_thread() {
+        let fixture = Fixture::new();
+        fixture.write(&[fixture.record("user", "Ship it", Uuid::new_v4())]);
+        assert_eq!(
+            fixture.store().list(fixture.root()).unwrap().threads[0].waiting_elsewhere,
+            None,
+            "no session record is not waiting"
+        );
+        let sessions = fixture.config.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        // This test's own process stands in for the live Claude.
+        let pid = std::process::id();
+        fs::write(
+            sessions.join(format!("{pid}.json")),
+            session_record(pid, SESSION, "waiting").to_string(),
+        )
+        .unwrap();
+        let index = fixture.store().list(fixture.root()).unwrap();
+        assert_eq!(
+            index.threads[0].waiting_elsewhere.as_deref(),
+            Some("permission prompt")
+        );
+
+        fs::write(
+            sessions.join(format!("{pid}.json")),
+            session_record(pid, SESSION, "busy").to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            fixture.store().list(fixture.root()).unwrap().threads[0].waiting_elsewhere,
+            None
+        );
+    }
+
+    #[test]
+    fn only_a_trustworthy_live_record_reports_waiting() {
+        let fixture = Fixture::new();
+        let sessions = fixture.config.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let live = std::process::id();
+        let other = "22222222-2222-4333-8444-555555555555";
+        // A crash leaves its record behind; nothing runs as pid i32::MAX.
+        let dead = i32::MAX as u32;
+        fs::write(
+            sessions.join(format!("{dead}.json")),
+            session_record(dead, SESSION, "waiting").to_string(),
+        )
+        .unwrap();
+        // A record naming a pid other than its file's is not that process.
+        fs::write(
+            sessions.join("1.json"),
+            session_record(live, other, "waiting").to_string(),
+        )
+        .unwrap();
+        // Never through a symlink.
+        let elsewhere = fixture.config.join("planted.json");
+        fs::write(
+            &elsewhere,
+            session_record(live, other, "waiting").to_string(),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&elsewhere, sessions.join(format!("{live}.json"))).unwrap();
+        fs::write(sessions.join("notes.txt"), "not a record").unwrap();
+        assert!(fixture.store().waiting_sessions().unwrap().is_empty());
     }
 
     #[test]

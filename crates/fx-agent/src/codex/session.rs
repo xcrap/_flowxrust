@@ -1061,6 +1061,7 @@ pub(crate) fn parse_user_input(params: &Value) -> crate::provider::UserInputRequ
                         .unwrap_or_default(),
                     is_other: q.get("isOther").and_then(Value::as_bool).unwrap_or(false),
                     is_secret: q.get("isSecret").and_then(Value::as_bool).unwrap_or(false),
+                    optional: false,
                 })
                 .collect()
         })
@@ -1073,6 +1074,7 @@ pub(crate) fn parse_user_input(params: &Value) -> crate::provider::UserInputRequ
             .unwrap_or_default()
             .to_string(),
         questions,
+        ..Default::default()
     }
 }
 

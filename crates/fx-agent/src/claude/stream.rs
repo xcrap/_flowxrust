@@ -20,7 +20,9 @@
 //!   start one, opened by `system/init`, which is what re-arms the count.
 //! - **Control requests block.** Claude waits for a `control_response` on every
 //!   one, so an unrecognised subtype that is silently ignored hangs the turn
-//!   forever. Anything unrecognised gets an explicit refusal instead.
+//!   forever. Anything unrecognised gets an explicit refusal instead. An MCP
+//!   server's `elicitation` is not refused: it is the reader's to answer,
+//!   and a refusal reached the server as a cancel it had never been shown.
 //!
 //! Background tasks are the fifth. `task_started`, `task_progress` and
 //! `task_notification` are `system` frames, so a subagent's `parent_tool_use_id`
@@ -43,9 +45,10 @@ use std::collections::VecDeque;
 
 use serde_json::{Value, json};
 
+use crate::elicitation::Elicitation;
 use crate::provider::{
     ApprovalRequest, Lifecycle, ProviderEvent, Question, RiskLevel, TaskStatus, TaskUpdate, Usage,
-    UserInputRequest,
+    UserInputRequest, UserResponse,
 };
 
 /// The most questions taken from one `AskUserQuestion` payload.
@@ -218,13 +221,33 @@ pub enum PendingControl {
         /// The tool input Claude supplied, so `updatedInput` can echo it back.
         input: Value,
     },
+    /// Waiting for the reader to answer an MCP server, which Claude relays.
+    Elicitation {
+        id: String,
+        request_id: String,
+        elicitation: Elicitation,
+    },
 }
 
 impl PendingControl {
     /// The id this app exposed for this request.
     pub fn id(&self) -> &str {
         match self {
-            Self::Approval { id, .. } | Self::UserInput { id, .. } => id,
+            Self::Approval { id, .. }
+            | Self::UserInput { id, .. }
+            | Self::Elicitation { id, .. } => id,
+        }
+    }
+
+    /// How it is answered.
+    fn kind(&self) -> PendingKind {
+        match self {
+            Self::Approval { .. } => PendingKind::Approval,
+            Self::UserInput { .. } => PendingKind::UserInput,
+            Self::Elicitation { elicitation, .. } if elicitation.is_tool_approval() => {
+                PendingKind::Approval
+            }
+            Self::Elicitation { .. } => PendingKind::UserInput,
         }
     }
 }
@@ -310,6 +333,18 @@ impl ClaudeStreamParser {
         };
         let request = envelope.get("request").cloned().unwrap_or(Value::Null);
 
+        if request.get("subtype").and_then(Value::as_str) == Some("elicitation") {
+            let elicitation = Elicitation::from_claude(&request);
+            let id = self.next_id("elicitation");
+            let event = elicitation.event(id.clone());
+            self.pending.push(PendingControl::Elicitation {
+                id,
+                request_id,
+                elicitation,
+            });
+            return vec![event];
+        }
+
         let (Some(subtype), Some(tool_name)) = (
             non_empty(request.get("subtype")),
             non_empty(request.get("tool_name")),
@@ -366,7 +401,11 @@ impl ClaudeStreamParser {
                 question_text_by_id,
                 input: input.clone(),
             });
-            return vec![ProviderEvent::UserInput(UserInputRequest { id, questions })];
+            return vec![ProviderEvent::UserInput(UserInputRequest {
+                id,
+                questions,
+                ..Default::default()
+            })];
         }
 
         if self.auto_approve {
@@ -851,11 +890,17 @@ impl ClaudeStreamParser {
         // The kind is checked *before* anything is removed. Removing first would
         // consume a question when handed its id, and Claude would then wait
         // forever on a reply that can never be given.
-        let is_approval = self.pending.iter().any(|pending| {
-            pending_id(pending) == id && matches!(pending, PendingControl::Approval { .. })
-        });
-        if !is_approval {
+        if self.kind_of(id) != Some(PendingKind::Approval) {
             return None;
+        }
+        if let Some(reply) = self.answer_elicitation(
+            id,
+            &UserResponse::Approval {
+                id: id.to_owned(),
+                approved,
+            },
+        ) {
+            return Some(reply);
         }
         let index = self
             .pending
@@ -882,11 +927,17 @@ impl ClaudeStreamParser {
     /// what lets a multi-select or a typed answer be mapped back to Claude's own
     /// question text rather than to a positional index.
     pub fn answer_questions(&mut self, id: &str, answers: &[(String, String)]) -> Option<Value> {
-        let is_question = self.pending.iter().any(|pending| {
-            pending_id(pending) == id && matches!(pending, PendingControl::UserInput { .. })
-        });
-        if !is_question {
+        if self.kind_of(id) != Some(PendingKind::UserInput) {
             return None;
+        }
+        if let Some(reply) = self.answer_elicitation(
+            id,
+            &UserResponse::Questions {
+                id: id.to_owned(),
+                answers: answers.to_vec(),
+            },
+        ) {
+            return Some(reply);
         }
         let index = self
             .pending
@@ -931,11 +982,13 @@ impl ClaudeStreamParser {
 
     /// Decline a question, which is how a turn that cannot be answered ends.
     pub fn decline_questions(&mut self, id: &str) -> Option<Value> {
-        let is_question = self.pending.iter().any(|pending| {
-            pending_id(pending) == id && matches!(pending, PendingControl::UserInput { .. })
-        });
-        if !is_question {
+        if self.kind_of(id) != Some(PendingKind::UserInput) {
             return None;
+        }
+        if let Some(reply) =
+            self.answer_elicitation(id, &UserResponse::CancelQuestions { id: id.to_owned() })
+        {
+            return Some(reply);
         }
         let index = self
             .pending
@@ -963,27 +1016,38 @@ impl ClaudeStreamParser {
 
     /// What one pending control is, or `None` when the id is not held.
     pub fn kind_of(&self, id: &str) -> Option<PendingKind> {
-        self.pending.iter().find_map(|pending| match pending {
-            PendingControl::Approval { id: held, .. } if held == id => Some(PendingKind::Approval),
-            PendingControl::UserInput { id: held, .. } if held == id => {
-                Some(PendingKind::UserInput)
-            }
-            _ => None,
-        })
+        self.pending
+            .iter()
+            .find(|pending| pending.id() == id)
+            .map(PendingControl::kind)
     }
 
     /// Every pending control with its kind, in the order Claude asked.
     pub fn pending_kinds(&self) -> Vec<(String, PendingKind)> {
         self.pending
             .iter()
-            .map(|pending| {
-                let kind = match pending {
-                    PendingControl::Approval { .. } => PendingKind::Approval,
-                    PendingControl::UserInput { .. } => PendingKind::UserInput,
-                };
-                (pending.id().to_string(), kind)
-            })
+            .map(|pending| (pending.id().to_string(), pending.kind()))
             .collect()
+    }
+
+    /// Answer an MCP server's elicitation, when `id` is one. The caller has
+    /// already checked the kind, so a reply of the wrong shape cannot consume
+    /// it.
+    fn answer_elicitation(&mut self, id: &str, response: &UserResponse) -> Option<Value> {
+        let index = self.pending.iter().position(|pending| {
+            pending.id() == id && matches!(pending, PendingControl::Elicitation { .. })
+        })?;
+        let PendingControl::Elicitation {
+            request_id,
+            elicitation,
+            ..
+        } = &self.pending[index]
+        else {
+            return None;
+        };
+        let reply = control_response(request_id, &elicitation.reply(response)?.to_claude());
+        self.pending.remove(index);
+        Some(reply)
     }
 
     /// Control requests still waiting, for a caller that needs to show them.
@@ -1064,6 +1128,7 @@ fn decode_questions(raw: &[Value]) -> Vec<Question> {
                     .unwrap_or_default(),
                 is_other: true,
                 is_secret: false,
+                optional: false,
             })
         })
         .collect()
@@ -2037,14 +2102,14 @@ mod tests {
     #[test]
     fn an_unsupported_control_subtype_can_be_refused_explicitly() {
         // The alternative to this is a turn that hangs waiting for a reply.
-        let response = refuse_control("r9", "elicitation");
+        let response = refuse_control("r9", "request_user_dialog");
         assert_eq!(response["response"]["subtype"], "error");
         assert_eq!(response["response"]["request_id"], "r9");
         assert!(
             response["response"]["error"]
                 .as_str()
                 .unwrap()
-                .contains("elicitation")
+                .contains("request_user_dialog")
         );
     }
 
@@ -2223,7 +2288,7 @@ mod tests {
         let mut parser = ClaudeStreamParser::new();
         let events = parser.events(&line(json!({
             "type": "control_request", "request_id": "r1",
-            "request": { "subtype": "elicitation", "tool_name": "Whatever" }
+            "request": { "subtype": "hook_callback", "tool_name": "Whatever" }
         })));
         assert!(events.is_empty(), "an unknown subtype produced an approval");
         let refusal = parser
@@ -2252,11 +2317,105 @@ mod tests {
         let mut parser = ClaudeStreamParser::new();
         parser.events(&line(json!({
             "type": "control_request", "request_id": "r1",
-            "request": { "subtype": "elicitation" }
+            "request": { "subtype": "request_user_dialog" }
         })));
         assert!(parser.take_refusal().is_some());
         parser.reset();
         assert!(parser.take_refusal().is_none());
+    }
+
+    /// What Claude Code 2.1.283 sent when an MCP server elicited, captured
+    /// from a live run against a probe server.
+    fn live_elicitation() -> Value {
+        json!({
+            "type": "control_request", "request_id": "28f189a4-fb71-46b2-b78a-a44e6a78a79d",
+            "request": {
+                "subtype": "elicitation", "mcp_server_name": "probe", "message": "Who is asking?",
+                "mode": "form", "requested_schema": {"type": "object", "properties": {
+                    "name": {"type": "string", "title": "Name", "description": "Your name"},
+                    "color": {"type": "string", "title": "Colour", "enum": ["red", "blue"]},
+                    "agree": {"type": "boolean", "title": "Agree"},
+                    "age": {"type": "integer", "title": "Age"}},
+                    "required": ["name"]}
+            }
+        })
+    }
+
+    #[test]
+    fn an_mcp_elicitation_is_asked_rather_than_refused() {
+        let mut parser = ClaudeStreamParser::new();
+        let events = parser.events(&line(live_elicitation()));
+        assert_eq!(parser.take_refusal(), None, "an elicitation was refused");
+        let [ProviderEvent::UserInput(request)] = events.as_slice() else {
+            panic!("expected one question, got {events:?}");
+        };
+        assert_eq!(request.source.as_deref(), Some("probe"));
+        assert_eq!(request.questions.len(), 4);
+        assert_eq!(parser.kind_of(&request.id), Some(PendingKind::UserInput));
+    }
+
+    #[test]
+    fn an_elicitation_is_answered_with_the_mcp_result_claude_reads() {
+        let mut parser = ClaudeStreamParser::new();
+        let id = match parser.events(&line(live_elicitation())).remove(0) {
+            ProviderEvent::UserInput(request) => request.id,
+            other => panic!("expected a question, got {other:?}"),
+        };
+        // An approval is the wrong answer, and must not consume it.
+        assert_eq!(parser.approve(&id, true), None);
+        let reply = parser
+            .answer_questions(
+                &id,
+                &[
+                    ("name".into(), "Probe".into()),
+                    ("color".into(), "blue".into()),
+                    ("agree".into(), "Yes".into()),
+                    ("age".into(), "7".into()),
+                ],
+            )
+            .expect("the elicitation was still open");
+        // The shape the live CLI accepted and forwarded to the server.
+        assert_eq!(
+            reply,
+            json!({"type": "control_response", "response": {
+                "subtype": "success", "request_id": "28f189a4-fb71-46b2-b78a-a44e6a78a79d",
+                "response": {"action": "accept", "content": {
+                    "name": "Probe", "color": "blue", "agree": true, "age": 7}}}})
+        );
+        assert!(parser.pending_ids().is_empty());
+    }
+
+    #[test]
+    fn declining_an_elicitation_tells_the_server_so() {
+        let mut parser = ClaudeStreamParser::new();
+        let id = match parser.events(&line(live_elicitation())).remove(0) {
+            ProviderEvent::UserInput(request) => request.id,
+            other => panic!("expected a question, got {other:?}"),
+        };
+        let reply = parser.decline_questions(&id).unwrap();
+        assert_eq!(reply["response"]["subtype"], "success");
+        assert_eq!(reply["response"]["response"], json!({"action": "decline"}));
+    }
+
+    #[test]
+    fn a_live_mcp_tool_permission_is_an_approval() {
+        // Claude Code 2.1.283's own permission prompt for an MCP tool, which
+        // comes before the server is called at all.
+        let mut parser = ClaudeStreamParser::new();
+        let events = parser.events(&line(json!({
+            "type": "control_request", "request_id": "fcfc1c7f-c50f-4285-bd4e-8a98c6fe70ec",
+            "request": {"subtype": "can_use_tool", "tool_name": "mcp__probe__ask_name",
+                "mcp_server": {"name": "probe", "source": "dynamic"}, "display_name": "Ask Name",
+                "input": {}, "permission_suggestions": [{"type": "addRules",
+                    "rules": [{"toolName": "mcp__probe__ask_name"}], "behavior": "allow",
+                    "destination": "localSettings"}],
+                "tool_use_id": "toolu_013rJJzajSkYzqgpta8QrD6v"}
+        })));
+        let [ProviderEvent::Approval(approval)] = events.as_slice() else {
+            panic!("expected one approval, got {events:?}");
+        };
+        assert_eq!(approval.tool_name, "mcp__probe__ask_name");
+        assert_eq!(parser.take_refusal(), None);
     }
 
     #[test]

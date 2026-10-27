@@ -142,7 +142,7 @@ for line in sys.stdin:
             send({"jsonrpc": "2.0", "method": "turn/completed",
                   "params": {"turn": {"id": "turn-1", "status": "interrupted"}}})
         elif prompt in ("interactive-approval", "interactive-question", "foreign-request",
-                        "subagent-request"):
+                        "subagent-request", "mcp-tool-approval", "mcp-form", "mcp-link"):
             send({"jsonrpc": "2.0", "method": "turn/started",
                   "params": {"threadId": thread, "turn": {"id": "turn-1"}}})
             if prompt == "subagent-request":
@@ -153,7 +153,32 @@ for line in sys.stdin:
                         "type": "subAgentActivity", "id": "activity-1", "kind": "started",
                         "agentThreadId": "child-thread", "agentPath": "/root/worker",
                         "model": None, "reasoningEffort": None}}})
-            if prompt == "interactive-question":
+            if prompt == "mcp-tool-approval":
+                # Codex 0.164's approval for an MCP tool call, captured live.
+                method = "mcpServer/elicitation/request"
+                params = {"threadId": thread, "turnId": "turn-1", "serverName": "probe",
+                          "mode": "form", "_meta": {"codex_approval_kind": "mcp_tool_call",
+                          "persist": ["session", "always"],
+                          "tool_description": "Asks the user for their name.",
+                          "tool_params": {}, "tool_params_display": []},
+                          "message": "Allow the probe MCP server to run tool \"ask_name\"?",
+                          "requestedSchema": {"type": "object", "properties": {}}}
+            elif prompt == "mcp-form":
+                # The probe server's own form, as Codex 0.164 relayed it. The
+                # turn id may be null: MCP does not tie an elicitation to one.
+                method = "mcpServer/elicitation/request"
+                params = {"threadId": thread, "turnId": None, "serverName": "probe",
+                          "mode": "form", "_meta": None, "message": "Who is asking?",
+                          "requestedSchema": {"type": "object", "properties": {
+                              "age": {"type": "integer", "title": "Age"},
+                              "name": {"type": "string", "title": "Name", "description": "Your name"}},
+                              "required": ["name"]}}
+            elif prompt == "mcp-link":
+                method = "mcpServer/elicitation/request"
+                params = {"threadId": thread, "turnId": "turn-1", "serverName": "github",
+                          "mode": "url", "_meta": None, "message": "Sign in to continue.",
+                          "url": "https://github.com/login/device", "elicitationId": "e-1"}
+            elif prompt == "interactive-question":
                 method = "item/tool/requestUserInput"
                 params = {"threadId": thread, "turnId": "turn-1", "questions": [
                     {"id": "database", "question": "Which database?", "options": [{"label": "SQLite"}]},

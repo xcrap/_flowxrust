@@ -218,6 +218,19 @@ for line in sys.stdin:
                  "options": [{"label": "Postgres", "description": "primary store"},
                              {"label": "SQLite"}]}]})
             waiting.append("req-2")
+        elif behaviour == "ask-elicitation":
+            # An MCP server's form, as Claude Code 2.1.283 relayed it from a
+            # live probe server. No tool name: Claude asks for the server.
+            emit_init()
+            send({"type": "control_request", "request_id": "req-e",
+                  "request": {"subtype": "elicitation", "mcp_server_name": "probe",
+                              "message": "Who is asking?", "mode": "form",
+                              "requested_schema": {"type": "object", "properties": {
+                                  "name": {"type": "string", "title": "Name",
+                                           "description": "Your name"},
+                                  "agree": {"type": "boolean", "title": "Agree"}},
+                                  "required": ["name"]}}})
+            waiting.append("req-e")
         elif behaviour == "ask-two":
             emit_init()
             request_control("req-a", "Bash", "tool-a", {"command": "ls"})
@@ -276,6 +289,14 @@ for line in sys.stdin:
             if not isinstance(answers, dict) or not all(isinstance(v, str) for v in answers.values()):
                 send({"type": "result", "is_error": True,
                       "result": "AskUserQuestion updatedInput.answers must be an object"})
+                continue
+        if request_id == "req-e":
+            # Claude's schema for the reply: an action, and a content record
+            # that may be absent but never null.
+            if decision.get("action") not in ("accept", "decline", "cancel") or (
+                    "content" in decision and not isinstance(decision["content"], dict)):
+                send({"type": "result", "is_error": True,
+                      "result": "invalid elicitation response"})
                 continue
         if request_id in waiting:
             waiting.remove(request_id)

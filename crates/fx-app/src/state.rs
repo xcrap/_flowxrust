@@ -99,6 +99,11 @@ pub struct AppState {
     /// takes it out, so a second click cannot send the provider a second reply;
     /// its card stays until the provider resolves it.
     pending_interactions: HashMap<Uuid, VecDeque<fx_agent::ProviderEvent>>,
+    /// Threads FlowX only mirrors whose provider reports them blocked on the
+    /// reader in another app, with what they wait for. Live, so never saved:
+    /// read from each index pass of the thread's project, and dropped when a
+    /// pass no longer reports it.
+    waiting_elsewhere: HashMap<Uuid, String>,
     /// The add-project sheet, while it is open.
     ///
     /// Owned here rather than by the sidebar so that the menu's "New Project"
@@ -218,6 +223,7 @@ impl AppState {
             restored_costs: HashMap::new(),
             last_checkpoint: Instant::now(),
             pending_interactions: HashMap::new(),
+            waiting_elsewhere: HashMap::new(),
             picker: None,
             palette: None,
             sidebar_visible,
@@ -1819,6 +1825,31 @@ impl AppState {
                 .is_some_and(|queue| queue.iter().any(|event| interaction_id(event) == Some(id)))
     }
 
+    /// What a thread FlowX does not run is waiting for in another app, as its
+    /// provider reports it. Only the active project polls, so another
+    /// project's mark would be stale and is not reported.
+    pub fn waiting_elsewhere(&self, agent_id: Uuid) -> Option<&str> {
+        if self.is_thread_busy(agent_id)
+            || self.project_for_agent(agent_id) != self.snapshot.active_project_id
+        {
+            return None;
+        }
+        self.waiting_elsewhere.get(&agent_id).map(String::as_str)
+    }
+
+    /// Whether the active thread is stopped on the reader: a request FlowX
+    /// can answer, or one in another app.
+    pub fn is_waiting_on_user(&self) -> bool {
+        self.snapshot.active_agent_id.is_some_and(|agent| {
+            self.waiting_elsewhere(agent).is_some()
+                || self.runners.contains_key(&agent)
+                    && self
+                        .pending_interactions
+                        .get(&agent)
+                        .is_some_and(|queue| !queue.is_empty())
+        })
+    }
+
     /// Save how a thread's turn ended. The sidebar reads this for every row,
     /// loaded or not, so a status cannot depend on whether a thread was opened.
     fn record_execution_state(&mut self, agent_id: Uuid, state: fx_core::AgentExecutionState) {
@@ -2302,6 +2333,7 @@ impl AppState {
                     (*id, revision)
                 })
                 .collect(),
+            waiting_elsewhere: self.waiting_elsewhere.clone(),
         }
     }
 
@@ -2537,6 +2569,28 @@ impl AppState {
         changed || self.native_loading() != loading_before
     }
 
+    /// Replace the waiting marks one index pass speaks for: every thread of
+    /// `provider` in `project`, with the ones it reported still waiting.
+    fn forget_waiting_elsewhere(
+        &mut self,
+        project: Uuid,
+        provider: &str,
+        waiting: Vec<(Uuid, String)>,
+    ) {
+        let threads: HashSet<Uuid> = self
+            .snapshot
+            .projects
+            .iter()
+            .filter(|record| record.project.as_ref().is_some_and(|p| p.id == project))
+            .flat_map(|record| &record.native_bindings)
+            .filter(|binding| binding.provider_id == provider)
+            .map(|binding| binding.agent_id)
+            .collect();
+        self.waiting_elsewhere
+            .retain(|agent, _| !threads.contains(agent));
+        self.waiting_elsewhere.extend(waiting);
+    }
+
     fn apply_native_completion(&mut self, completion: crate::native_sync::Completion) -> bool {
         use crate::native_sync::{Payload, RequestKind, same_project};
         let ticket = completion.ticket;
@@ -2550,6 +2604,8 @@ impl AppState {
         match completion.result {
             Err(error) => match ticket.kind {
                 RequestKind::Index { .. } => {
+                    // Unknown is not waiting.
+                    self.forget_waiting_elsewhere(ticket.project, &ticket.provider, Vec::new());
                     self.native_sync.warnings.insert(
                         (ticket.project, ticket.provider.clone()),
                         vec![format!("{} history unavailable: {error}", ticket.provider)],
@@ -2567,6 +2623,7 @@ impl AppState {
                 protected,
             }) => {
                 let mut warnings = index.warnings;
+                let mut waiting = Vec::new();
                 let present: HashSet<_> = index
                     .threads
                     .iter()
@@ -2636,6 +2693,11 @@ impl AppState {
                                 .map(|agent| agent.id)
                         });
                     let id = existing.unwrap_or_else(Uuid::new_v4);
+                    if let Some(reason) = &entry.waiting_elsewhere
+                        && !self.is_thread_busy(id)
+                    {
+                        waiting.push((id, reason.clone()));
+                    }
                     record.missing_native_agent_ids.retain(|agent| *agent != id);
                     if self.is_thread_busy(id)
                         || self
@@ -2738,6 +2800,7 @@ impl AppState {
                 if serde_json::to_vec(&next).ok() != serde_json::to_vec(&self.snapshot).ok() {
                     self.commit_thread_change(next, "save native thread discovery");
                 }
+                self.forget_waiting_elsewhere(ticket.project, &ticket.provider, waiting);
                 self.native_sync
                     .warnings
                     .insert((ticket.project, ticket.provider), warnings);
@@ -2748,6 +2811,7 @@ impl AppState {
                 }
             }
             Ok(Payload::History(history)) => {
+                let history = *history;
                 let RequestKind::History {
                     agent,
                     session,
@@ -4119,6 +4183,7 @@ struct NativeView {
     warnings: HashMap<(Uuid, String), Vec<String>>,
     history_warnings: HashMap<Uuid, String>,
     revisions: HashMap<Uuid, u64>,
+    waiting_elsewhere: HashMap<Uuid, String>,
 }
 
 /// What reading a thread's saved transcript produced.
@@ -5126,6 +5191,7 @@ mod persistence_tests {
                     fx_agent::ProviderEvent::UserInput(fx_agent::provider::UserInputRequest {
                         id: "old-request".into(),
                         questions: vec![],
+                        ..Default::default()
                     });
                 state
                     .pending_interactions
@@ -6486,7 +6552,7 @@ mod persistence_tests {
             ] {
                 let saved = state.thread(agent).unwrap().execution_state;
                 assert_eq!(
-                    crate::thread_presentation::activity(None, false, saved).0,
+                    crate::thread_presentation::activity(None, false, saved, None).0,
                     expected
                 );
             }
@@ -7333,6 +7399,7 @@ mod persistence_tests {
                         fx_agent::provider::UserInputRequest {
                             id: id.into(),
                             questions: vec![],
+                            ..Default::default()
                         },
                     ),
                 };
@@ -7446,6 +7513,7 @@ mod native_sync_tests {
                 context_window_size: Some(200_000),
             },
             revision: "revision-1".into(),
+            waiting_elsewhere: None,
         }
     }
 
@@ -7514,12 +7582,12 @@ mod native_sync_tests {
     ) {
         state.apply_native_completion(Completion {
             ticket,
-            result: Ok(Payload::History(NativeThread {
+            result: Ok(Payload::History(Box::new(NativeThread {
                 entry,
                 messages,
                 current_context_tokens: Some(123),
                 history_truncated: false,
-            })),
+            }))),
         });
     }
 
@@ -7875,6 +7943,92 @@ mod native_sync_tests {
         });
     }
     #[test]
+    fn a_mirrored_thread_waiting_in_another_app_is_shown_waiting_until_it_moves_on() {
+        use gpui::{VisualTestContext, px, size};
+        const SESSION: &str = "12e63679-12f2-422f-ad74-9fe7e9672c27";
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_string_lossy().to_string();
+        let mut test = gpui::TestAppContext::single();
+        let (state, project) =
+            test.update(|cx| setup(cx, AppPaths::at(temp.path().join("store")), &root));
+        let waiting = |reason: Option<&str>| NativeThreadSummary {
+            waiting_elsewhere: reason.map(str::to_owned),
+            ..entry(&root, "claude", SESSION, "Mirrored")
+        };
+        let agent = test.update(|cx| {
+            crate::AppHandle::install(state.clone(), cx);
+            state.update(cx, |state, _| {
+                index(
+                    state,
+                    project,
+                    "claude",
+                    vec![waiting(Some("permission prompt"))],
+                    Vec::new(),
+                );
+                let agent = state.snapshot.active_agent_id.unwrap();
+                assert_eq!(state.waiting_elsewhere(agent), Some("permission prompt"));
+                assert!(state.is_waiting_on_user());
+                // Loaded, so the centre column draws the transcript.
+                state.conversation(project, agent);
+                agent
+            })
+        });
+
+        let for_view = state.clone();
+        let window = test.add_window(move |_, _| crate::FlowX::new(for_view));
+        let mut visual = VisualTestContext::from_window(window.into(), &test);
+        visual.simulate_resize(size(px(1280.0), px(800.0)));
+        test.refresh().unwrap();
+        assert!(
+            visual.debug_bounds("waiting-elsewhere").is_some(),
+            "the transcript did not say where the request is"
+        );
+        assert!(visual.debug_bounds("titlebar-activity:true").is_some());
+        test.read(|cx| {
+            let state = state.read(cx);
+            let agent = state.active_agent().unwrap();
+            assert_eq!(
+                crate::thread_presentation::activity(
+                    None,
+                    false,
+                    agent.execution_state,
+                    state.waiting_elsewhere(agent.id),
+                )
+                .0,
+                fx_design::components::ActivityState::Waiting
+            );
+        });
+
+        // Answered in the other app: the next pass no longer reports it.
+        // Checked on the state: GPUI 0.2.2 never clears a frame's debug
+        // selectors, so a notice that has gone cannot be seen to go.
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                index(state, project, "claude", vec![waiting(None)], Vec::new());
+                assert_eq!(state.waiting_elsewhere(agent), None);
+                assert!(!state.is_waiting_on_user());
+            })
+        });
+
+        // A turn FlowX runs on the thread answers for itself.
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                index(
+                    state,
+                    project,
+                    "claude",
+                    vec![waiting(Some("permission prompt"))],
+                    Vec::new(),
+                );
+                state
+                    .runners
+                    .insert(agent, crate::session::TurnRunner::detached().0);
+                assert_eq!(state.waiting_elsewhere(agent), None);
+            })
+        });
+    }
+
+    #[test]
     fn missing_native_threads_hide_only_after_complete_index_and_keep_local_drafts() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_string_lossy().to_string();
@@ -8028,7 +8182,7 @@ mod native_sync_tests {
             // Pending work remains bounded even while many timer ticks pass.
             for _ in 0..20 { state.poll_native_sync(cx); }
             assert!(codex_jobs.try_recv().is_err());
-            codex_results.send(Completion { ticket: initial, result: Ok(Payload::History(NativeThread { entry: native_entry, messages: vec![ConversationMessage::text(MessageRole::Assistant, "Native history")], current_context_tokens: None, history_truncated: false })) }).unwrap();
+            codex_results.send(Completion { ticket: initial, result: Ok(Payload::History(Box::new(NativeThread { entry: native_entry, messages: vec![ConversationMessage::text(MessageRole::Assistant, "Native history")], current_context_tokens: None, history_truncated: false }))) }).unwrap();
             state.poll_native_sync(cx);
             let index_ticket = codex_jobs.try_recv().unwrap();
             assert!(matches!(index_ticket.kind, RequestKind::Index { .. }), "metadata gets a turn after selected history");

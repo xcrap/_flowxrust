@@ -52,7 +52,8 @@ pub(crate) enum Payload {
         sessions: Vec<(Uuid, String)>,
         protected: Vec<Uuid>,
     },
-    History(NativeThread),
+    /// Boxed: a thread is several times the size of the other payloads.
+    History(Box<NativeThread>),
     Unchanged,
 }
 
@@ -243,7 +244,7 @@ impl Worker {
                         } else {
                             claude.read_if_changed(&ticket.root, session, known_revision.as_deref()).map_err(|error| error.to_string())
                         };
-                        result.map(|history| history.map(Payload::History).unwrap_or(Payload::Unchanged))
+                        result.map(|history| history.map(|history| Payload::History(Box::new(history))).unwrap_or(Payload::Unchanged))
                     }
                 };
                 if results.send(Completion { ticket, result }).is_err() { break; }

@@ -612,7 +612,30 @@ fn summary(
         },
         defaults: native_defaults(raw),
         revision: format!("{revision}|archive:{archived}"),
+        waiting_elsewhere: waiting_on_user(raw),
     }))
+}
+
+/// What a thread loaded by another app-server client is blocked on, from the
+/// status Codex reports for it (`{type: active, activeFlags: [...]}`).
+///
+/// Only a thread loaded in the app-server FlowX reads from carries a live
+/// status; one running in another Codex process reads `notLoaded`, so this
+/// says nothing about it rather than guessing.
+fn waiting_on_user(raw: &Value) -> Option<String> {
+    let status = &raw["status"];
+    if status["type"].as_str() != Some("active") {
+        return None;
+    }
+    let flags = status["activeFlags"].as_array()?;
+    let flag = |name: &str| flags.iter().any(|flag| flag.as_str() == Some(name));
+    if flag("waitingOnApproval") {
+        Some("approval".into())
+    } else if flag("waitingOnUserInput") {
+        Some("input needed".into())
+    } else {
+        None
+    }
 }
 fn native_defaults(raw: &Value) -> NativeDefaults {
     let collaboration = raw
@@ -1291,6 +1314,32 @@ for line in sys.stdin:
             2,
             "a failed connection must be replaced"
         );
+    }
+
+    #[test]
+    fn a_loaded_thread_waiting_on_the_user_is_marked_and_others_are_not() {
+        // The statuses Codex 0.164 reported while a live probe turn waited on
+        // an approval and then ran on.
+        let waiting = json!({"type": "active", "activeFlags": ["waitingOnApproval"]});
+        assert_eq!(
+            waiting_on_user(&json!({ "status": waiting })).as_deref(),
+            Some("approval")
+        );
+        assert_eq!(
+            waiting_on_user(
+                &json!({"status": {"type": "active", "activeFlags": ["waitingOnUserInput"]}})
+            )
+            .as_deref(),
+            Some("input needed")
+        );
+        for status in [
+            json!({"type": "active", "activeFlags": []}),
+            json!({"type": "idle"}),
+            json!({"type": "notLoaded"}),
+            Value::Null,
+        ] {
+            assert_eq!(waiting_on_user(&json!({ "status": status })), None);
+        }
     }
 
     #[test]

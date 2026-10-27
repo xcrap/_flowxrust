@@ -4282,13 +4282,23 @@ fn parse_questions(input: &str) -> Vec<RecordedQuestion> {
 fn pending_prompts(snapshot: &Snapshot, window: &Window, cx: &App) -> AnyElement {
     let approvals = &snapshot.approvals;
     let questions = &snapshot.questions;
-    if approvals.is_empty() && questions.is_empty() {
+    let state = crate::AppHandle::get(cx);
+    let elsewhere = state.as_ref().and_then(|handle| {
+        handle
+            .0
+            .read(cx)
+            .waiting_elsewhere(snapshot.agent_id)
+            .map(str::to_owned)
+    });
+    if approvals.is_empty() && questions.is_empty() && elsewhere.is_none() {
         return div().w(px(0.0)).h(px(0.0)).into_any_element();
     }
     let theme = global::current();
-    let state = crate::AppHandle::get(cx);
 
     let mut cards = div().flex().flex_col().gap(px_len(Spacing::MD));
+    if let Some(reason) = elsewhere {
+        cards = cards.child(elsewhere_notice(&reason));
+    }
     if !approvals.is_empty() {
         cards = cards.child(tray_title(
             Icon::HAND_RAISED_FILL,
@@ -4345,6 +4355,55 @@ fn pending_prompts(snapshot: &Snapshot, window: &Window, cx: &App) -> AnyElement
                 .pb(px_len(Spacing::MD))
                 .child(cards),
         )
+        .into_any_element()
+}
+
+/// A thread FlowX only mirrors, stopped on a request another app holds.
+///
+/// Says so instead of drawing buttons. The request belongs to the process that
+/// asked, which is the only one that can hear the answer: a button here would
+/// look live and reach nobody.
+fn elsewhere_notice(reason: &str) -> AnyElement {
+    let theme = global::current();
+    div()
+        .debug_selector(|| "waiting-elsewhere".into())
+        .child(banner(
+            Colors::warning_muted(&theme),
+            Colors::fg(&theme),
+            div()
+                .flex()
+                .flex_row()
+                .items_start()
+                .gap(px_len(Spacing::SM))
+                .child(Icon::HAND_RAISED_FILL.render(
+                    IconSize::Small,
+                    Colors::fg_secondary(&theme),
+                    &theme,
+                ))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px_len(Spacing::XXS))
+                        .child(
+                            div()
+                                .fx_body_medium()
+                                .child("Waiting for you in another app"),
+                        )
+                        .child(
+                            div()
+                                .fx_caption()
+                                .text_color(Colors::fg_secondary(&theme))
+                                .child(SharedString::from(format!(
+                                    "The app running this thread reports: {reason}. \
+                                     Answer it there. FlowX can answer only the turns it runs, \
+                                     and this thread updates here once it continues."
+                                ))),
+                        ),
+                ),
+        ))
         .into_any_element()
 }
 

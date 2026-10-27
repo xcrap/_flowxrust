@@ -22,6 +22,12 @@
 //!   answers them itself; without one, an unanswered request would leave Codex
 //!   blocked, so the turn answers with the configured policy and reports what it
 //!   did.
+//! - **An MCP server's elicitation is answered, never refused.** Codex relays
+//!   them as `mcpServer/elicitation/request`, and asks its own MCP tool-call
+//!   approvals the same way. Refused as an unknown method, every MCP tool call
+//!   under an access level that asks failed. A tool approval follows the
+//!   approval policy; anything else is the reader's, and with no reader it is
+//!   cancelled rather than refused.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -36,6 +42,7 @@ use crate::codex::session::{
 use crate::codex::session::{goal_set_params, steer_params};
 use crate::codex::transport::Requester;
 use crate::codex::transport::{PendingResponse, ServerEvent, Transport, TransportError};
+use crate::elicitation::{Elicitation, Reply};
 use crate::provider::{ApprovalRequest, ProviderError, ProviderEvent, RiskLevel, UserResponse};
 use fx_core::models::goal::{ConversationGoal, GoalStatus};
 use tokio::sync::mpsc;
@@ -467,6 +474,7 @@ impl CodexSession {
                             // Codex reports the real one when it is done.
                             if let ProviderEvent::Approval(a) = event
                                 && !approved
+                                && request.elicitation.is_none()
                             {
                                 // A sub-agent's call is a row in its own
                                 // thread, not here, so the refusal brings it.
@@ -809,11 +817,23 @@ struct PendingRequest {
     method: String,
     params: Value,
     event: ProviderEvent,
+    /// What an MCP server asked, which decides the shape of every reply.
+    elicitation: Option<Elicitation>,
 }
 
 impl PendingRequest {
     fn parse(wire_id: Value, method: &str, params: &Value) -> Option<Self> {
         let id = request_key(&wire_id);
+        if method == "mcpServer/elicitation/request" {
+            let elicitation = Elicitation::from_codex(params);
+            return Some(Self {
+                event: elicitation.event(id),
+                wire_id,
+                method: method.into(),
+                params: params.clone(),
+                elicitation: Some(elicitation),
+            });
+        }
         let event = match method {
             "item/tool/requestUserInput" => {
                 let mut request = crate::codex::session::parse_user_input(params);
@@ -859,6 +879,7 @@ impl PendingRequest {
             method: method.into(),
             params: params.clone(),
             event,
+            elicitation: None,
         })
     }
 
@@ -877,8 +898,9 @@ impl PendingRequest {
     /// For a call whose item never reached this transcript: it belongs to
     /// another thread, or to a sub-agent, whose items stay in its own.
     fn call_row(&self) -> ProviderEvent {
-        let name = match &self.event {
-            ProviderEvent::Approval(approval) => approval.tool_name.clone(),
+        let name = match (&self.event, &self.elicitation) {
+            (ProviderEvent::Approval(approval), _) => approval.tool_name.clone(),
+            (_, Some(elicitation)) => format!("mcp__{}", elicitation.server),
             _ => "requestUserInput".to_owned(),
         };
         let call = self
@@ -900,8 +922,9 @@ impl PendingRequest {
             Some(other) if other != thread_id => format!("another Codex thread ({other})"),
             _ => "another turn".to_owned(),
         };
-        let what = match &self.event {
-            ProviderEvent::UserInput(_) => "question",
+        let what = match (&self.event, &self.elicitation) {
+            (_, Some(_)) => "MCP server request",
+            (ProviderEvent::UserInput(_), _) => "question",
             _ => "approval request",
         };
         [
@@ -919,6 +942,14 @@ impl PendingRequest {
     fn approval_result(&self, approved: bool) -> Option<Value> {
         if !matches!(self.event, ProviderEvent::Approval(_)) {
             return None;
+        }
+        if let Some(elicitation) = &self.elicitation {
+            return elicitation
+                .reply(&UserResponse::Approval {
+                    id: String::new(),
+                    approved,
+                })
+                .map(|reply| reply.to_codex());
         }
         Some(match self.method.as_str() {
             // A legacy denial is an object carrying the reason; the bare
@@ -938,6 +969,9 @@ impl PendingRequest {
     }
 
     fn response(&self, response: &UserResponse) -> Option<Value> {
+        if let Some(elicitation) = &self.elicitation {
+            return elicitation.reply(response).map(|reply| reply.to_codex());
+        }
         match (&self.event, response) {
             (ProviderEvent::Approval(_), UserResponse::Approval { approved, .. }) => {
                 self.approval_result(*approved)
@@ -963,13 +997,17 @@ impl PendingRequest {
     }
 
     fn reply(&self, transport: &Transport, response: &UserResponse) -> Result<bool, ProviderError> {
-        if matches!(
-            (&self.event, response),
-            (
-                ProviderEvent::UserInput(_),
-                UserResponse::CancelQuestions { .. }
+        // A server is told the reader declined; Codex's own question is
+        // refused, which is how it hears a cancel.
+        if self.elicitation.is_none()
+            && matches!(
+                (&self.event, response),
+                (
+                    ProviderEvent::UserInput(_),
+                    UserResponse::CancelQuestions { .. }
+                )
             )
-        ) {
+        {
             self.reject(transport)?;
             return Ok(true);
         }
@@ -983,7 +1021,16 @@ impl PendingRequest {
         }
     }
 
+    /// Answer with no reader: a refusal, or for an MCP server's question, a
+    /// cancel, which is what MCP calls a request nobody answered.
     fn reject(&self, transport: &Transport) -> Result<(), ProviderError> {
+        if let Some(elicitation) = &self.elicitation
+            && !elicitation.is_tool_approval()
+        {
+            return transport
+                .respond(self.wire_id.clone(), Reply::cancelled().to_codex())
+                .map_err(map_error);
+        }
         if let Some(result) = self.approval_result(false) {
             transport
                 .respond(self.wire_id.clone(), result)
@@ -1544,6 +1591,185 @@ mod tests {
             "accept"
         );
         assert_eq!(resolved, vec!["codex:\"interactive-1\""]);
+    }
+
+    /// Run one interactive turn, answering the first request with `answer`.
+    async fn answer_first_request(
+        prompt: &str,
+        policy: ApprovalPolicy,
+        answer: impl Fn(&ProviderEvent) -> Option<UserResponse>,
+    ) -> Option<(Vec<ProviderEvent>, Vec<String>)> {
+        let server = FakeServer::new()?;
+        let mut session = CodexSession::open(
+            Transport::start(server.launch(), "FlowX", "test")
+                .await
+                .unwrap(),
+            None,
+            AgentAccess::Supervised,
+            "/tmp",
+            policy,
+        )
+        .await
+        .unwrap();
+        let thread = session.thread_id().to_owned();
+        let (sender, mut responses) = mpsc::unbounded_channel();
+        let mut resolved = Vec::new();
+        let seen = std::cell::RefCell::new(Vec::new());
+        let outcome = session
+            .run_turn_interactive(
+                &request(&thread, prompt, "/tmp"),
+                &mut responses,
+                |event| {
+                    if let Some(response) = answer(&event) {
+                        sender.send(response).unwrap();
+                    }
+                    seen.borrow_mut().push(event);
+                },
+                || {},
+                |id| resolved.push(id),
+            )
+            .await
+            .unwrap();
+        assert!(outcome.is_completed(), "{outcome:?}");
+        Some((seen.into_inner(), resolved))
+    }
+
+    #[tokio::test]
+    async fn an_mcp_tool_approval_is_an_approval_card_answered_in_the_mcp_shape() {
+        let Some((seen, resolved)) =
+            answer_first_request("mcp-tool-approval", ApprovalPolicy::Ask, |event| {
+                let ProviderEvent::Approval(approval) = event else {
+                    return None;
+                };
+                assert_eq!(approval.tool_name, "mcp__probe__ask_name");
+                Some(UserResponse::Approval {
+                    id: approval.id.clone(),
+                    approved: true,
+                })
+            })
+            .await
+        else {
+            return;
+        };
+        let reply = echoed_response(&seen);
+        assert_eq!(
+            reply["result"],
+            json!({"action": "accept", "content": null, "_meta": null})
+        );
+        assert_eq!(resolved, vec!["codex:\"interactive-1\""]);
+    }
+
+    #[tokio::test]
+    async fn an_mcp_tool_approval_follows_the_policy_when_nobody_is_asked() {
+        let Some((seen, _)) = answer_first_request(
+            "mcp-tool-approval",
+            ApprovalPolicy::DenyUnlessReadOnly,
+            |_| None,
+        )
+        .await
+        else {
+            return;
+        };
+        assert!(
+            !seen
+                .iter()
+                .any(|event| matches!(event, ProviderEvent::Approval(_))),
+            "a policy answer still asked"
+        );
+        assert_eq!(echoed_response(&seen)["result"]["action"], "decline");
+    }
+
+    #[tokio::test]
+    async fn an_mcp_form_is_a_question_and_its_answer_reaches_codex_typed() {
+        let Some((seen, _)) = answer_first_request("mcp-form", ApprovalPolicy::Ask, |event| {
+            let ProviderEvent::UserInput(request) = event else {
+                return None;
+            };
+            assert_eq!(request.source.as_deref(), Some("probe"));
+            assert_eq!(request.message.as_deref(), Some("Who is asking?"));
+            Some(UserResponse::Questions {
+                id: request.id.clone(),
+                answers: vec![("name".into(), "Ada".into()), ("age".into(), "36".into())],
+            })
+        })
+        .await
+        else {
+            return;
+        };
+        assert_eq!(
+            echoed_response(&seen)["result"],
+            json!({"action": "accept", "content": {"name": "Ada", "age": 36}, "_meta": null})
+        );
+    }
+
+    #[tokio::test]
+    async fn an_mcp_form_is_asked_even_when_a_policy_answers_approvals() {
+        // A form asks for what only the reader has, so AllowAll does not
+        // answer it.
+        let Some((seen, _)) = answer_first_request("mcp-form", ApprovalPolicy::AllowAll, |event| {
+            let ProviderEvent::UserInput(request) = event else {
+                return None;
+            };
+            Some(UserResponse::CancelQuestions {
+                id: request.id.clone(),
+            })
+        })
+        .await
+        else {
+            return;
+        };
+        assert!(
+            seen.iter()
+                .any(|event| matches!(event, ProviderEvent::UserInput(_)))
+        );
+        // Cancelling the dialog is the reader declining, not an error.
+        assert_eq!(
+            echoed_response(&seen)["result"],
+            json!({"action": "decline", "content": null, "_meta": null})
+        );
+    }
+
+    #[tokio::test]
+    async fn an_mcp_link_carries_its_url_and_is_accepted_by_an_answer() {
+        let Some((seen, _)) = answer_first_request("mcp-link", ApprovalPolicy::Ask, |event| {
+            let ProviderEvent::UserInput(request) = event else {
+                return None;
+            };
+            assert_eq!(
+                request.link.as_deref(),
+                Some("https://github.com/login/device")
+            );
+            Some(UserResponse::Questions {
+                id: request.id.clone(),
+                answers: vec![],
+            })
+        })
+        .await
+        else {
+            return;
+        };
+        assert_eq!(echoed_response(&seen)["result"]["action"], "accept");
+    }
+
+    #[tokio::test]
+    async fn an_mcp_form_with_no_reader_is_cancelled_not_refused() {
+        let Some(server) = FakeServer::new() else {
+            return;
+        };
+        let mut session = interactive_session(&server).await;
+        let thread = session.thread_id().to_owned();
+        let mut seen = Vec::new();
+        let outcome = session
+            .run_turn(&request(&thread, "mcp-form", "/tmp"), |event| {
+                seen.push(event)
+            })
+            .await
+            .unwrap();
+        assert!(outcome.is_completed(), "{outcome:?}");
+        assert_eq!(
+            echoed_response(&seen)["result"],
+            json!({"action": "cancel", "content": null, "_meta": null})
+        );
     }
 
     #[tokio::test]

@@ -705,6 +705,7 @@ fn title_bar(
         .map(|project| project.name.clone());
     let has_project = project.is_some();
     let busy = snapshot.is_busy();
+    let waiting = snapshot.is_waiting_on_user();
     let for_sidebar = state.clone();
     let for_inspector = state.clone();
     let for_new = state.clone();
@@ -771,12 +772,20 @@ fn title_bar(
                     project.as_deref(),
                 )),
         )
-        .children(busy.then(|| {
-            fx_design::components::activity_dot(
-                Colors::accent(&theme),
-                fx_design::components::ActivityState::Running,
-                0.0,
-            )
+        // Stopped on the reader outranks working: it is the one that needs
+        // them, whether FlowX can take the answer or another app has to.
+        .children((busy || waiting).then(|| {
+            div()
+                .debug_selector(move || format!("titlebar-activity:{waiting}"))
+                .child(fx_design::components::activity_dot(
+                    Colors::accent(&theme),
+                    if waiting {
+                        fx_design::components::ActivityState::Waiting
+                    } else {
+                        fx_design::components::ActivityState::Running
+                    },
+                    0.0,
+                ))
         }))
         .child(titlebar_control(project_changes::view(state.clone(), cx)))
         .child(titlebar_control(fx_design::components::icon_button(

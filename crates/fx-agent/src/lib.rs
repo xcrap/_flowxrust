@@ -9,6 +9,7 @@
 pub mod claude;
 pub mod codex;
 pub mod conversation;
+pub mod elicitation;
 pub mod native;
 mod process;
 pub mod provider;

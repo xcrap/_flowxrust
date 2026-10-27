@@ -584,6 +584,75 @@ refused still gets a row: the call it asked about, with the refusal as its
 result, because its own item never reaches this transcript and a silent
 refusal failed the call with nothing on screen to say why.
 
+### What a provider can ask the user
+
+Every request either provider can block on, checked against the real CLIs
+(Claude Code 2.1.283's binary and a live stream-json run; `codex app-server
+generate-ts` and a live run of codex-cli 0.164, both against a probe MCP server
+that elicits). Each is answered in the UI, or answered on purpose for the reason
+given.
+
+| Provider | Request | What FlowX does |
+|---|---|---|
+| Claude | `can_use_tool` (any tool, MCP tools `mcp__server__tool` included, `ExitPlanMode`, a sandbox's network ask) | Approval card. Full Access and a non-`Ask` policy answer it. |
+| Claude | `can_use_tool` for `AskUserQuestion` | Question dialog. Never answered by policy. |
+| Claude | `elicitation` (an MCP server's form, confirmation or link) | Question dialog. Never answered by policy. |
+| Claude | `request_user_dialog` | Refused. Sent only for `dialog_kind`s the host declared in `initialize.supportedDialogKinds`; FlowX sends no `initialize`, so the CLI falls back to its no-dialog path. |
+| Claude | `hook_callback`, `mcp_message` | Refused. Sent only for hooks and SDK MCP servers a host registers at `initialize`; FlowX registers none. |
+| Claude | `oauth_token_refresh`, `host_auth_token_refresh`, `remote_control_work_secret`, device-hook requests | Refused. Host-managed auth and remote control, which FlowX does not enable. |
+| Codex | `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/permissions/requestApproval`, legacy `execCommandApproval` / `applyPatchApproval` | Approval card, or the approval policy. |
+| Codex | `item/tool/requestUserInput` | Question dialog. |
+| Codex | `mcpServer/elicitation/request` with `_meta.codex_approval_kind` | Approval card for an MCP tool call (`mcp__server__tool`), or the approval policy. |
+| Codex | any other `mcpServer/elicitation/request` | Question dialog. With no reader, `{action: cancel}`. |
+| Codex | `currentTime/read` | Answered with the clock. |
+| Codex | `item/tool/call` | Refused. Dynamic tools only; FlowX registers none on `thread/start`. |
+| Codex | `account/chatgptAuthTokens/refresh`, `attestation/generate` | Refused. Externally managed auth, and `initialize.capabilities.requestAttestation`, neither of which FlowX uses. |
+
+Three of those rows were bugs found by that live run:
+
+- **An MCP elicitation was refused.** Claude turns the refusal into
+  `{action: cancel}` and Codex into a failed request, so the server's tool
+  failed and nothing on screen said it had asked. Both providers relay the same
+  MCP request, and `fx-agent::elicitation` is the one reader for both: a form
+  becomes one question per field (a yes-or-no and a single choice are chosen,
+  not typed; a field outside `required` may be left blank), a form with no
+  fields is a confirmation, and `url` mode is a link. The answer goes back typed
+  as the schema says, and a value that does not parse is sent as written,
+  because a reply that never leaves keeps the server waiting.
+- **Codex asks for MCP tool approvals as elicitations.** Under any access level
+  that asks, every MCP tool call opens with `mcpServer/elicitation/request`, an
+  empty form and `_meta.codex_approval_kind: "mcp_tool_call"`. Refused as an
+  unknown method, every MCP tool call failed. The tool's name is only in the
+  message (`…run tool "ask_name"?`).
+- **The reply shapes differ.** Claude's schema takes `content` absent but never
+  null; Codex names `content` and `_meta`, null when empty.
+
+Opening a link is consent, so the dialog opens it only when the reader accepts,
+in their own browser, and only `http`/`https`: a `file:` or app-scheme URL from
+a server is never offered.
+
+A thread FlowX only mirrors is a different case: the request belongs to the
+process that asked, and only that process can hear the answer. FlowX shows that
+the thread is waiting and does not offer buttons that reach nobody:
+
+- **Claude.** Every Claude process keeps `<config>/sessions/<pid>.json`
+  current, and while one is blocked it reads `status: "waiting"` with
+  `waitingFor` (`"permission prompt"`, `"input needed"`, `"dialog open"`). That
+  is the record `claude agents --json` reports. The Claude index pass reads it
+  for every listed thread and ignores a record whose process is gone, since a
+  crash leaves its file behind.
+- **Codex.** `thread/list` reports `status: {type: active, activeFlags:
+  [waitingOnApproval | waitingOnUserInput]}` only for a thread loaded in the
+  app-server answering the listing. A thread running in another Codex process
+  reads `notLoaded`, so FlowX cannot see that one wait and says nothing rather
+  than guessing.
+
+The mark is live state, never saved. Each index pass replaces it for its
+provider and project, a failed pass clears it, and it is reported only for the
+active project, the only one that keeps polling. A turn FlowX runs on the thread
+answers for itself. The sidebar row shows Waiting, the title bar's dot turns to
+Waiting for the active thread, and the transcript says where to answer.
+
 ## The transcript
 
 The transcript carries tool calls as first-class rows, not only as the activity
@@ -832,6 +901,11 @@ Each view test builds its own `TestAppContext` and its own `TempDir`. Sharing on
 store directory across tests is a race: they run concurrently in one process and
 overwrite each other's snapshot, which surfaces as a test that fails only in a
 full run.
+
+`VisualTestContext::debug_bounds` proves something was drawn, never that it
+went away: GPUI 0.2.2's `Frame::clear` does not clear the frame's debug
+selectors, so a selector drawn once stays visible to it in later frames.
+Assert a removal on the state that decides it.
 
 ## The inspector
 

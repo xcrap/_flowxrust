@@ -219,10 +219,18 @@ pub enum RiskLevel {
     Dangerous,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct UserInputRequest {
     pub id: String,
+    /// Empty for a request that asks only for consent: an MCP server's
+    /// confirmation, or a link it asks the reader to open.
     pub questions: Vec<Question>,
+    /// Who is asking, when it is not the agent: an MCP server's name.
+    pub source: Option<String>,
+    /// What the asker said about the request as a whole.
+    pub message: Option<String>,
+    /// A web page the asker wants opened. Answering is consenting to open it.
+    pub link: Option<String>,
 }
 
 /// A response to one request from a running provider turn.
@@ -255,17 +263,21 @@ impl UserResponse {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Question {
     pub id: String,
     pub header: String,
     pub question: String,
     pub options: Vec<Option_>,
+    /// Whether a typed answer is taken. Without it, and with options, the
+    /// answer is one of the options.
     pub is_other: bool,
     pub is_secret: bool,
+    /// Whether it may be left blank.
+    pub optional: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Option_ {
     pub label: String,
     pub description: String,

@@ -1209,17 +1209,19 @@ impl Conversation {
                 risk: approval.risk.into(),
             }),
             ProviderEvent::UserInput(request) => {
+                // An MCP server's request says what it wants as a whole, and
+                // may have no question at all: that is what the tray shows.
                 self.add_question(PendingQuestion {
                     id: request.id,
                     question: request
-                        .questions
-                        .first()
-                        .map(|q| q.question.clone())
+                        .message
+                        .clone()
+                        .or_else(|| request.questions.first().map(|q| q.question.clone()))
                         .unwrap_or_default(),
                     header: request
-                        .questions
-                        .first()
-                        .map(|q| q.header.clone())
+                        .source
+                        .clone()
+                        .or_else(|| request.questions.first().map(|q| q.header.clone()))
                         .unwrap_or_default(),
                     options: request
                         .questions
@@ -1930,6 +1932,7 @@ mod tests {
                     ],
                     is_other: false,
                     is_secret: false,
+                    optional: false,
                 },
                 crate::provider::Question {
                     id: "q2".into(),
@@ -1938,8 +1941,10 @@ mod tests {
                     options: Vec::new(),
                     is_other: true,
                     is_secret: false,
+                    optional: false,
                 },
             ],
+            ..Default::default()
         };
         let mut c = Conversation::new(Uuid::nil());
         c.apply(ProviderEvent::UserInput(request));

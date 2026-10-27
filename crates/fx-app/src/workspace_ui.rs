@@ -7,7 +7,7 @@ use fx_core::services::runtime::{BinaryHealth, BinarySpec, RuntimeDiscovery, all
 use fx_design::components::{ButtonStyle, button, choice_row, divider, panel};
 use fx_design::icon::Icon;
 use fx_design::styled::{FxStyled, px_len};
-use fx_design::theme::{Colors, IconSize, Layout, Shadow, Spacing, global};
+use fx_design::theme::{Colors, IconSize, Layout, Radii, Shadow, Spacing, TextRole, global};
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, SharedString, Subscription, Window, div, px};
 use uuid::Uuid;
@@ -382,6 +382,10 @@ impl WorkspaceUi {
 
 /// The dialog for a provider's question. Approvals are answered on their card
 /// in the transcript instead.
+///
+/// An MCP server's request comes here too, relayed by either provider: a form
+/// is one question per field, and a request with no questions asks only for
+/// consent — to what its message says, or to open its link.
 pub struct RequestPanel {
     state: Entity<AppState>,
     agent: Uuid,
@@ -444,6 +448,13 @@ impl RequestPanel {
 
     fn answers(&self, cx: &App) -> Option<UserResponse> {
         let request = &self.request;
+        // Consent alone: nothing to fill in, so accepting is the answer.
+        if request.questions.is_empty() {
+            return Some(UserResponse::Questions {
+                id: request.id.clone(),
+                answers: Vec::new(),
+            });
+        }
         let answers: Vec<_> = request
             .questions
             .iter()
@@ -461,8 +472,10 @@ impl RequestPanel {
             })
             .collect();
         if answers.len() != request.questions.len()
-            || answers.is_empty()
-            || answers.iter().any(|(_, value)| value.trim().is_empty())
+            || answers
+                .iter()
+                .zip(&request.questions)
+                .any(|((_, value), question)| value.trim().is_empty() && !question.optional)
         {
             return None;
         }
@@ -476,7 +489,15 @@ impl RequestPanel {
 impl Render for RequestPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.focused {
-            if let Some(field) = self.fields.first() {
+            // The first field drawn: a choice-only question's field holds
+            // the choice but is never on screen to type into.
+            let typed = self
+                .request
+                .questions
+                .iter()
+                .zip(&self.fields)
+                .find(|(question, _)| takes_typed_answer(question));
+            if let Some((_, field)) = typed {
                 field.read(cx).focus_handle().focus(window);
             } else {
                 self.focus.focus(window);
@@ -495,10 +516,16 @@ impl Render for RequestPanel {
             .map(|agent| agent.title.clone())
             .unwrap_or_else(|| "Conversation".into());
         let request = &self.request;
-        let heading = if request.questions.len() > 1 {
-            "A few questions"
-        } else {
-            "A quick question"
+        let heading = match (request.questions.len(), &request.link) {
+            (0, Some(_)) => "Open a link to continue",
+            (0, None) => "Your confirmation is needed",
+            (1, _) => "A quick question",
+            _ => "A few questions",
+        };
+        // Who asked, when it was not the agent: an MCP server it relayed.
+        let title = match &request.source {
+            Some(source) => format!("MCP server “{source}” · {title}"),
+            None => title,
         };
         let icon = Icon::QUESTIONMARK_BUBBLE_FILL;
         let header = div()
@@ -531,6 +558,28 @@ impl Render for RequestPanel {
             .flex_col()
             .gap(px_len(Spacing::XL))
             .p(px_len(Spacing::XXL));
+        if let Some(message) = &request.message {
+            body = body.child(
+                div()
+                    .debug_selector(|| "request-message".into())
+                    .fx_body()
+                    .child(SharedString::from(message.clone())),
+            );
+        }
+        if let Some(link) = &request.link {
+            body = body.child(
+                div()
+                    .debug_selector(|| "request-link".into())
+                    .p(px_len(Spacing::MD))
+                    .rounded(px_len(Radii::MD))
+                    .bg(Colors::bg_surface(&theme))
+                    .fx_role(TextRole::MonoSmall)
+                    .text_color(Colors::fg_secondary(&theme))
+                    // Never elided: what is opened is decided by the whole
+                    // address, often by its end.
+                    .child(SharedString::from(link.clone())),
+            );
+        }
         let mut footer = div()
             .w_full()
             .flex()
@@ -550,23 +599,30 @@ impl Render for RequestPanel {
                 .flex()
                 .flex_col()
                 .gap(px_len(Spacing::MD));
-            if request.questions.len() > 1 || !question.header.is_empty() {
+            if request.questions.len() > 1 || !question.header.is_empty() || question.optional {
+                let header = if question.header.is_empty() {
+                    format!("Question {}", index + 1)
+                } else {
+                    question.header.clone()
+                };
                 section = section.child(
                     div()
                         .fx_caption()
                         .text_color(Colors::fg_tertiary(&theme))
-                        .child(SharedString::from(if question.header.is_empty() {
-                            format!("Question {}", index + 1)
+                        .child(SharedString::from(if question.optional {
+                            format!("{header} · Optional")
                         } else {
-                            question.header.clone()
+                            header
                         })),
                 );
             }
-            section = section.child(
-                div()
-                    .fx_body_medium()
-                    .child(SharedString::from(question.question.clone())),
-            );
+            if !question.question.trim().is_empty() {
+                section = section.child(
+                    div()
+                        .fx_body_medium()
+                        .child(SharedString::from(question.question.clone())),
+                );
+            }
             for option in &question.options {
                 let field = self.fields[index].clone();
                 let value = option.label.clone();
@@ -585,8 +641,9 @@ impl Render for RequestPanel {
                     .debug_selector(move || selector),
                 );
             }
+            let typed = takes_typed_answer(question);
             section = section
-                .when(!question.options.is_empty(), |section| {
+                .when(!question.options.is_empty() && typed, |section| {
                     section.child(
                         div()
                             .fx_caption()
@@ -594,7 +651,7 @@ impl Render for RequestPanel {
                             .child("Choose an option above or enter your answer."),
                     )
                 })
-                .child(self.fields[index].clone());
+                .when(typed, |section| section.child(self.fields[index].clone()));
             body = body.child(section);
             if index + 1 < request.questions.len() {
                 body = body.child(divider());
@@ -604,23 +661,49 @@ impl Render for RequestPanel {
         let cancel = UserResponse::CancelQuestions {
             id: request.id.clone(),
         };
+        // Consent has a yes and a no; a form is sent or cancelled.
+        let (refuse, accept) = match (request.questions.is_empty(), &request.link) {
+            (true, Some(_)) => ("Decline", "Open link"),
+            (true, None) => ("Decline", "Accept"),
+            (false, _) => ("Cancel", "Send answers"),
+        };
+        let link = request
+            .link
+            .clone()
+            .filter(|link| fx_agent::elicitation::is_web_link(link));
         footer = footer
-            .child(button(
-                "Cancel",
-                ButtonStyle::Secondary,
-                !self.sent,
-                cx.listener(move |this, _, _, cx| this.respond(cancel.clone(), cx)),
-            ))
-            .child(button(
-                "Send answers",
-                ButtonStyle::Primary,
-                !self.sent && answers.is_some(),
-                cx.listener(move |this, _, _, cx| {
-                    if let Some(answer) = this.answers(cx) {
-                        this.respond(answer, cx);
-                    }
-                }),
-            ));
+            .child(
+                div()
+                    .debug_selector(|| "request-refuse".into())
+                    .child(button(
+                        refuse,
+                        ButtonStyle::Secondary,
+                        !self.sent,
+                        cx.listener(move |this, _, _, cx| this.respond(cancel.clone(), cx)),
+                    )),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "request-accept".into())
+                    .child(button(
+                        accept,
+                        ButtonStyle::Primary,
+                        !self.sent && answers.is_some(),
+                        cx.listener(move |this, _, _, cx| {
+                            if let Some(answer) = this.answers(cx) {
+                                // Accepting a link is consenting to open it,
+                                // so it is opened here, in the reader's own
+                                // browser, and only a web page ever is.
+                                if let Some(link) = &link
+                                    && !this.sent
+                                {
+                                    cx.open_url(link);
+                                }
+                                this.respond(answer, cx);
+                            }
+                        }),
+                    )),
+            );
         let content = div()
             .w_full()
             .flex()
@@ -663,6 +746,12 @@ impl Render for RequestPanel {
     }
 }
 
+/// Whether a question is answered by typing. One that offers options and does
+/// not take another answer is answered by choosing alone.
+fn takes_typed_answer(question: &fx_agent::provider::Question) -> bool {
+    question.is_other || question.options.is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -682,6 +771,7 @@ mod tests {
             options: vec![],
             is_other: true,
             is_secret: secret,
+            optional: false,
         }
     }
 
@@ -736,6 +826,7 @@ mod tests {
                 event: ProviderEvent::UserInput(UserInputRequest {
                     id: "secret-request".into(),
                     questions: vec![question("password", true)],
+                    ..Default::default()
                 }),
             })
         });
@@ -820,6 +911,7 @@ mod tests {
                     event: ProviderEvent::UserInput(UserInputRequest {
                         id: "two-questions".into(),
                         questions: vec![yes_or_no("tests"), yes_or_no("docs")],
+                        ..Default::default()
                     }),
                 },
             )
@@ -854,6 +946,200 @@ mod tests {
             test.refresh().unwrap();
             assert_eq!(values(&test), expected, "after clicking {selector}");
         }
+    }
+
+    /// The workspace with a turn running for one thread, whose answers land in
+    /// the receiver exactly as the provider session would read them.
+    fn mounted_with_runner(
+        test: &mut gpui::TestAppContext,
+        path: &std::path::Path,
+    ) -> (
+        gpui::WindowHandle<MountedWorkspace>,
+        Entity<AppState>,
+        Entity<WorkspaceUi>,
+        Uuid,
+        tokio::sync::mpsc::UnboundedReceiver<UserResponse>,
+    ) {
+        use gpui::{VisualTestContext, px, size};
+        let (state, ui, composer) =
+            test.update(|cx| (state(cx, path), handle(cx), cx.new(TextField::new)));
+        let window = test.add_window({
+            let state = state.clone();
+            let ui = ui.clone();
+            move |_, _| MountedWorkspace {
+                state,
+                ui,
+                composer,
+            }
+        });
+        VisualTestContext::from_window(window.into(), test)
+            .simulate_resize(size(px(1100.0), px(900.0)));
+        let agent = Uuid::new_v4();
+        let (runner, received) = crate::session::TurnRunner::detached();
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                state.runners.insert(agent, runner);
+            })
+        });
+        (window, state, ui, agent, received)
+    }
+
+    fn ask(
+        test: &mut gpui::TestAppContext,
+        window: gpui::WindowHandle<MountedWorkspace>,
+        state: &Entity<AppState>,
+        agent: Uuid,
+        event: ProviderEvent,
+    ) {
+        test.update(|cx| {
+            state.read(cx).update_sender_for(agent)(crate::session::SessionUpdate::Interaction {
+                event,
+            })
+        });
+        window.update(test, |_, _, cx| cx.notify()).unwrap();
+        test.refresh().unwrap();
+    }
+
+    fn click(
+        test: &mut gpui::TestAppContext,
+        window: gpui::WindowHandle<MountedWorkspace>,
+        selector: &'static str,
+    ) {
+        use gpui::{MouseButton, VisualTestContext};
+        let mut visual = VisualTestContext::from_window(window.into(), test);
+        let point = visual
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} was not drawn"))
+            .center();
+        visual.simulate_mouse_down(point, MouseButton::Left, Default::default());
+        visual.simulate_mouse_up(point, MouseButton::Left, Default::default());
+        test.refresh().unwrap();
+    }
+
+    #[test]
+    fn an_mcp_form_opens_the_dialog_and_its_answer_reaches_the_provider_typed() {
+        // The form Claude Code 2.1.283 relayed from a live MCP server.
+        let elicitation = fx_agent::elicitation::Elicitation::from_claude(&serde_json::json!({
+            "subtype": "elicitation", "mcp_server_name": "probe", "message": "Who is asking?",
+            "mode": "form", "requested_schema": {"type": "object", "properties": {
+                "name": {"type": "string", "title": "Name", "description": "Your name"},
+                "agree": {"type": "boolean", "title": "Agree"},
+                "age": {"type": "integer", "title": "Age"}},
+                "required": ["name", "agree"]}
+        }));
+        let temp = tempfile::tempdir().unwrap();
+        let mut test = gpui::TestAppContext::single();
+        let (window, state, ui, agent, mut received) = mounted_with_runner(&mut test, temp.path());
+        ask(
+            &mut test,
+            window,
+            &state,
+            agent,
+            elicitation.event("claude-elicitation-1".into()),
+        );
+
+        let panel = test.update(|cx| ui.read(cx).request.clone().expect("the dialog opened"));
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), &test);
+        assert!(visual.debug_bounds("request-message").is_some());
+        test.read(|cx| {
+            let panel = panel.read(cx);
+            let index = |id: &str| {
+                panel
+                    .request
+                    .questions
+                    .iter()
+                    .position(|q| q.id == id)
+                    .unwrap()
+            };
+            panel.fields[index("name")].clone()
+        })
+        .update(&mut test, |field, cx| field.set_value("Ada", cx));
+        test.refresh().unwrap();
+        // Age is optional, so the form is complete once the required two are.
+        test.read(|cx| assert!(panel.read(cx).answers(cx).is_none()));
+        let agree = test.read(|cx| {
+            let position = panel
+                .read(cx)
+                .request
+                .questions
+                .iter()
+                .position(|q| q.id == "agree")
+                .unwrap();
+            Box::leak(format!("question-option:{position}:Yes").into_boxed_str()) as &'static str
+        });
+        // A yes-or-no is chosen, not typed.
+        click(&mut test, window, agree);
+        click(&mut test, window, "request-accept");
+
+        let response = received.try_recv().expect("the answer reached the runner");
+        assert!(received.try_recv().is_err(), "answered more than once");
+        let reply = elicitation
+            .reply(&response)
+            .expect("an answer of the form's kind");
+        assert_eq!(
+            reply.to_claude(),
+            serde_json::json!({"action": "accept", "content": {"name": "Ada", "agree": true}})
+        );
+    }
+
+    #[test]
+    fn a_link_request_opens_its_page_only_when_the_reader_accepts() {
+        let elicitation = fx_agent::elicitation::Elicitation::from_codex(&serde_json::json!({
+            "threadId": "t", "turnId": "u", "serverName": "github", "mode": "url",
+            "_meta": null, "message": "Sign in to continue.",
+            "url": "https://github.com/login/device", "elicitationId": "e-1"
+        }));
+        let temp = tempfile::tempdir().unwrap();
+        let mut test = gpui::TestAppContext::single();
+        let (window, state, _, agent, mut received) = mounted_with_runner(&mut test, temp.path());
+        ask(
+            &mut test,
+            window,
+            &state,
+            agent,
+            elicitation.event("codex:7".into()),
+        );
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), &test);
+        assert!(visual.debug_bounds("request-link").is_some());
+        assert_eq!(test.opened_url(), None, "opened before the reader agreed");
+
+        click(&mut test, window, "request-accept");
+        assert_eq!(
+            test.opened_url().as_deref(),
+            Some("https://github.com/login/device")
+        );
+        let response = received.try_recv().unwrap();
+        assert_eq!(elicitation.reply(&response).unwrap().action, "accept");
+    }
+
+    #[test]
+    fn declining_a_confirmation_reaches_the_provider_as_a_decline() {
+        let elicitation = fx_agent::elicitation::Elicitation::from_claude(&serde_json::json!({
+            "mcp_server_name": "db", "message": "Drop the staging tables?", "mode": "form",
+            "requested_schema": {"type": "object", "properties": {}}
+        }));
+        let temp = tempfile::tempdir().unwrap();
+        let mut test = gpui::TestAppContext::single();
+        let (window, state, ui, agent, mut received) = mounted_with_runner(&mut test, temp.path());
+        ask(
+            &mut test,
+            window,
+            &state,
+            agent,
+            elicitation.event("claude-elicitation-2".into()),
+        );
+        test.read(|cx| {
+            let panel = ui.read(cx).request.clone().unwrap();
+            // Nothing to fill in, so it can be accepted at once.
+            assert!(panel.read(cx).answers(cx).is_some());
+        });
+        click(&mut test, window, "request-refuse");
+        let response = received.try_recv().unwrap();
+        assert_eq!(
+            elicitation.reply(&response).unwrap().to_claude(),
+            serde_json::json!({"action": "decline"})
+        );
+        assert_eq!(test.opened_url(), None);
     }
 
     #[test]
@@ -967,6 +1253,7 @@ mod tests {
                 UserInputRequest {
                     id: "request-envelope".into(),
                     questions: vec![question("database", false), question("region", false)],
+                    ..Default::default()
                 },
                 cx,
             );
@@ -1004,6 +1291,7 @@ mod tests {
                 UserInputRequest {
                     id: "auth-request".into(),
                     questions: vec![question("password", true)],
+                    ..Default::default()
                 },
                 cx,
             );
