@@ -36,6 +36,19 @@ not complete.** The remaining work is listed below.
 - Assistant replies render Markdown links, inline code, emphasis, lists and code
   blocks. Imported image attachments show bounded thumbnails; recognized provider
   attachment envelopes are replaced by the prompt and its attachments.
+- Add file references from the composer or a diff's file header, and quote a
+  message or selected transcript text from its context menu. References enter
+  the draft as editable text and survive draft and queue recovery. They are
+  never sent automatically; file references name paths for the provider to read.
+- Select a diff line, then Shift-click another to capture a range in either
+  inline or split view. **Add selection to prompt** includes the exact excerpt,
+  comparison and old/new line numbers, followed by space for feedback.
+- **⌘F** finds messages in the current conversation; Enter and Shift-Enter move
+  between matches, and Escape closes search. **⌘K** also searches message text
+  across visible chats, including saved transcripts that have not been opened.
+  Search matches every query word regardless of case or order, opens the matching
+  message, and reports unavailable history. Raw tool logs and unsent drafts are
+  excluded; native history must first be opened and cached to be searchable.
 - Compact activity groups show progress and action counts without flooding the
   transcript. Open a group to inspect commands, with earlier actions paged in.
 - Automatic names for new chats from the first prompt, using one shared provider

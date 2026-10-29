@@ -351,6 +351,32 @@ impl TextField {
         self.focus_handle.clone()
     }
 
+    pub(crate) fn is_composing(&self) -> bool {
+        self.marked.is_some()
+    }
+
+    /// Append an explicit reference as one undoable edit, or keep the entire
+    /// draft unchanged if it does not fit. Context must never be cut in half.
+    pub(crate) fn append_context(
+        &mut self,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if !self.enabled || self.marked.is_some() {
+            return Err("Finish editing the prompt before adding context.".into());
+        }
+        let separator = if self.value.is_empty() { "" } else { "\n\n" };
+        let insert = format!("{separator}{text}");
+        let insert = normalise_line_breaks(&insert, self.multiline.is_some());
+        if self.max_len > 0 && self.value.chars().count() + insert.chars().count() > self.max_len {
+            return Err("This context would exceed the prompt limit. Select fewer lines or shorten the draft.".into());
+        }
+        let end = self.value.len();
+        self.user_edit(EditKind::Clipboard, end..end, &insert);
+        cx.notify();
+        Ok(())
+    }
+
     /// Placeholder shown while empty.
     pub fn placeholder(mut self, text: impl Into<String>) -> Self {
         self.placeholder = text.into();
@@ -2598,6 +2624,28 @@ impl EntityInputHandler for TextField {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_is_appended_atomically_and_undo_restores_the_original_draft() {
+        let test = gpui::TestAppContext::single();
+        test.update(|cx| {
+            let field = cx.new(|cx| TextField::new(cx).multiline(5.0).max_len(12));
+            field.update(cx, |field, cx| {
+                field.set_value("Açores 🐳", cx);
+                field.selection = Selection::select_all(field.value.len());
+                assert!(field.append_context("é🦀", cx).is_ok());
+                assert_eq!(field.value(), "Açores 🐳\n\né🦀");
+                assert!(field.append_context("overflow", cx).is_err());
+                assert_eq!(field.value(), "Açores 🐳\n\né🦀");
+                assert!(field.undo(cx));
+                assert_eq!(field.value(), "Açores 🐳");
+                assert!(!field.undo(cx));
+                field.marked = Some(0..1);
+                assert!(field.append_context("x", cx).is_err());
+                assert_eq!(field.value(), "Açores 🐳");
+            });
+        });
+    }
 
     #[test]
     fn secret_fields_mask_glyphs_with_reversible_unicode_caret_positions() {

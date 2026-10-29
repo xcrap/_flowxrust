@@ -10,6 +10,8 @@ pub mod diff_disclosure;
 pub mod diff_row_layout;
 pub mod file_index;
 pub mod image_correlation;
+pub mod message_search;
+pub mod prompt_context;
 pub mod transcript_grouping;
 pub mod transcript_presentation;
 pub mod turn_plan;

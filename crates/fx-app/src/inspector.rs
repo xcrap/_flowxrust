@@ -541,6 +541,85 @@ mod tests {
     }
 
     #[test]
+    fn inline_and_split_diff_ranges_become_editable_feedback() {
+        for layout in [DiffLayout::Inline, DiffLayout::Split] {
+            let root = repo();
+            std::fs::write(root.path().join("sample.txt"), "after the edit\n").unwrap();
+            let data = tempfile::tempdir().unwrap();
+            let mut test = gpui::TestAppContext::single();
+            let (inspector, window) = mount(&mut test, data.path(), Some(root.path()), 700.0);
+            let state = test.read(|cx| inspector.read(cx).state.clone());
+            let agent = state.update(&mut test, |state, cx| {
+                let agent = state.create_thread().unwrap();
+                state.conversation(state.active_project().unwrap().id, agent);
+                let draft = state.draft(agent, cx);
+                draft.update(cx, |field, cx| field.set_value("Please review", cx));
+                agent
+            });
+            inspector.update(&mut test, |inspector, cx| {
+                inspector.set_layout(layout, cx);
+                inspector.select_path("sample.txt", cx);
+            });
+            let (old, new) = test.read(|cx| {
+                let inspector = inspector.read(cx);
+                let lines = &inspector.diff.document.as_ref().unwrap().sections[0].lines;
+                (
+                    lines
+                        .iter()
+                        .position(|line| line.text == "-before the edit")
+                        .unwrap(),
+                    lines
+                        .iter()
+                        .position(|line| line.text == "+after the edit")
+                        .unwrap(),
+                )
+            });
+            let mut visual = gpui::VisualTestContext::from_window(window.into(), &test);
+            visual.simulate_resize(gpui::size(px(700.0), px(700.0)));
+            for (index, side, shift) in [(old, "old", false), (new, "new", true)] {
+                test.refresh().unwrap();
+                let side = if layout == DiffLayout::Inline {
+                    "inline"
+                } else {
+                    side
+                };
+                let selector =
+                    Box::leak(format!("diff-select:{side}:Some({index})").into_boxed_str());
+                let bounds = visual.debug_bounds(selector).unwrap();
+                assert!(bounds.size.height > px(0.0));
+                let modifiers = gpui::Modifiers {
+                    shift,
+                    ..Default::default()
+                };
+                visual.simulate_mouse_down(bounds.center(), gpui::MouseButton::Left, modifiers);
+                visual.simulate_mouse_up(bounds.center(), gpui::MouseButton::Left, modifiers);
+            }
+            test.refresh().unwrap();
+            let button = visual
+                .debug_bounds("compact-action:Add selection to prompt")
+                .unwrap()
+                .center();
+            visual.simulate_mouse_down(button, gpui::MouseButton::Left, Default::default());
+            visual.simulate_mouse_up(button, gpui::MouseButton::Left, Default::default());
+            test.read(|cx| {
+                let state = state.read(cx);
+                let draft = state.drafts[&agent].read(cx).value();
+                assert!(
+                    draft.starts_with("Please review\n\nReferenced diff:"),
+                    "{draft}"
+                );
+                assert!(draft.contains("Old lines: 1; new lines: 1"), "{draft}");
+                assert!(
+                    draft.contains("-before the edit\n+after the edit"),
+                    "{draft}"
+                );
+                assert!(draft.ends_with("Feedback: "));
+                assert!(inspector.read(cx).diff.selection.is_none());
+            });
+        }
+    }
+
+    #[test]
     fn a_refresh_keeps_the_open_diff_its_selection_and_its_scroll_position() {
         let root = repo();
         let body = |n: usize| -> String { (0..n).map(|i| format!("line {i}\n")).collect() };

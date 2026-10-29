@@ -113,6 +113,8 @@ pub struct AppState {
     /// The command palette, while it is open. Held here for the same reasons as
     /// the picker: ⌘K and the View menu open the same one, above every column.
     pub palette: Option<Entity<crate::command_palette::CommandPalette>>,
+    pub(crate) find: Option<Entity<crate::conversation_search::ConversationFind>>,
+    pub(crate) search_target: Option<crate::conversation_search::Target>,
     pub sidebar_visible: bool,
     /// The thread search and per-project paging, kept here so they survive the
     /// sidebar being hidden and shown again.
@@ -226,6 +228,8 @@ impl AppState {
             waiting_elsewhere: HashMap::new(),
             picker: None,
             palette: None,
+            find: None,
+            search_target: None,
             sidebar_visible,
             sidebar: crate::sidebar::SidebarUi::new(cx),
             last_error,
@@ -739,6 +743,20 @@ impl AppState {
         }
         let project_id = self.project_for_agent(agent_id)?;
         let source = self.thread(agent_id)?.clone();
+        self.composer.reference_picks.remove(&agent_id);
+        if self
+            .find
+            .as_ref()
+            .is_some_and(|find| find.read(cx).agent == agent_id)
+        {
+            self.find = None;
+        }
+        if self
+            .search_target
+            .is_some_and(|target| target.agent == agent_id)
+        {
+            self.search_target = None;
+        }
         self.pending_interactions.remove(&agent_id);
         self.retry_drafts.remove(&agent_id);
         let provider_knows_it = self
@@ -1140,6 +1158,10 @@ impl AppState {
         self.loading.contains(&agent_id)
     }
 
+    pub(crate) fn has_unreadable_conversation(&self, agent_id: Uuid) -> bool {
+        self.protected_conversations.contains(&agent_id)
+    }
+
     /// Install a read transcript as the live one.
     fn adopt_conversation(
         &mut self,
@@ -1291,6 +1313,40 @@ impl AppState {
         .detach();
         self.drafts.insert(agent_id, field.clone());
         field
+    }
+
+    pub(crate) fn append_prompt_context(
+        &mut self,
+        agent_id: Uuid,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<TextField>> {
+        self.thread(agent_id)?;
+        let field = self.draft(agent_id, cx);
+        let result = if self.is_loading_conversation(agent_id) {
+            Err("Wait for this thread's saved draft to load before adding context.".to_string())
+        } else if self.has_unreadable_conversation(agent_id) {
+            Err(
+                "This thread's saved history could not be read. Start a new thread to add context."
+                    .to_string(),
+            )
+        } else {
+            field.update(cx, |field, cx| field.append_context(text, cx))
+        };
+        match result {
+            Ok(()) => {
+                self.set_composer_notice(agent_id, None);
+                self.capture_drafts(cx);
+                self.save_conversations();
+                cx.notify();
+                Some(field)
+            }
+            Err(error) => {
+                self.set_composer_notice(agent_id, Some(error));
+                cx.notify();
+                None
+            }
+        }
     }
 
     /// Add a project at an already-validated, resolved path, and select it.
@@ -3102,6 +3158,7 @@ const COMPOSER_MAX_CHARACTERS: usize = 32_000;
 /// all live and die with the thread, and are read together by one view.
 #[derive(Default)]
 pub struct ComposerStore {
+    pub(crate) reference_picks: HashMap<Uuid, Uuid>,
     attachments: HashMap<Uuid, Arc<Vec<fx_core::Attachment>>>,
     /// Live import tickets per thread. Removing them invalidates late results
     /// without confusing them with imports begun after a reset.
@@ -3198,6 +3255,7 @@ impl AppState {
     /// Release the composer's buffers and invalidate in-flight imports before
     /// its conversation is reset or removed. Do not dispatch a deleted queue.
     fn release_composer(&mut self, agent_id: Uuid) {
+        self.composer.reference_picks.remove(&agent_id);
         if let Some(conversation) = self.conversations.get(&agent_id) {
             let conversation = conversation
                 .lock()
@@ -5014,6 +5072,72 @@ mod persistence_tests {
             first.id,
             second.id,
         )
+    }
+
+    #[test]
+    fn context_survives_draft_and_queue_recovery_without_sending() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temp.path().join("state"));
+        let test = gpui::TestAppContext::single();
+        let (state, project, agent, _) = test.update(|cx| workspace(cx, &paths));
+        let reference = fx_core::policy::prompt_context::quoted_reply("Keep this exact reply 🐳");
+        let expected = format!("My feedback\n\n{reference}");
+        test.update(|cx| {
+            state.update(cx, |state, cx| {
+                state.conversation(project, agent);
+                let draft = state.draft(agent, cx);
+                draft.update(cx, |field, cx| field.set_value("My feedback", cx));
+                assert!(state.append_prompt_context(agent, &reference, cx).is_some());
+                state.flush_saves();
+                let saved = state
+                    .store
+                    .load_conversation(project, agent)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(saved.draft_text, expected);
+                assert!(
+                    saved.messages.is_empty(),
+                    "context is never submitted on its own"
+                );
+                state.protected_conversations.insert(agent);
+                assert!(
+                    state
+                        .append_prompt_context(agent, "must not be lost", cx)
+                        .is_none()
+                );
+                assert_eq!(draft.read(cx).value(), expected);
+                assert!(
+                    state
+                        .composer_notice(agent)
+                        .unwrap()
+                        .contains("could not be read")
+                );
+                state.protected_conversations.remove(&agent);
+                state
+                    .enqueue_prompt(agent, &expected, Vec::new(), cx)
+                    .unwrap();
+                state.flush_saves();
+            })
+        });
+        let reopened = test.update(|cx| cx.new(|cx| AppState::restore(paths, cx)));
+        test.update(|cx| {
+            reopened.update(cx, |state, cx| {
+                state.conversation(project, agent);
+                assert_eq!(state.draft(agent, cx).read(cx).value(), expected);
+                assert!(
+                    state
+                        .conversation(project, agent)
+                        .lock()
+                        .unwrap()
+                        .messages()
+                        .next()
+                        .is_none()
+                );
+                state.composer.reference_picks.insert(agent, Uuid::new_v4());
+                state.reset_conversation(agent, cx);
+                assert!(!state.composer.reference_picks.contains_key(&agent));
+            })
+        });
     }
 
     #[test]

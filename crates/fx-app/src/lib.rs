@@ -19,6 +19,7 @@ pub mod command_palette;
 pub mod commands;
 pub mod composer;
 mod configuration;
+mod conversation_search;
 mod conversation_writer;
 mod follow_up_settings;
 pub mod inspector;
@@ -26,6 +27,7 @@ mod markdown;
 mod native_sync;
 mod project_changes;
 pub mod project_picker;
+mod prompt_context;
 pub mod provider_catalog;
 mod provider_settings;
 mod selection;
@@ -495,7 +497,13 @@ impl Render for FlowX {
                     }
                 })
             })
-            .map(|root| command_handlers(root, idle_thread))
+            .map(|root| {
+                command_handlers(
+                    root,
+                    idle_thread,
+                    self.state.read(cx).active_agent().is_some(),
+                )
+            })
             .when(can_attach, |root| {
                 root.on_action(|_: &composer::AttachImages, _, cx| {
                     if let Some((state, agent)) = attach_target(cx) {
@@ -617,6 +625,7 @@ impl Render for FlowX {
 fn command_handlers(
     root: gpui::Stateful<gpui::Div>,
     idle_thread: Option<uuid::Uuid>,
+    has_thread: bool,
 ) -> gpui::Stateful<gpui::Div> {
     fn unobstructed(cx: &App) -> Option<Entity<AppState>> {
         let handle = AppHandle::get(cx)?;
@@ -626,6 +635,13 @@ fn command_handlers(
         if let Some(handle) = AppHandle::get(cx) {
             command_palette::toggle(handle.0, window, cx);
         }
+    })
+    .when(has_thread, |root| {
+        root.on_action(|_: &commands::FindConversation, window, cx| {
+            if let Some(state) = unobstructed(cx) {
+                conversation_search::open(state, window, cx);
+            }
+        })
     })
     .on_action(|action: &commands::OpenThread, _, cx| {
         let Some(state) = unobstructed(cx) else {
@@ -962,6 +978,11 @@ fn center_column(
         .flex()
         .flex_col()
         .bg(Colors::content_bg(&theme))
+        .children(
+            state.read(cx).find.clone().filter(|find| {
+                Some(find.read(cx).agent) == state.read(cx).snapshot.active_agent_id
+            }),
+        )
         .children(state.read(cx).last_error.clone().map(|error| {
             fx_design::components::surface::banner(
                 Colors::error_muted(&theme),
@@ -1179,6 +1200,9 @@ fn composer_row(
         }
         composer::ComposerAction::Stop => for_actions.update(cx, |state, _| state.stop_turn()),
         composer::ComposerAction::Attach => pick_attachments(&for_actions, agent.id, cx),
+        composer::ComposerAction::ReferenceFiles => {
+            prompt_context::pick_files(&for_actions, agent.id, cx)
+        }
         composer::ComposerAction::AttachPaths(paths) => {
             attach_paths(&for_actions, agent.id, paths, cx);
         }
@@ -1747,6 +1771,9 @@ pub fn dispatch_menu_choice(owner: &str, chosen: &str, window: &mut Window, cx: 
         return;
     };
     if owner.starts_with(transcript::MENU_OWNER_PREFIX) {
+        if transcript::quote_menu_choice(owner, chosen, window, cx) {
+            return;
+        }
         transcript::apply_menu_choice(owner, chosen, cx);
         return;
     }
@@ -2812,7 +2839,21 @@ mod tests {
             )
         });
         assert!(owner.starts_with(transcript::MENU_OWNER_PREFIX), "{owner}");
-        assert_eq!(items, vec!["copy-message".to_string()]);
+        assert_eq!(
+            items,
+            vec!["copy-message".to_string(), "quote-message".to_string()]
+        );
+        window
+            .update(&mut test, |_, window, cx| {
+                dispatch_menu_choice(&owner, "quote-message", window, cx);
+                state.update(cx, |state, cx| {
+                    let draft = state.draft(agent, cx);
+                    assert!(draft.read(cx).value().contains("Copy this answer."));
+                    assert!(draft.read(cx).value().ends_with("Feedback: "));
+                    assert_eq!(conversation.lock().unwrap().messages().len(), 1);
+                });
+            })
+            .unwrap();
         window
             .update(&mut test, |_, window, cx| {
                 dispatch_menu_choice(&owner, "copy-message", window, cx);

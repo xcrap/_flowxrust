@@ -37,6 +37,7 @@ gpui::actions!(
     [
         /// Open the command palette, or close it when it is open.
         ToggleCommandPalette,
+        FindConversation,
         /// Clear the active thread's conversation and start a fresh session.
         ResetConversation,
         /// Rename the active thread.
@@ -159,6 +160,12 @@ pub fn key_bindings() -> Vec<Shortcut> {
     use ShortcutGroup::*;
     let mut table = vec![
         Shortcut::new(General, "cmd-k", "Command palette", ToggleCommandPalette),
+        Shortcut::new(
+            Conversation,
+            "cmd-f",
+            "Find in conversation",
+            FindConversation,
+        ),
         Shortcut::new(General, "cmd-o", "Open project", crate::NewProject),
         Shortcut::new(General, "cmd-,", "Settings", crate::ShowSettings),
         Shortcut::new(General, "cmd-h", "Hide FlowX", Hide),
@@ -377,6 +384,7 @@ pub fn menus(context: &MenuContext) -> Vec<Menu> {
             name: "View".into(),
             items: vec![
                 MenuItem::action("Command palette…", ToggleCommandPalette),
+                MenuItem::action("Find in conversation…", FindConversation),
                 MenuItem::separator(),
                 MenuItem::action("Toggle sidebar", crate::ToggleSidebar),
                 MenuItem::action("Toggle changes", crate::ToggleInspector),

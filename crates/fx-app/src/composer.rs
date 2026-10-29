@@ -154,6 +154,8 @@ pub enum ComposerAction {
     Stop,
     /// Open the attachment picker.
     Attach,
+    /// Add paths as editable context without treating documents as images.
+    ReferenceFiles,
     /// Files were dropped on the composer.
     AttachPaths(Vec<PathBuf>),
     /// ⌘V found an image, not text, on the clipboard.
@@ -790,6 +792,13 @@ fn control_row(
                         && handler.is_some(),
                 ),
             fire(handler.clone(), ComposerAction::Attach),
+        ));
+        controls = controls.child(icon_button(
+            IconButtonProps::new(Icon::DOC_ON_DOC, "Reference files")
+                .small()
+                .ghost()
+                .enabled(chrome.enabled && handler.is_some()),
+            fire(handler.clone(), ComposerAction::ReferenceFiles),
         ));
     }
 

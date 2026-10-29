@@ -25,7 +25,7 @@ use fx_design::components::{
     shortcut_chip,
 };
 use fx_design::icon::Icon;
-use fx_design::styled::px_len;
+use fx_design::styled::{FxStyled, px_len};
 use fx_design::theme::{Colors, IconSize, Layout, Spacing, global};
 use gpui::prelude::*;
 use gpui::{
@@ -35,6 +35,7 @@ use gpui::{
 use uuid::Uuid;
 
 use crate::commands::{self, NUMBERED_THREADS};
+use crate::conversation_search::{self, Cancellation};
 use crate::state::AppState;
 use crate::text_field::TextField;
 use crate::workspace_ui;
@@ -50,6 +51,10 @@ pub enum PaletteTarget {
     Thread(Uuid),
     /// Switch to a project.
     Project(Uuid),
+    Message {
+        agent: Uuid,
+        message: Uuid,
+    },
 }
 
 impl Clone for PaletteTarget {
@@ -58,6 +63,10 @@ impl Clone for PaletteTarget {
             Self::Action(action) => Self::Action(action.boxed_clone()),
             Self::Thread(id) => Self::Thread(*id),
             Self::Project(id) => Self::Project(*id),
+            Self::Message { agent, message } => Self::Message {
+                agent: *agent,
+                message: *message,
+            },
         }
     }
 }
@@ -161,6 +170,13 @@ pub fn commands(state: &AppState) -> Vec<PaletteCommand> {
         ));
     }
     if let Some(agent) = state.active_agent() {
+        out.push(PaletteCommand::action(
+            "Find in conversation…",
+            "Search messages in this thread",
+            Icon::MAGNIFYINGGLASS,
+            &["find", "search", "messages"],
+            commands::FindConversation,
+        ));
         if state.is_thread_busy(agent.id) {
             out.push(PaletteCommand::action(
                 "Stop current run",
@@ -369,6 +385,10 @@ fn fuzzy_score(word: &[char], text: &str) -> Option<u32> {
 pub struct CommandPalette {
     state: Entity<AppState>,
     commands: Vec<PaletteCommand>,
+    command_count: usize,
+    search_status: String,
+    search_task: Option<gpui::Task<()>>,
+    search_cancel: Option<Cancellation>,
     /// Indices into `commands`, best match first.
     results: Vec<usize>,
     /// The results as a menu, for the highlight and its keyboard rules.
@@ -407,7 +427,7 @@ pub fn toggle(state: Entity<AppState>, window: &mut Window, cx: &mut App) {
         let query = cx.new(|cx| {
             TextField::new(cx)
                 .bare()
-                .placeholder("Search commands, threads, and projects")
+                .placeholder("Search commands, threads, projects, and messages")
                 .max_len(200)
         });
         let query_changed = cx.observe(&query, |palette: &mut CommandPalette, _, cx| {
@@ -415,7 +435,11 @@ pub fn toggle(state: Entity<AppState>, window: &mut Window, cx: &mut App) {
         });
         let mut palette = CommandPalette {
             state: state.clone(),
+            command_count: commands.len(),
             commands,
+            search_status: String::new(),
+            search_task: None,
+            search_cancel: None,
             results: Vec::new(),
             model: MenuModel::default(),
             query,
@@ -458,7 +482,11 @@ impl CommandPalette {
     fn refilter(&mut self, cx: &mut Context<Self>) {
         let query = self.query(cx);
         if query != self.ranked_query {
+            self.search_task = None;
+            self.search_cancel = None;
+            self.commands.truncate(self.command_count);
             self.rank_against(query);
+            self.search_messages(cx);
             cx.notify();
         }
     }
@@ -466,7 +494,8 @@ impl CommandPalette {
     /// Rank against `query` and highlight the best match, as the Swift palette
     /// did on every change.
     fn rank_against(&mut self, query: String) {
-        self.results = rank(&self.commands, &query);
+        self.results = rank(&self.commands[..self.command_count], &query);
+        self.results.extend(self.command_count..self.commands.len());
         let items = self
             .results
             .iter()
@@ -479,6 +508,79 @@ impl CommandPalette {
         self.model.highlight_first();
         self.ranked_query = query;
         self.scroll.scroll_to_item(0);
+    }
+
+    fn search_messages(&mut self, cx: &mut Context<Self>) {
+        let query = self.ranked_query.trim().to_string();
+        self.search_status.clear();
+        if query.is_empty() {
+            return;
+        }
+        self.search_status = "Searching saved messages…".into();
+        let cancel = Cancellation::new();
+        let flag = cancel.flag();
+        self.search_cancel = Some(cancel);
+        let state = self.state.clone();
+        self.search_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(180))
+                .await;
+            let Ok((store, sources)) = cx.read_entity(&state, |state, _| {
+                (
+                    state.store.clone(),
+                    conversation_search::sources(state, None),
+                )
+            }) else {
+                return;
+            };
+            let searched = query.clone();
+            let result = cx
+                .background_executor()
+                .spawn(
+                    async move { conversation_search::search(store, sources, searched, flag, 100) },
+                )
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.ranked_query.trim() != query {
+                    return;
+                }
+                this.commands.truncate(this.command_count);
+                this.search_status = format!(
+                    "{}{} matching messages",
+                    result.hits.len(),
+                    if result.capped { "+" } else { "" }
+                );
+                if result.unavailable > 0 {
+                    this.search_status.push_str(&format!(
+                        " · {} chats have no readable cache; open them to load history",
+                        result.unavailable
+                    ));
+                }
+                for hit in result.hits {
+                    this.commands.push(PaletteCommand {
+                        id: format!("message:{}:{}", hit.agent, hit.message),
+                        title: format!("In {}", hit.title),
+                        subtitle: format!("{} — {}", hit.project_name, hit.snippet),
+                        icon: Icon::BUBBLE_LEFT_AND_BUBBLE_RIGHT,
+                        keywords: Vec::new(),
+                        shortcut: None,
+                        target: PaletteTarget::Message {
+                            agent: hit.agent,
+                            message: hit.message,
+                        },
+                    });
+                }
+                let highlighted = this.model.highlighted().map(str::to_string);
+                this.rank_against(this.ranked_query.clone());
+                if let Some(key) = highlighted {
+                    this.model.set_highlight(&key);
+                    if let Some(index) = this.highlighted_index() {
+                        this.scroll.scroll_to_item(index);
+                    }
+                }
+                cx.notify();
+            });
+        }));
     }
 
     /// Position of the highlighted row within `results`.
@@ -510,6 +612,8 @@ impl CommandPalette {
     }
 
     fn close(&mut self, cx: &mut Context<Self>) {
+        self.search_task = None;
+        self.search_cancel = None;
         self.state.update(cx, |state, cx| {
             state.palette = None;
             cx.notify();
@@ -537,6 +641,9 @@ impl CommandPalette {
                 state.save();
                 cx.notify();
             }),
+            PaletteTarget::Message { agent, message } => {
+                conversation_search::reveal(&self.state, agent, message, cx)
+            }
         }
     }
 
@@ -552,9 +659,14 @@ impl CommandPalette {
                         Colors::fg_tertiary(&theme),
                         &theme,
                     ),
-                    "No matching commands",
-                    "Try another word, or part of a thread's name.",
+                    if self.search_task.is_some() && self.search_status.starts_with("Searching") {
+                        "Searching…"
+                    } else {
+                        "No matches"
+                    },
+                    "Try a command, thread name, or words from a message.",
                 ))
+                .children((!self.search_status.is_empty()).then(|| self.search_status_element()))
                 .into_any_element();
         }
         let highlighted = self.model.highlighted().map(str::to_string);
@@ -598,7 +710,21 @@ impl CommandPalette {
                 },
             ));
         }
-        list.into_any_element()
+        div()
+            .flex()
+            .flex_col()
+            .child(list)
+            .children((!self.search_status.is_empty()).then(|| self.search_status_element()))
+            .into_any_element()
+    }
+
+    fn search_status_element(&self) -> gpui::Div {
+        div()
+            .fx_caption()
+            .px(px_len(Spacing::LG))
+            .pb(px_len(Spacing::SM))
+            .text_color(Colors::fg_secondary(&global::current()))
+            .child(SharedString::from(self.search_status.clone()))
     }
 }
 
@@ -847,6 +973,121 @@ mod tests {
             threads: [first.id, second.id],
             _dir: dir,
         }
+    }
+
+    #[test]
+    fn message_search_opens_an_unloaded_thread_at_the_matching_message() {
+        let mut shell = shell();
+        let message = fx_core::ConversationMessage::text(
+            fx_core::MessageRole::Assistant,
+            "Orchid quasar answer",
+        );
+        shell.test.update(|cx| {
+            shell.state.update(cx, |state, _| {
+                let project = state.active_project().unwrap().id;
+                state
+                    .store
+                    .save_conversation(
+                        project,
+                        shell.threads[1],
+                        &fx_store::PersistedConversation::from_messages(
+                            shell.threads[1],
+                            vec![message.clone()],
+                        ),
+                    )
+                    .unwrap();
+                assert!(!state.conversations.contains_key(&shell.threads[1]));
+            })
+        });
+        shell.keys("cmd-k");
+        shell.type_text("quasar orchid");
+        shell
+            .test
+            .executor()
+            .advance_clock(std::time::Duration::from_millis(200));
+        shell.test.run_until_parked();
+        shell.test.refresh().unwrap();
+        assert_eq!(shell.titles(), ["In Second"]);
+        shell.keys("enter");
+        shell.test.run_until_parked();
+        shell.test.refresh().unwrap();
+        shell.test.read(|cx| {
+            let state = shell.state.read(cx);
+            assert_eq!(state.snapshot.active_agent_id, Some(shell.threads[1]));
+            assert_eq!(state.search_target.unwrap().message, message.id);
+        });
+    }
+
+    #[test]
+    fn find_cycles_matching_messages_and_closes_when_leaving_the_thread() {
+        let mut shell = shell();
+        let messages = [
+            fx_core::ConversationMessage::text(fx_core::MessageRole::User, "Needle first"),
+            fx_core::ConversationMessage::text(fx_core::MessageRole::Assistant, "Needle second"),
+        ];
+        shell.test.update(|cx| {
+            shell.state.update(cx, |state, cx| {
+                let project = state.active_project().unwrap().id;
+                let conversation = state.conversation(project, shell.threads[0]);
+                conversation.lock().unwrap().append(messages[0].clone());
+                for index in 0..80 {
+                    conversation
+                        .lock()
+                        .unwrap()
+                        .append(fx_core::ConversationMessage::text(
+                            fx_core::MessageRole::Assistant,
+                            format!("Unrelated distant message {index}"),
+                        ));
+                }
+                conversation.lock().unwrap().append(messages[1].clone());
+                cx.notify();
+            })
+        });
+        shell.keys("cmd-f");
+        shell.type_text("needle");
+        shell
+            .test
+            .executor()
+            .advance_clock(std::time::Duration::from_millis(200));
+        shell.test.run_until_parked();
+        shell.test.refresh().unwrap();
+        let target = |shell: &Shell| {
+            shell
+                .test
+                .read(|cx| shell.state.read(cx).search_target.map(|t| t.message))
+        };
+        assert_eq!(target(&shell), Some(messages[0].id));
+        let mut visual = gpui::VisualTestContext::from_window(shell.window.into(), &shell.test);
+        let selector =
+            Box::leak(format!("transcript.search-match:{}", messages[0].id).into_boxed_str());
+        assert!(
+            visual.debug_bounds(selector).is_some(),
+            "search draws the previously offscreen message"
+        );
+        shell.keys("enter");
+        assert_eq!(target(&shell), Some(messages[1].id));
+        let selector =
+            Box::leak(format!("transcript.search-match:{}", messages[1].id).into_boxed_str());
+        assert!(
+            visual.debug_bounds(selector).is_some(),
+            "next search draws the distant second message"
+        );
+        shell.keys("enter");
+        assert_eq!(target(&shell), Some(messages[0].id));
+        shell.keys("shift-enter");
+        assert_eq!(target(&shell), Some(messages[1].id));
+        shell.keys("escape");
+        assert_eq!(target(&shell), None);
+        assert!(shell.test.read(|cx| shell.state.read(cx).find.is_none()));
+        shell.keys("cmd-f");
+        shell.test.update(|cx| {
+            shell.state.update(cx, |state, cx| {
+                state.open_thread(shell.threads[1], cx);
+                cx.notify();
+            })
+        });
+        shell.test.run_until_parked();
+        assert!(shell.test.read(|cx| shell.state.read(cx).find.is_none()));
     }
 
     #[test]

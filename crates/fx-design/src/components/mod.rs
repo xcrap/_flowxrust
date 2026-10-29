@@ -16,6 +16,7 @@ pub mod menu;
 pub mod menu_model;
 pub mod palette;
 pub mod provider_status;
+pub mod reference;
 pub mod rich_text;
 pub mod segmented;
 pub mod settings;

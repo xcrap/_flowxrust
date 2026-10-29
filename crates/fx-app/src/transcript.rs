@@ -148,6 +148,8 @@ pub(crate) const MENU_OWNER_PREFIX: &str = "transcript:";
 const COPY_SELECTION: &str = "copy-selection";
 const COPY_MESSAGE: &str = "copy-message";
 const COPY_IMAGE: &str = "copy-image";
+const QUOTE_SELECTION: &str = "quote-selection";
+const QUOTE_MESSAGE: &str = "quote-message";
 
 /// A prompt longer than this many characters collapses behind "Show more".
 const COLLAPSED_CHARACTER_LIMIT: usize = 600;
@@ -275,6 +277,7 @@ struct ThreadMemory {
     expanded_prompts: HashSet<Uuid>,
     /// The prompt whose copy button reads "Copied" until the pointer leaves it.
     copied: Option<Uuid>,
+    search_message: Option<Uuid>,
 }
 
 impl ThreadMemory {
@@ -301,6 +304,7 @@ impl ThreadMemory {
             clock_pending: false,
             expanded_prompts: HashSet::new(),
             copied: None,
+            search_message: None,
         }
     }
 }
@@ -1604,13 +1608,61 @@ fn render(mut snapshot: Snapshot, window: &mut Window, cx: &mut App) -> AnyEleme
 
     let frame = MEMORY.with(|memory| memory.borrow_mut().next_frame());
     request_caret_frame(&snapshot, frame, window);
+    let target = crate::AppHandle::get(cx)
+        .and_then(|handle| handle.0.read(cx).search_target)
+        .filter(|target| target.agent == snapshot.agent_id);
+    let target_row = target.and_then(|target| {
+        rows.plan
+            .iter()
+            .position(|row| row_has_message(row, &snapshot, target.message))
+    });
+    if let (Some(target), Some(row)) = (target.filter(|target| target.pending), target_row) {
+        with_thread(snapshot.id, |thread| {
+            thread.expanded_prompts.insert(target.message);
+        });
+        if let RowPlan::Activity {
+            messages, index, ..
+        } = &rows.plan[row]
+        {
+            let key = activity_key(snapshot.id, &[&*snapshot.messages[messages.start]], *index);
+            MEMORY.with(|memory| {
+                let mut memory = memory.borrow_mut();
+                memory.disclosures.insert(key.clone(), true);
+                memory.detail_limits.insert(key, messages.len());
+            });
+        }
+    }
     let (state, scrolled) = with_thread(snapshot.id, |thread| {
         // Before this pass's splices, so the heights near the bottom are the
         // ones the last layout measured.
         follow_bottom(&thread.list, &thread.scrolled);
         thread.measure(&rows, &snapshot);
+        let search_message = target.map(|target| target.message);
+        if thread.search_message != search_message || target.is_some_and(|target| target.pending) {
+            thread.search_message = search_message;
+            remeasure_all(&thread.list);
+        }
+        if let (Some(target), Some(row)) = (target, target_row)
+            && target.pending
+        {
+            thread.list.scroll_to(ListOffset {
+                item_ix: row,
+                offset_in_item: px(0.0),
+            });
+            thread.scrolled.set(true);
+        }
         (thread.list.clone(), thread.scrolled.clone())
     });
+    if target_row.is_some()
+        && target.is_some_and(|target| target.pending)
+        && let Some(handle) = crate::AppHandle::get(cx)
+    {
+        handle.0.update(cx, |state, _| {
+            if let Some(target) = &mut state.search_target {
+                target.pending = false;
+            }
+        });
+    }
     let focus = viewport_focus(snapshot.id, || {
         let mut handle = cx.focus_handle();
         // Reachable from the keyboard at all. Without this the viewport is
@@ -1746,7 +1798,32 @@ fn row_element(
             None => div().into_any_element(),
         },
     };
-    reading_column(content)
+    let highlighted = crate::AppHandle::get(cx)
+        .and_then(|handle| handle.0.read(cx).search_target)
+        .filter(|target| {
+            target.agent == snapshot.agent_id && row_has_message(row, snapshot, target.message)
+        });
+    if let Some(target) = highlighted {
+        reading_column(
+            fx_design::components::reference::reference_selection(content, true)
+                .debug_selector(move || format!("transcript.search-match:{}", target.message))
+                .into_any_element(),
+        )
+    } else {
+        reading_column(content)
+    }
+}
+
+fn row_has_message(row: &RowPlan, snapshot: &Snapshot, message: Uuid) -> bool {
+    match row {
+        RowPlan::Message(index) | RowPlan::Plan { message: index, .. } => {
+            snapshot.messages[*index].id == message
+        }
+        RowPlan::Activity { messages, .. } => snapshot.messages[messages.clone()]
+            .iter()
+            .any(|m| m.id == message),
+        _ => false,
+    }
 }
 
 /// Centre a row on the transcript's reading measure.
@@ -2069,16 +2146,19 @@ fn message_menu(message: &ConversationMessage) -> Option<MenuModel> {
     if selected {
         sections.push(MenuSection::new(
             "selection",
-            vec![MenuItem::new(COPY_SELECTION, "Copy")],
+            vec![
+                MenuItem::new(COPY_SELECTION, "Copy"),
+                MenuItem::new(QUOTE_SELECTION, "Quote selection in prompt"),
+            ],
         ));
     }
     if has_copyable_text(message) {
         sections.push(MenuSection::new(
             "message",
-            vec![MenuItem::new(
-                COPY_MESSAGE,
-                if selected { "Copy Message" } else { "Copy" },
-            )],
+            vec![
+                MenuItem::new(COPY_MESSAGE, if selected { "Copy Message" } else { "Copy" }),
+                MenuItem::new(QUOTE_MESSAGE, "Quote message in prompt"),
+            ],
         ));
     }
     (!sections.is_empty()).then(|| MenuModel::new(sections))
@@ -2648,6 +2728,50 @@ fn image_input(
 }
 
 /// Act on a choice from a transcript context menu.
+pub(crate) fn quote_menu_choice(
+    owner: &str,
+    chosen: &str,
+    window: &mut Window,
+    cx: &mut App,
+) -> bool {
+    if !matches!(chosen, QUOTE_SELECTION | QUOTE_MESSAGE) {
+        return false;
+    }
+    let Some(target) = MenuTarget::parse(owner) else {
+        return true;
+    };
+    let Some(handle) = crate::AppHandle::get(cx) else {
+        return true;
+    };
+    let agent = MEMORY.with(|memory| {
+        memory
+            .borrow()
+            .threads
+            .get(&target.conversation)
+            .map(|thread| thread.agent)
+    });
+    if agent != handle.0.read(cx).snapshot.active_agent_id {
+        return true;
+    }
+    let text = if chosen == QUOTE_SELECTION {
+        selection::touches(&format!("{}:", target.message))
+            .then(selection::selected_text)
+            .flatten()
+    } else {
+        drawn_message(target.conversation, target.message).map(|message| copyable_text(&message))
+    };
+    if let (Some(agent), Some(text)) = (agent, text) {
+        crate::prompt_context::add(
+            &handle.0,
+            agent,
+            &fx_core::policy::prompt_context::quoted_reply(&text),
+            window,
+            cx,
+        );
+    }
+    true
+}
+
 pub(crate) fn apply_menu_choice(owner: &str, chosen: &str, cx: &mut App) {
     if chosen == COPY_SELECTION {
         selection::copy_selection(cx);

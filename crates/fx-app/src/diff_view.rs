@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use fx_core::GitRepositoryInfo;
 use fx_core::git::{DiffLine, DiffLineKind, DiffSection, SplitRow, SplitSide};
+use fx_core::policy::prompt_context::DiffSelection;
 use fx_core::policy::{DiffDisclosureState, DiffRowLayout};
 use fx_design::components::{
     DividerAxis, IconButtonProps, SegmentedOption, compact_action_toggle, divider_with_axis,
@@ -84,6 +85,7 @@ pub(super) struct DiffState {
     /// on every edit, and the selection must not.
     pub(super) selected_path: Option<String>,
     pub(super) navigator_visible: bool,
+    pub(super) selection: Option<DiffSelection>,
     pub(super) scroll: UniformListScrollHandle,
     task: Option<Task<()>>,
 }
@@ -101,6 +103,7 @@ impl Default for DiffState {
             disclosure: DiffDisclosureState::new(),
             selected_path: None,
             navigator_visible: true,
+            selection: None,
             scroll: UniformListScrollHandle::new(),
             task: None,
         }
@@ -120,6 +123,7 @@ impl DiffState {
     }
 
     fn drop_document(&mut self) {
+        self.selection = None;
         self.failed = None;
         self.document = None;
         self.shown = None;
@@ -499,6 +503,8 @@ fn header_row(
     let toggle_path = path.clone();
     let toggle = inspector.clone();
     let open_path = path.clone();
+    let reference_path = path.clone();
+    let reference_inspector = inspector.clone();
     let mut counts = div()
         .flex_shrink_0()
         .flex()
@@ -562,6 +568,16 @@ fn header_row(
         )
         .child(counts)
         .child(glyph_button(
+            SharedString::from(format!("diff-reference:{path}")),
+            Icon::PLUS_CIRCLE,
+            "Reference file in prompt",
+            move |_, window, cx| {
+                let _ = reference_inspector.update(cx, |this, cx| {
+                    this.add_file_reference(&reference_path, window, cx);
+                });
+            },
+        ))
+        .child(glyph_button(
             SharedString::from(format!("diff-open:{path}")),
             Icon::ARROW_UP_RIGHT_SQUARE,
             "Open in Editor",
@@ -589,6 +605,86 @@ fn widest_row(document: &DiffDocument, layout: &DiffRowLayout, collapsed: &[bool
 }
 
 impl Inspector {
+    fn context_target(&self, cx: &gpui::App) -> Option<uuid::Uuid> {
+        let state = self.state.read(cx);
+        (state.active_project()?.root_path == *self.project.as_ref()?)
+            .then_some(state.snapshot.active_agent_id)
+            .flatten()
+    }
+
+    fn add_file_reference(
+        &mut self,
+        path: &str,
+        window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(agent) = self.context_target(cx) else {
+            return;
+        };
+        let Some(root) = &self.project else {
+            return;
+        };
+        let text = fx_core::policy::prompt_context::file_reference(
+            &std::path::Path::new(root).join(path).to_string_lossy(),
+        );
+        crate::prompt_context::add(&self.state, agent, &text, window, cx);
+    }
+
+    fn add_diff_reference(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) {
+        let Some(agent) = self.context_target(cx) else {
+            return;
+        };
+        let Some(selection) = &self.diff.selection else {
+            return;
+        };
+        let Some(section) = self
+            .diff
+            .document
+            .as_ref()
+            .and_then(|doc| doc.sections.iter().find(|s| s.path == selection.path))
+        else {
+            return;
+        };
+        let Some(text) = selection.excerpt(section, self.diff.mode.title()) else {
+            return;
+        };
+        if crate::prompt_context::add(&self.state, agent, &text, window, cx) {
+            self.diff.selection = None;
+            cx.notify();
+        }
+    }
+
+    fn select_diff_line(
+        &mut self,
+        document: &Arc<DiffDocument>,
+        path: &str,
+        line: usize,
+        extend: bool,
+        cx: &mut Context<Self>,
+    ) {
+        // A click queued before a refresh must never select new text at the
+        // old coordinates.
+        if !self
+            .diff
+            .document
+            .as_ref()
+            .is_some_and(|shown| Arc::ptr_eq(shown, document))
+        {
+            return;
+        }
+        match &mut self.diff.selection {
+            Some(selection) if extend && selection.path == path => selection.head = line,
+            _ => {
+                self.diff.selection = Some(DiffSelection {
+                    path: path.into(),
+                    anchor: line,
+                    head: line,
+                })
+            }
+        }
+        cx.notify();
+    }
+
     /// Load the diff for the current comparison and snapshot, unless the one
     /// shown or loading already is that.
     pub(super) fn ensure_diff(&mut self, cx: &mut Context<Self>) {
@@ -617,6 +713,7 @@ impl Inspector {
         if !repository.files.iter().any(|file| key.mode.includes(file)) {
             // Nothing to compare: no read, and nothing stale left behind.
             self.diff.document = Some(Arc::new(DiffDocument::default()));
+            self.diff.selection = None;
             self.diff.shown = Some(key);
             self.diff.loading = None;
             self.diff.task = None;
@@ -650,6 +747,17 @@ impl Inspector {
         match result {
             Ok(document) => {
                 let anchor = self.diff.anchor();
+                if let Some(selection) = &self.diff.selection {
+                    let old = self
+                        .diff
+                        .document
+                        .as_ref()
+                        .and_then(|doc| doc.sections.iter().find(|s| s.path == selection.path));
+                    let new = document.sections.iter().find(|s| s.path == selection.path);
+                    if old != new {
+                        self.diff.selection = None;
+                    }
+                }
                 if let Some(selected) = &self.diff.selected_path
                     && !document.sections.iter().any(|s| &s.path == selected)
                 {
@@ -801,6 +909,20 @@ impl Inspector {
         };
         if let Some(notice) = &document.notice {
             body = body.child(note(notice, false));
+        }
+        if self.diff.selection.is_some() {
+            body = body.child(compact_action_toggle(
+                "Add selection to prompt",
+                Some(Icon::PLUS_CIRCLE),
+                false,
+                self.context_target(cx).is_some(),
+                cx.listener(|this, _, window, cx| this.add_diff_reference(window, cx)),
+            ));
+        } else {
+            body = body.child(note(
+                "Click a code line; Shift-click to select a range.",
+                false,
+            ));
         }
         if document.sections.is_empty() {
             return body
@@ -982,6 +1104,7 @@ impl Inspector {
         let selected = self.diff.selected_path.clone();
         let inspector = cx.weak_entity();
         let scroll = self.diff.scroll.clone();
+        let selection = self.diff.selection.clone();
         uniform_list("inspector.diff", count, move |range, _, _| {
             let theme = global::current();
             let pinned = if split {
@@ -1007,8 +1130,42 @@ impl Inspector {
                             &theme,
                             inspector.clone(),
                         ),
-                        Some(line) if split => split_row(section, line, metrics, &theme),
-                        Some(line) => inline_row(&section.lines[line], metrics, &theme),
+                        Some(line) if split => match section.split_rows.get(line) {
+                            Some(SplitRow::Pair { old, new }) => div()
+                                .h(px(metrics.height))
+                                .w_full()
+                                .flex()
+                                .child(selectable_diff_line(
+                                    split_half(section, *old, Column::Old, metrics, &theme),
+                                    &document,
+                                    section,
+                                    *old,
+                                    "old",
+                                    selection.as_ref(),
+                                    inspector.clone(),
+                                ))
+                                .child(divider_with_axis(DividerAxis::Vertical))
+                                .child(selectable_diff_line(
+                                    split_half(section, *new, Column::New, metrics, &theme),
+                                    &document,
+                                    section,
+                                    *new,
+                                    "new",
+                                    selection.as_ref(),
+                                    inspector.clone(),
+                                ))
+                                .into_any_element(),
+                            _ => split_row(section, line, metrics, &theme),
+                        },
+                        Some(line) => selectable_diff_line(
+                            inline_row(&section.lines[line], metrics, &theme),
+                            &document,
+                            section,
+                            Some(line),
+                            "inline",
+                            selection.as_ref(),
+                            inspector.clone(),
+                        ),
                     }
                 })
                 .collect::<Vec<_>>()
@@ -1027,6 +1184,45 @@ impl Inspector {
         .bg(Colors::content_bg(&theme))
         .into_any_element()
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn selectable_diff_line(
+    content: AnyElement,
+    document: &Arc<DiffDocument>,
+    section: &DiffSection,
+    index: Option<usize>,
+    side: &'static str,
+    selection: Option<&DiffSelection>,
+    inspector: WeakEntity<Inspector>,
+) -> AnyElement {
+    let selected =
+        index.is_some_and(|index| selection.is_some_and(|s| s.contains(&section.path, index)));
+    let row = fx_design::components::reference::reference_selection(content, selected)
+        .id(SharedString::from(format!(
+            "diff-select:{}:{side}:{index:?}",
+            section.path
+        )))
+        .debug_selector(move || format!("diff-select:{side}:{index:?}"))
+        .flex()
+        .flex_1()
+        .min_w_0()
+        .h_full();
+    let Some(index) = index
+        .filter(|&i| section.lines[i].old_line.is_some() || section.lines[i].new_line.is_some())
+    else {
+        return row.into_any_element();
+    };
+    let document = document.clone();
+    let path = section.path.clone();
+    row.cursor_pointer()
+        .on_mouse_down(gpui::MouseButton::Left, move |event, _, cx| {
+            let _ = inspector.update(cx, |this, cx| {
+                this.select_diff_line(&document, &path, index, event.modifiers.shift, cx)
+            });
+            cx.stop_propagation();
+        })
+        .into_any_element()
 }
 
 fn navigator_row(
@@ -1136,6 +1332,52 @@ mod tests {
             ["@@ -1,3 +1,2 @@", " keep", "-old", "-gone", "+new"],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn changed_diff_content_drops_its_selection_and_old_clicks_cannot_restore_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let test = gpui::TestAppContext::single();
+        test.update(|cx| {
+            let state = cx
+                .new(|cx| crate::state::AppState::restore(fx_store::AppPaths::at(temp.path()), cx));
+            let monitor = cx.new(|_| super::super::monitor::RepositoryMonitor::new(state.clone()));
+            let inspector = cx.new(|cx| Inspector::new(state, monitor, cx));
+            inspector.update(cx, |this, cx| {
+                let original = Arc::new(DiffDocument {
+                    sections: vec![section()],
+                    ..Default::default()
+                });
+                this.diff.document = Some(original.clone());
+                this.select_diff_line(&original, "a.rs", 2, false, cx);
+                let key = DiffKey {
+                    generation: 1,
+                    mode: ComparisonMode::Unstaged,
+                    revision: 1,
+                };
+                this.diff.loading = Some(key);
+                this.finish_diff(key, Ok((*original).clone()), cx);
+                assert!(
+                    this.diff.selection.is_some(),
+                    "an identical refresh keeps its range"
+                );
+                let changed = DiffDocument {
+                    sections: vec![
+                        parse_section(Some("a.rs".into()), ["@@ -1 +1 @@", "-different", "+now"])
+                            .unwrap(),
+                    ],
+                    ..Default::default()
+                };
+                this.diff.loading = Some(key);
+                this.finish_diff(key, Ok(changed), cx);
+                assert!(this.diff.selection.is_none());
+                this.select_diff_line(&original, "a.rs", 2, false, cx);
+                assert!(
+                    this.diff.selection.is_none(),
+                    "the old frame cannot select new text"
+                );
+            });
+        });
     }
 
     #[test]
