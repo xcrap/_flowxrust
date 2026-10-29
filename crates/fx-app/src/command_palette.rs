@@ -1019,6 +1019,126 @@ mod tests {
     }
 
     #[test]
+    fn find_preserves_the_current_message_across_refreshes_and_resets_for_a_new_query() {
+        fn settle(shell: &mut Shell) {
+            shell.test.run_until_parked();
+            shell
+                .test
+                .executor()
+                .advance_clock(std::time::Duration::from_millis(200));
+            shell.test.run_until_parked();
+            shell.test.refresh().unwrap();
+        }
+        fn selected(shell: &Shell) -> Option<(Uuid, bool)> {
+            shell.test.read(|cx| {
+                shell
+                    .state
+                    .read(cx)
+                    .search_target
+                    .map(|t| (t.message, t.pending))
+            })
+        }
+        let mut shell = shell();
+        let messages = [
+            fx_core::ConversationMessage::text(fx_core::MessageRole::User, "Needle first"),
+            fx_core::ConversationMessage::text(fx_core::MessageRole::Assistant, "Needle second"),
+            fx_core::ConversationMessage::text(fx_core::MessageRole::Assistant, "Needle third"),
+        ];
+        let conversation = shell.test.update(|cx| {
+            shell.state.update(cx, |state, cx| {
+                let conversation =
+                    state.conversation(state.active_project().unwrap().id, shell.threads[0]);
+                for message in &messages {
+                    conversation.lock().unwrap().append(message.clone());
+                }
+                cx.notify();
+                conversation
+            })
+        });
+        shell.keys("cmd-f");
+        shell.type_text("needle");
+        settle(&mut shell);
+        shell.keys("enter");
+        assert_eq!(selected(&shell), Some((messages[1].id, false)));
+
+        conversation
+            .lock()
+            .unwrap()
+            .append(fx_core::ConversationMessage::text(
+                fx_core::MessageRole::Assistant,
+                "Unrelated new result",
+            ));
+        shell
+            .test
+            .update(|cx| shell.state.update(cx, |_, cx| cx.notify()));
+        shell.test.run_until_parked();
+        assert_eq!(
+            selected(&shell),
+            Some((messages[1].id, false)),
+            "refresh must not clear the highlight"
+        );
+        // Navigation while the replacement search is pending wins over the
+        // selection it started with, and completion must not scroll again.
+        shell.keys("enter");
+        settle(&mut shell);
+        assert_eq!(selected(&shell), Some((messages[2].id, false)));
+
+        let inserted =
+            fx_core::ConversationMessage::text(fx_core::MessageRole::User, "Needle inserted");
+        conversation.lock().unwrap().replace_full_history(
+            std::iter::once(inserted.clone())
+                .chain(messages.iter().cloned())
+                .collect(),
+        );
+        shell
+            .test
+            .update(|cx| shell.state.update(cx, |_, cx| cx.notify()));
+        settle(&mut shell);
+        assert_eq!(
+            selected(&shell),
+            Some((messages[2].id, false)),
+            "preserve identity, not result index"
+        );
+
+        conversation.lock().unwrap().replace_full_history(vec![
+            inserted,
+            messages[0].clone(),
+            messages[1].clone(),
+        ]);
+        shell
+            .test
+            .update(|cx| shell.state.update(cx, |_, cx| cx.notify()));
+        settle(&mut shell);
+        assert_eq!(
+            selected(&shell),
+            Some((messages[1].id, false)),
+            "a removed match falls back to the nearest remaining hit"
+        );
+
+        shell.keys("cmd-a");
+        shell.type_text("first");
+        settle(&mut shell);
+        assert_eq!(
+            selected(&shell),
+            Some((messages[0].id, false)),
+            "a changed query starts at its first match"
+        );
+        conversation
+            .lock()
+            .unwrap()
+            .replace_full_history(Vec::new());
+        shell
+            .test
+            .update(|cx| shell.state.update(cx, |_, cx| cx.notify()));
+        settle(&mut shell);
+        assert_eq!(
+            selected(&shell),
+            None,
+            "no matches must leave no stale highlight"
+        );
+    }
+
+    #[test]
     fn find_cycles_matching_messages_and_closes_when_leaving_the_thread() {
         let mut shell = shell();
         let messages = [

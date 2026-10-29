@@ -857,22 +857,28 @@ pub struct PersistedUnsentPrompt {
 }
 
 impl PersistedConversation {
+    /// Local input still owed to the user, even when the provider removes its
+    /// session. These records must remain reachable for recovery.
+    pub fn has_pending_input(&self) -> bool {
+        self.unsent_prompt.is_some()
+            || !self.draft_text.is_empty()
+            || self
+                .draft_attachments
+                .as_ref()
+                .is_some_and(|images| !images.is_empty())
+            || !self.queued.is_empty()
+    }
+
     /// Whether this thread is worth writing at all.
     ///
     /// An unopened provider thread has nothing to save. Writing it anyway would
     /// truncate every other thread's cache and prune its images on quit.
     pub fn is_worth_persisting(&self) -> bool {
         !self.messages.is_empty()
-            || self.unsent_prompt.is_some()
-            || !self.draft_text.is_empty()
-            || self
-                .draft_attachments
-                .as_ref()
-                .is_some_and(|images| !images.is_empty())
+            || self.has_pending_input()
             || self.session_id.is_some()
             || self.total_tokens > 0
             || self.goal.is_some()
-            || !self.queued.is_empty()
     }
 
     /// Build a persisted record from a thread's messages.
@@ -1431,6 +1437,38 @@ mod tests {
             vec![ConversationMessage::text(MessageRole::User, "hi")],
         );
         assert!(persisted.is_worth_persisting());
+    }
+
+    #[test]
+    fn pending_input_includes_image_only_drafts_and_queues_but_not_history() {
+        let mut saved = PersistedConversation::from_messages(
+            Uuid::nil(),
+            vec![ConversationMessage::text(MessageRole::User, "sent")],
+        );
+        saved.session_id = Some("session".into());
+        assert!(!saved.has_pending_input());
+        let image = fx_core::Attachment::new(vec![1, 2, 3], "image/png", "draft.png");
+        saved.draft_attachments = Some(vec![image.clone()]);
+        let read: PersistedConversation =
+            serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+        assert!(read.has_pending_input());
+        saved.draft_attachments = Some(Vec::new());
+        assert!(
+            !saved.has_pending_input(),
+            "removing an image clears its protection"
+        );
+        saved.queued.push(PersistedQueuedPrompt {
+            id: Uuid::new_v4(),
+            text: String::new(),
+            attachments: vec![image],
+        });
+        assert!(saved.has_pending_input());
+        saved.queued.clear();
+        saved.draft_text = "draft".into();
+        assert!(saved.has_pending_input());
+        saved.draft_text.clear();
+        saved.unsent_prompt = Some(PersistedUnsentPrompt::new(String::new(), 1, None));
+        assert!(saved.has_pending_input());
     }
 
     #[test]

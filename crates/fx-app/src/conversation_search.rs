@@ -270,15 +270,17 @@ impl ConversationFind {
         self.generation += 1;
         self.task = None;
         self.cancellation = None;
-        self.results = Results::default();
-        self.current = 0;
         let query = self.query.read(cx).value().trim().to_string();
+        if query != self.searched_query {
+            self.results = Results::default();
+            self.current = 0;
+            self.state.update(cx, |state, cx| {
+                state.search_target = None;
+                cx.notify();
+            });
+        }
         self.searched_query = query.clone();
         self.searching = !query.is_empty();
-        self.state.update(cx, |state, cx| {
-            state.search_target = None;
-            cx.notify();
-        });
         if !self.searching {
             cx.notify();
             return;
@@ -306,9 +308,17 @@ impl ConversationFind {
                 if this.generation != generation {
                     return;
                 }
+                // Read the current hit when the results land: the user may
+                // have navigated while this refresh was running.
+                let selected = this.results.hits.get(this.current).map(|hit| hit.message);
+                this.current = selected
+                    .and_then(|id| results.hits.iter().position(|hit| hit.message == id))
+                    .unwrap_or_else(|| this.current.min(results.hits.len().saturating_sub(1)));
                 this.results = results;
                 this.searching = false;
-                this.show_current(cx);
+                if this.results.hits.get(this.current).map(|hit| hit.message) != selected {
+                    this.show_current(cx);
+                }
                 cx.notify();
             });
         }));
@@ -321,6 +331,11 @@ impl ConversationFind {
         }
         if let Some(hit) = self.results.hits.get(self.current) {
             reveal(&self.state, hit.agent, hit.message, cx);
+        } else {
+            self.state.update(cx, |state, cx| {
+                state.search_target = None;
+                cx.notify();
+            });
         }
     }
 

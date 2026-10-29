@@ -198,6 +198,8 @@ struct FieldGeometry {
     painted_scroll: Point<Pixels>,
     #[cfg(test)]
     first_painted_text_origin: Option<Point<Pixels>>,
+    #[cfg(test)]
+    painted_lines: Vec<usize>,
 }
 
 /// The field state the element needs while it draws, snapshotted so painting
@@ -1274,18 +1276,40 @@ impl Element for TextFieldElement {
             .first_painted_text_origin
             .get_or_insert(origin);
 
+        let visible = self
+            .layout
+            .visible_rows(self.layout.scroll_y..self.layout.scroll_y + content.size.height);
+        let lines = match (visible.first(), visible.last()) {
+            (Some(first), Some(last)) => first.line..last.line + 1,
+            _ => 0..0,
+        };
+        #[cfg(test)]
+        self.geometry.borrow_mut().painted_lines.clear();
         window.with_content_mask(Some(ContentMask { bounds: content }), |window| {
-            self.paint_selection(origin, &theme, window);
+            self.paint_selection(visible, origin, &theme, window);
             paint_shaped(
                 &self.layout.shaped,
-                |line| self.layout.line_top(line),
+                lines,
+                |line| {
+                    #[cfg(test)]
+                    self.geometry.borrow_mut().painted_lines.push(line);
+                    self.layout.line_top(line)
+                },
                 &self.metrics,
                 origin,
                 window,
                 cx,
             );
             if let Some(placeholder) = &self.placeholder {
-                paint_shaped(placeholder, |_| px(0.0), &self.metrics, origin, window, cx);
+                paint_shaped(
+                    placeholder,
+                    0..1,
+                    |_| px(0.0),
+                    &self.metrics,
+                    origin,
+                    window,
+                    cx,
+                );
             }
             self.paint_caret(origin, &theme, window);
         });
@@ -1294,9 +1318,15 @@ impl Element for TextFieldElement {
 
 impl TextFieldElement {
     /// One rectangle per visual row the selection touches.
-    fn paint_selection(&self, origin: Point<Pixels>, theme: &Theme, window: &mut Window) {
+    fn paint_selection(
+        &self,
+        visible: &[VisualRow],
+        origin: Point<Pixels>,
+        theme: &Theme,
+        window: &mut Window,
+    ) {
         let selection = self.snapshot.selection.range();
-        for row in &self.layout.rows {
+        for row in visible {
             let start = row.start.max(selection.start);
             let end = row.end.min(selection.end);
             if start >= end {
@@ -1430,6 +1460,9 @@ enum ShapedText {
 struct LogicalLine {
     /// Byte offset of the line's first character in the value.
     start: usize,
+    /// Cached while building rows; painting must not scan all preceding rows
+    /// for each line in a large pasted draft.
+    top: Pixels,
     shape: LineShape,
 }
 
@@ -1614,10 +1647,19 @@ impl TextLayout {
 
     /// The top of a logical line's first visual row.
     fn line_top(&self, line: usize) -> Pixels {
-        self.rows
-            .iter()
-            .find(|row| row.line == line && row.index_in_line == 0)
-            .map_or(px(0.0), |row| row.top)
+        self.lines.get(line).map_or(px(0.0), |line| line.top)
+    }
+
+    /// Rows intersecting the viewport, including partially visible wraps.
+    fn visible_rows(&self, viewport: Range<Pixels>) -> &[VisualRow] {
+        if viewport.end <= viewport.start {
+            return &[];
+        }
+        let start = self
+            .rows
+            .partition_point(|row| row.top + row.height <= viewport.start);
+        let end = self.rows.partition_point(|row| row.top < viewport.end);
+        &self.rows[start..end]
     }
 
     /// The row a byte offset falls on. A byte at a wrap boundary belongs to the
@@ -1723,6 +1765,7 @@ fn build_layout(
     match &shaped {
         ShapedText::Single(line) => lines.push(LogicalLine {
             start: 0,
+            top: px(0.0),
             shape: LineShape::Single(Arc::clone(&***line)),
         }),
         ShapedText::Wrapped(wrapped) => {
@@ -1731,6 +1774,7 @@ fn build_layout(
                 let len = line.len();
                 lines.push(LogicalLine {
                     start,
+                    top: px(0.0),
                     shape: LineShape::Wrapped(Arc::new(line.clone())),
                 });
                 // `shape_text` splits on '\n' and reports each line without it.
@@ -1740,7 +1784,8 @@ fn build_layout(
     }
 
     let mut rows = Vec::new();
-    for (index, line) in lines.iter().enumerate() {
+    for (index, line) in lines.iter_mut().enumerate() {
+        line.top = metrics.line_height * rows.len() as f32;
         let shape = &line.shape;
         for row in 0..shape.row_count() {
             let (from, to) = shape.row_bounds(row);
@@ -1891,6 +1936,7 @@ fn text_run(text: &str, metrics: &FieldMetrics, color: gpui::Rgba) -> TextRun {
 /// one of its rows from wherever it is handed.
 fn paint_shaped(
     shaped: &ShapedText,
+    visible: Range<usize>,
     line_top: impl Fn(usize) -> Pixels,
     metrics: &FieldMetrics,
     origin: Point<Pixels>,
@@ -1904,7 +1950,12 @@ fn paint_shaped(
             }
         }
         ShapedText::Wrapped(lines) => {
-            for (index, line) in lines.iter().enumerate() {
+            for (index, line) in lines
+                .iter()
+                .enumerate()
+                .take(visible.end)
+                .skip(visible.start)
+            {
                 let at = point(origin.x, origin.y + line_top(index));
                 if let Err(error) =
                     line.paint(at, metrics.line_height, TextAlign::Left, None, window, cx)
@@ -3965,6 +4016,71 @@ mod tests {
         window
             .update(&mut test, |_window, _entity, _cx| {})
             .expect("the window is still alive");
+    }
+
+    #[test]
+    fn a_large_multiline_draft_paints_only_the_visible_lines_and_keeps_full_selection() {
+        let mut test = gpui::TestAppContext::single();
+        let value = "x\n".repeat(10_000);
+        let field =
+            test.update(|cx| cx.new(|cx| TextField::new(cx).multiline(4.0).max_len(32_000)));
+        test.update(|cx| field.update(cx, |field, cx| field.set_value(value.clone(), cx)));
+        let _window = mount_at_width(&mut test, &field, 300.0);
+        test.refresh().unwrap();
+        test.read(|cx| {
+            let lines = field.read(cx).geometry.borrow().painted_lines.clone();
+            assert!(
+                lines.first().is_some_and(|line| *line > 9_990),
+                "the caret at the end must reveal the tail: {lines:?}"
+            );
+            assert!(
+                lines.len() <= 5,
+                "offscreen logical lines were painted: {lines:?}"
+            );
+        });
+        test.update(|cx| {
+            field.update(cx, |field, cx| {
+                field.select_all();
+                assert_eq!(
+                    field.selected_text(),
+                    value,
+                    "culling must not truncate selection"
+                );
+                field.selection = Selection::collapsed(0);
+                cx.notify();
+            })
+        });
+        test.refresh().unwrap();
+        test.read(|cx| {
+            let lines = field.read(cx).geometry.borrow().painted_lines.clone();
+            assert_eq!(lines.first(), Some(&0));
+            assert!(lines.len() <= 5);
+        });
+    }
+
+    #[test]
+    fn visible_rows_and_line_origins_account_for_wraps_and_partial_rows() {
+        with_layout(&format!("{WIDE}\n\nlast"), 3.0, 90.0, |layout| {
+            assert!(layout.lines[0].shape.row_count() > 1);
+            for (index, line) in layout.lines.iter().enumerate() {
+                let first = layout.rows.iter().find(|row| row.line == index).unwrap();
+                assert_eq!(layout.line_top(index), first.top);
+                assert_eq!(line.top, first.top);
+            }
+            let height = layout.line_height;
+            let visible = layout.visible_rows(height * 1.5..height * 3.5);
+            assert_eq!(visible.len(), 3, "both partial edge rows must paint");
+            assert_eq!(visible[0].top, height);
+            let visible = layout.visible_rows(height..height * 3.0);
+            assert_eq!(visible.len(), 2, "touching an edge is not intersection");
+            assert!(layout.visible_rows(height..height).is_empty());
+            assert!(layout.visible_rows(px(-40.0)..px(-20.0)).is_empty());
+            assert!(
+                layout
+                    .visible_rows(height * 100.0..height * 101.0)
+                    .is_empty()
+            );
+        });
     }
 
     #[test]

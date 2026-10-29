@@ -2901,15 +2901,19 @@ impl AppState {
                                 .restored_drafts
                                 .get(&id)
                                 .is_some_and(|draft| !draft.is_empty())
+                            || !self.attachments(id).is_empty()
                             || self.conversations.get(&id).is_some_and(|conversation| {
-                                conversation
+                                let conversation = conversation
                                     .lock()
-                                    .unwrap_or_else(|error| error.into_inner())
-                                    .unsent()
-                                    .is_some()
+                                    .unwrap_or_else(|error| error.into_inner());
+                                conversation.unsent().is_some()
+                                    || conversation.queued().next().is_some()
                             });
-                        if !present.contains(&binding.session_id)
-                            && !protected
+                        if protected {
+                            // A previous build may already have hidden an
+                            // image-only draft. Recovery must make it reachable.
+                            record.missing_native_agent_ids.retain(|agent| *agent != id);
+                        } else if !present.contains(&binding.session_id)
                             && !record.missing_native_agent_ids.contains(&id)
                         {
                             record.missing_native_agent_ids.push(id);
@@ -8286,6 +8290,115 @@ mod native_sync_tests {
                     .runners
                     .insert(agent, crate::session::TurnRunner::detached().0);
                 assert_eq!(state.waiting_elsewhere(agent), None);
+            })
+        });
+    }
+
+    #[test]
+    fn image_only_drafts_keep_missing_native_threads_visible_live_and_after_relaunch() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_string_lossy().to_string();
+        let paths = AppPaths::at(temp.path().join("store"));
+        let test = gpui::TestAppContext::single();
+        let (state, project) = test.update(|cx| setup(cx, paths.clone(), &root));
+        let second_id = test.update(|cx| {
+            state.update(cx, |state, cx| {
+                let first = entry(&root, "codex", "first", "First");
+                let second = entry(&root, "codex", "second", "Second");
+                index(
+                    state,
+                    project,
+                    "codex",
+                    vec![first.clone(), second],
+                    Vec::new(),
+                );
+                let second_id = state.snapshot.projects[0]
+                    .native_bindings
+                    .iter()
+                    .find(|binding| binding.session_id == "second")
+                    .unwrap()
+                    .agent_id;
+                state.conversation(project, second_id);
+                state.composer.attachments.insert(
+                    second_id,
+                    Arc::new(vec![fx_core::Attachment::new(
+                        vec![1, 2, 3],
+                        "image/png",
+                        "draft.png",
+                    )]),
+                );
+                // A poll can land before the next autosave. The live image alone
+                // must protect the inactive chat.
+                index(state, project, "codex", vec![first], Vec::new());
+                assert!(
+                    state
+                        .active_agents()
+                        .iter()
+                        .any(|agent| agent.id == second_id)
+                );
+                state.save_all(cx);
+                second_id
+            })
+        });
+
+        let reopened = test.update(|cx| cx.new(|cx| AppState::restore(paths, cx)));
+        test.update(|cx| {
+            reopened.update(cx, |state, _| {
+                assert!(!state.conversations.contains_key(&second_id));
+                // Model a cache hidden by the older image-blind policy.
+                state.snapshot.projects[0]
+                    .missing_native_agent_ids
+                    .push(second_id);
+                assert!(
+                    !state
+                        .active_agents()
+                        .iter()
+                        .any(|agent| agent.id == second_id)
+                );
+                let mut warnings = Vec::new();
+                let protected = crate::native_sync::protect_missing_thread(
+                    &state.store,
+                    project,
+                    second_id,
+                    &mut warnings,
+                );
+                assert!(
+                    protected,
+                    "an unopened image-only draft must stay reachable"
+                );
+                assert!(warnings.is_empty());
+                state.apply_native_completion(Completion {
+                    ticket: Ticket {
+                        project,
+                        root: root.clone(),
+                        provider: "codex".into(),
+                        generation: state.native_sync.generation(project),
+                        kind: RequestKind::Index {
+                            candidates: Vec::new(),
+                            missing_candidates: Vec::new(),
+                        },
+                    },
+                    result: Ok(Payload::Index {
+                        index: NativeThreadIndex {
+                            threads: Vec::new(),
+                            warnings,
+                        },
+                        sessions: Vec::new(),
+                        protected: vec![second_id],
+                    }),
+                });
+                assert!(
+                    state
+                        .active_agents()
+                        .iter()
+                        .any(|agent| agent.id == second_id)
+                );
+                let conversation = state
+                    .store
+                    .load_conversation(project, second_id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(conversation.draft_attachments.unwrap().len(), 1);
             })
         });
     }

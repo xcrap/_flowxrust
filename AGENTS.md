@@ -340,6 +340,11 @@ explicit empty list, so removing a failed prompt's image stays removed after
 relaunch. Image ids participate in the save version; checkpoints share the bytes
 with the writer instead of copying them on the UI thread.
 
+Native discovery keeps a missing thread visible while it has local input,
+including image-only drafts and queued prompts. Check both the live composer
+and an unopened thread's saved `has_pending_input`, or a saved image can remain
+on disk with no chat left in the sidebar to recover it from.
+
 Images imported while a draft loads are merged with its saved images. The save
 version remembers only the disk's image ids, so that merge is saved even without
 a text edit. Each import owns a ticket; an in-place Reset, Delete and project
@@ -844,6 +849,11 @@ Five more, each of which was a bug first:
   adding the column too put every click on a later row at its end. It also
   truncates `y / line_height`, so ask for a row at its middle.
 
+Logical lines cache their vertical origins when rows are built. Painting looks
+up those origins directly and visits only lines and selection rectangles that
+intersect the viewport. Scanning preceding rows for every painted line made a
+large multiline draft quadratic, even when almost all of it was clipped.
+
 ### Running a turn
 
 The runner owns a `CodexSession` for a turn's lifetime and writes events into
@@ -870,6 +880,10 @@ never asks and FlowX never gets to refuse. The access level has to be
 `Supervised` or `AcceptEdits` for the policy to mean anything.
 
 ### Scrolling
+
+Conversation Find preserves the selected message id when history refreshes,
+including navigation made while the search is pending. Only a changed query
+starts at the first match; an unchanged match must not request another scroll.
 
 GPUI 0.2.2's scrollable elements have **no keyboard handling at all**. The
 Swift original got arrows and page keys from `NSScrollView` for free, so the

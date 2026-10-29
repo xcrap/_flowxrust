@@ -223,14 +223,8 @@ impl Worker {
                             }).collect();
                             let protected = missing_candidates.iter().filter_map(|(agent, session)| {
                                 if index.threads.iter().any(|entry| entry.summary.identity.session_id == *session) { return None; }
-                                match store.load_conversation(ticket.project, *agent) {
-                                    Ok(Some(conversation)) if !conversation.draft_text.is_empty() || conversation.unsent_prompt.is_some() => Some(*agent),
-                                    Err(error) => {
-                                        index.warnings.push(format!("Could not check a missing native thread's saved draft: {error}"));
-                                        Some(*agent)
-                                    }
-                                    _ => None,
-                                }
+                                protect_missing_thread(&store, ticket.project, *agent, &mut index.warnings)
+                                    .then_some(*agent)
                             }).collect();
                             Payload::Index { index, sessions, protected }
                         })
@@ -255,6 +249,26 @@ impl Worker {
             receiver,
             pending: None,
         })
+    }
+}
+
+/// Unopened chats have no live composer to inspect. Keep every kind of saved
+/// input reachable, and fail closed when its recovery file cannot be read.
+pub(crate) fn protect_missing_thread(
+    store: &fx_store::Store,
+    project: Uuid,
+    agent: Uuid,
+    warnings: &mut Vec<String>,
+) -> bool {
+    match store.load_conversation(project, agent) {
+        Ok(Some(conversation)) => conversation.has_pending_input(),
+        Err(error) => {
+            warnings.push(format!(
+                "Could not check a missing native thread's saved draft: {error}"
+            ));
+            true
+        }
+        Ok(None) => false,
     }
 }
 
