@@ -24,6 +24,7 @@ impl gpui::Global for UiHandle {}
 
 #[derive(Default)]
 pub struct WorkspaceUi {
+    pub(crate) new_chat: Option<Entity<crate::new_chat::NewChat>>,
     pub settings: Option<Entity<SettingsSheet>>,
     pub request: Option<Entity<RequestPanel>>,
     pub thread_dialog: Option<Entity<crate::thread_actions::ThreadDialog>>,
@@ -47,7 +48,10 @@ pub fn has_modal(state: &Entity<AppState>, cx: &App) -> bool {
         || state.read(cx).palette.is_some()
         || cx.try_global::<UiHandle>().is_some_and(|handle| {
             let ui = handle.0.read(cx);
-            ui.settings.is_some() || ui.thread_dialog.is_some() || ui.request.is_some()
+            ui.settings.is_some()
+                || ui.thread_dialog.is_some()
+                || ui.new_chat.is_some()
+                || ui.request.is_some()
         })
 }
 
@@ -357,6 +361,7 @@ impl WorkspaceUi {
         // that request until the reader closes the current dialog.
         if self.settings.is_some()
             || self.thread_dialog.is_some()
+            || self.new_chat.is_some()
             || state.read(cx).picker.is_some()
         {
             return;

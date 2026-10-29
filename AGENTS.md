@@ -369,6 +369,27 @@ inspector's geometry is declared in both `PersistedApp` and `Layout`.
 `the_persisted_defaults_match_the_design_metrics` in `fx-app` is the only test
 that sees both, and is therefore the only place the duplication can be caught.
 
+## Chat worktrees
+
+An agent's optional `ChatWorkspace` binds it to a linked Git checkout. Missing
+means the project folder; malformed metadata stays unreadable rather than
+silently selecting another folder. `AppState::project_root_for` is the execution
+root for prompts, recovery and native history; `active_workspace_root` also
+routes the inspector and context references. Project-level native discovery
+must not mark worktree bindings missing or clear their external-waiting status.
+
+New worktrees use a new branch at the current commit. Creation never copies,
+stages or stashes source edits, never forces an existing path or branch, and
+runs on the Git worker. The chat is selected only after its binding is saved.
+If saving fails, the dialog retains the prepared checkout for another save.
+Archive, Delete and project removal keep checkout files and branches.
+
+Before a provider starts or the inspector commits/pushes, validate the saved
+path, common Git directory and worktree registration. Never fall back to the
+project when a worktree is missing. Reset keeps the checkout while retiring the
+provider session. Worktrees live in the private app data directory, independent
+of conversation cache deletion.
+
 ## Runtime discovery
 
 Neither provider CLI is bundled. Both are the user's own install, found at launch

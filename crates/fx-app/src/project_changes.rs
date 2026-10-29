@@ -80,7 +80,7 @@ impl Render for ProjectChanges {
         };
         let partial = snapshot.notice.is_some();
         let mut detail = format!(
-            "{} changed {} · Live project working tree\nClick to toggle Changes · Includes staged, unstaged and new files",
+            "{} changed {} · Current chat workspace\nClick to toggle Changes · Includes staged, unstaged and new files",
             repo.files.len(),
             if repo.files.len() == 1 {
                 "file"

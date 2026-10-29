@@ -607,7 +607,7 @@ fn widest_row(document: &DiffDocument, layout: &DiffRowLayout, collapsed: &[bool
 impl Inspector {
     fn context_target(&self, cx: &gpui::App) -> Option<uuid::Uuid> {
         let state = self.state.read(cx);
-        (state.active_project()?.root_path == *self.project.as_ref()?)
+        (state.active_workspace_root()? == *self.project.as_ref()?)
             .then_some(state.snapshot.active_agent_id)
             .flatten()
     }

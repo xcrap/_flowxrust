@@ -402,13 +402,9 @@ fn project_row(
                 .ghost(),
             {
                 let state = state.clone();
-                move |_, _, cx| {
+                move |_, window, cx| {
                     cx.stop_propagation();
-                    state.update(cx, |state, cx| {
-                        state.save_all(cx);
-                        state.apply_menu_choice(&format!("project:{id}"), "new-thread");
-                        cx.notify();
-                    });
+                    crate::new_chat::open(state.clone(), Some(id), window, cx);
                 }
             },
         ))
@@ -814,6 +810,7 @@ fn thread_menu(archived: bool, busy: bool, thread_id: Option<&str>) -> MenuModel
         "actions",
         vec![
             MenuItem::new("rename", "Rename thread…").enabled(!busy),
+            MenuItem::new("reveal-workspace", "Reveal workspace in Finder"),
             if archived {
                 MenuItem::new("unarchive", "Restore thread").enabled(!busy)
             } else {
@@ -1486,11 +1483,16 @@ mod tests {
     }
 
     #[test]
-    fn running_threads_cannot_be_renamed_archived_or_deleted_but_can_copy_their_id() {
+    fn running_threads_allow_only_copying_the_id_and_revealing_the_workspace() {
         for archived in [false, true] {
             let menu = thread_menu(archived, true, Some("thread-123"));
             for item in menu.sections().iter().flat_map(|s| &s.items) {
-                assert_eq!(item.enabled, item.id == "copy-thread-id", "{}", item.id);
+                assert_eq!(
+                    item.enabled,
+                    matches!(item.id.as_str(), "copy-thread-id" | "reveal-workspace"),
+                    "{}",
+                    item.id
+                );
             }
         }
     }

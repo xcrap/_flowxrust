@@ -252,6 +252,11 @@ impl Inspector {
         cx: &Context<Self>,
     ) -> Option<(std::path::PathBuf, GitRepositoryInfo, String)> {
         let monitor = self.monitor.read(cx);
+        if monitor.error().is_some()
+            || self.state.read(cx).active_workspace_root().as_deref() != monitor.project()
+        {
+            return None;
+        }
         let snapshot = monitor.snapshot()?;
         Some((
             snapshot.root.clone(),
@@ -272,7 +277,17 @@ impl Inspector {
         Fut: std::future::Future<Output = Result<String, String>> + Send + 'static,
     {
         self.composer.outcome = None;
-        let job = repository::spawn_git(job);
+        let workspace = self
+            .state
+            .read(cx)
+            .active_agent()
+            .and_then(|agent| agent.workspace);
+        let job = repository::spawn_git(move || async move {
+            if let Some(workspace) = workspace {
+                fx_core::git::worktree::validate(&workspace).await?;
+            }
+            job().await
+        });
         let target = project.clone();
         let task = cx.spawn(async move |this, cx| {
             let result = repository::finish_git(job).await;

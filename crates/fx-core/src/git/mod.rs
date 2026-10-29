@@ -5,6 +5,7 @@ pub mod diff;
 pub mod operations;
 pub mod revision;
 pub mod status_parser;
+pub mod worktree;
 
 pub use command::{
     CommandOutput, CommandSpec, ContentRevisionBuilder, DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_TIMEOUT,

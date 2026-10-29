@@ -163,7 +163,7 @@ impl Render for ThreadDialog {
                     div()
                         .fx_caption()
                         .text_color(Colors::fg_secondary(&theme))
-                        .child("This deletes the saved conversation and draft from FlowX. Project files and the provider's own history are kept. This cannot be undone."),
+                        .child("This deletes the saved conversation and draft from FlowX. Project files, worktrees, branches and the provider's own history are kept. This cannot be undone."),
                 );
         } else {
             body = body.child(self.field.clone());

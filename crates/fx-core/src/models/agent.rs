@@ -13,6 +13,10 @@ use super::{Timestamp, now};
 pub struct Agent {
     pub id: Uuid,
     pub title: String,
+    /// A dedicated Git checkout. Missing means the project's current folder.
+    /// Malformed bindings fail decoding rather than falling back to another directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<ChatWorkspace>,
     #[serde(default)]
     pub configuration: AgentConfiguration,
     #[serde(default)]
@@ -25,6 +29,7 @@ impl Agent {
         Self {
             id: Uuid::new_v4(),
             title: title.into(),
+            workspace: None,
             configuration: AgentConfiguration::default(),
             execution_state: AgentExecutionState::Idle,
             created_at: now(),
@@ -35,11 +40,21 @@ impl Agent {
         Self {
             id,
             title: title.into(),
+            workspace: None,
             configuration: AgentConfiguration::default(),
             execution_state: AgentExecutionState::Idle,
             created_at: now(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatWorkspace {
+    pub path: String,
+    pub repository: String,
+    pub common_dir: String,
+    pub branch: String,
+    pub base_commit: String,
 }
 
 /// Where a thread is in its lifecycle.

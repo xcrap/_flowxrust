@@ -394,6 +394,7 @@ impl TurnRunner {
             conversation: conversation.clone(),
             provider,
             project_root,
+            workspace: agent.workspace.clone(),
             prompt: work.prompt,
             attachments: work.attachments,
             control: work.control,
@@ -524,6 +525,7 @@ struct Job {
     conversation: Arc<Mutex<Conversation>>,
     provider: RuntimeProvider,
     project_root: String,
+    workspace: Option<fx_core::models::agent::ChatWorkspace>,
     prompt: String,
     /// Images sent with the prompt, written to private files for the turn.
     attachments: Vec<fx_core::Attachment>,
@@ -575,6 +577,19 @@ impl Job {
         responses: tokio::sync::mpsc::UnboundedReceiver<UserResponse>,
     ) {
         let _handles_stay_alive = (&self.interrupt, &self.responses);
+        if let Some(workspace) = &self.workspace {
+            if self.project_root != workspace.path {
+                self.fail(
+                    "Workspace mismatch:",
+                    "This chat must run in its saved worktree.",
+                );
+                return;
+            }
+            if let Err(error) = fx_core::git::worktree::validate(workspace).await {
+                self.fail("Worktree unavailable:", &error);
+                return;
+            }
+        }
         // Taken once, here: whichever loop drives the turn owns the receiver.
         // A runner built without one gets a closed channel, which never fires.
         let steers = self
@@ -2676,6 +2691,7 @@ for worker in workers: worker.join()
                     .with_arguments(vec![self.script.display().to_string()]),
                 },
                 project_root: self.dir.path().display().to_string(),
+                workspace: None,
                 prompt: prompt.into(),
                 attachments: Vec::new(),
                 control: None,
@@ -2698,6 +2714,41 @@ for worker in workers: worker.join()
                 .map(|line| serde_json::from_str(line).unwrap())
                 .collect()
         }
+    }
+
+    #[tokio::test]
+    async fn missing_worktree_fails_before_launching_a_provider() {
+        let Some(server) = ClaudeFixture::new() else {
+            return;
+        };
+        let conversation = conversation();
+        let recorder = Recorder::default();
+        let sink = recorder.clone();
+        let mut job = server.job(&conversation, "Keep this prompt", move |update| {
+            sink.record(update)
+        });
+        job.project_root = server
+            .dir
+            .path()
+            .join("missing")
+            .to_string_lossy()
+            .to_string();
+        job.workspace = Some(fx_core::models::agent::ChatWorkspace {
+            path: job.project_root.clone(),
+            repository: server.dir.path().to_string_lossy().to_string(),
+            common_dir: "unused".into(),
+            branch: "flowx/test".into(),
+            base_commit: "fixture".into(),
+        });
+        let (_interrupt, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (_responses, answers) = tokio::sync::mpsc::unbounded_channel();
+        job.run(receiver, answers).await;
+        assert!(recorder.updates().iter().any(|update| matches!(update,
+            SessionUpdate::Failed { reason } if reason.contains("Worktree unavailable"))));
+        assert!(
+            !server.log.exists(),
+            "the provider must never start in another folder"
+        );
     }
 
     fn wait_for_interaction(recorder: &Recorder) -> ProviderEvent {
@@ -3183,6 +3234,7 @@ for worker in workers: worker.join()
                     .with_arguments(vec![server.script.display().to_string()]),
                 },
                 project_root: server.dir.path().display().to_string(),
+                workspace: None,
                 prompt: prompt.into(),
                 attachments: Vec::new(),
                 control: None,

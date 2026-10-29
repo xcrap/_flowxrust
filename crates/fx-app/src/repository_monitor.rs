@@ -101,9 +101,7 @@ impl RepositoryMonitor {
     /// from every render.
     pub(crate) fn sync(&mut self, cx: &mut Context<Self>) {
         let state = self.state.read(cx);
-        let project = state
-            .active_project()
-            .map(|project| project.root_path.clone());
+        let project = state.active_workspace_root();
         let busy = state.is_busy();
         if self.project != project {
             self.project = project;
@@ -149,7 +147,15 @@ impl RepositoryMonitor {
         self.loading = true;
         self.reads += 1;
         let generation = self.generation;
+        let workspace = self
+            .state
+            .read(cx)
+            .active_agent()
+            .and_then(|agent| agent.workspace);
         let job = repository::spawn_git(move || async move {
+            if let Some(workspace) = workspace {
+                fx_core::git::worktree::validate(&workspace).await?;
+            }
             repository::changes_snapshot(&PathBuf::from(root)).await
         });
         self.read_task = Some(cx.spawn(async move |this, cx| {

@@ -119,7 +119,11 @@ impl Inspector {
 
     /// The repository as last read, if the project is one.
     fn repository<'a>(&self, cx: &'a App) -> Option<&'a GitRepositoryInfo> {
-        self.monitor.read(cx).snapshot()?.repository.as_ref()
+        let monitor = self.monitor.read(cx);
+        if monitor.error().is_some() {
+            return None;
+        }
+        monitor.snapshot()?.repository.as_ref()
     }
 
     fn header(&self, cx: &Context<Self>) -> AnyElement {
@@ -1033,6 +1037,7 @@ mod tests {
         let second_id = state.update(&mut test, |state, _| {
             state.add_project(&second.path().to_string_lossy())
         });
+        state.update(&mut test, |state, _| state.select_project(first_id));
         inspector.update(&mut test, |inspector, cx| {
             inspector.commit("Ship it".into(), cx);
             assert_eq!(inspector.running(), Some(Operation::Commit));
@@ -1078,6 +1083,7 @@ mod tests {
         let second_id = state.update(&mut test, |state, _| {
             state.add_project(&second.path().to_string_lossy())
         });
+        state.update(&mut test, |state, _| state.select_project(first_id));
         // What rendering a visible inspector does after a switch.
         let show = |test: &mut gpui::TestAppContext, project| {
             state.update(test, |state, _| state.select_project(project));
@@ -1167,6 +1173,7 @@ mod tests {
         let second_id = state.update(&mut test, |state, _| {
             state.add_project(&second.path().to_string_lossy())
         });
+        state.update(&mut test, |state, _| state.select_project(first_id));
         let show = |test: &mut gpui::TestAppContext, project| {
             state.update(test, |state, _| state.select_project(project));
             inspector.update(test, |inspector, cx| inspector.sync(cx));

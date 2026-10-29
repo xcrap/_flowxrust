@@ -320,6 +320,61 @@ impl AppState {
         Some(agent.id)
     }
 
+    pub(crate) fn create_workspace_thread(
+        &mut self,
+        project_id: Uuid,
+        id: Uuid,
+        configuration: AgentConfiguration,
+        workspace: Option<fx_core::models::agent::ChatWorkspace>,
+    ) -> Result<Uuid, String> {
+        if !self.snapshot_writable {
+            return Err("Restore the saved workspace before creating a chat.".into());
+        }
+        if self.thread(id).is_some() {
+            return Err("This chat has already been created.".into());
+        }
+        let mut next = self.snapshot.clone();
+        let record = next
+            .projects
+            .iter_mut()
+            .find(|record| record.project.as_ref().is_some_and(|p| p.id == project_id))
+            .ok_or("This project is no longer open.")?;
+        if let Some(workspace) = &workspace
+            && !crate::native_sync::same_project(
+                &workspace.repository,
+                &record.project.as_ref().unwrap().root_path,
+            )
+        {
+            return Err("This worktree belongs to a different project.".into());
+        }
+        let mut agent = Agent::with_id(id, "Untitled thread");
+        agent.configuration = configuration;
+        agent.workspace = workspace;
+        record.project.as_mut().unwrap().agent_order.push(id);
+        record.agents.push(agent);
+        record.auto_title_pending.push(id);
+        record.is_expanded = true;
+        record.last_selected_agent_id = Some(id);
+        next.active_project_id = Some(project_id);
+        next.active_agent_id = Some(id);
+        if !self.commit_thread_change(next, "save this new chat") {
+            return Err(self
+                .last_error
+                .clone()
+                .unwrap_or_else(|| "Could not save the chat.".into()));
+        }
+        self.conversations
+            .insert(id, Arc::new(Mutex::new(Conversation::new(id))));
+        Ok(id)
+    }
+
+    pub(crate) fn active_workspace_root(&self) -> Option<String> {
+        self.snapshot
+            .active_agent_id
+            .and_then(|id| self.project_root_for(id))
+            .or_else(|| self.active_project().map(|p| p.root_path.clone()))
+    }
+
     /// Snapshot a provider's defaults for a new, unused chat. Existing chats
     /// resolve only their own overrides/native settings, never current defaults.
     pub fn default_configuration(&self, provider: &str) -> AgentConfiguration {
@@ -743,6 +798,7 @@ impl AppState {
         }
         let project_id = self.project_for_agent(agent_id)?;
         let source = self.thread(agent_id)?.clone();
+        let workspace = source.workspace.clone();
         self.composer.reference_picks.remove(&agent_id);
         if self
             .find
@@ -779,6 +835,7 @@ impl AppState {
                 .find(|agent| agent.id == fresh)
             {
                 agent.configuration = configuration;
+                agent.workspace = workspace;
             }
             self.save();
             return Some(fresh);
@@ -2128,10 +2185,7 @@ impl AppState {
     /// The thread and project root a recovery turn runs with.
     pub fn recovery_target(&self, agent_id: Uuid) -> Option<(Agent, String)> {
         let agent = self.thread(agent_id)?.clone();
-        let root = self
-            .project(self.project_for_agent(agent_id)?)?
-            .root_path
-            .clone();
+        let root = self.project_root_for(agent_id)?;
         Some((agent, root))
     }
 
@@ -2512,7 +2566,7 @@ impl AppState {
                 {
                     return None;
                 }
-                let root = self.project(project)?.root_path.clone();
+                let root = self.project_root_for(agent)?;
                 let binding = self
                     .snapshot
                     .projects
@@ -2568,12 +2622,13 @@ impl AppState {
                     .agents
                     .iter()
                     .filter(|agent| {
-                        agent
-                            .configuration
-                            .provider_id
-                            .as_deref()
-                            .unwrap_or("codex")
-                            == provider
+                        agent.workspace.is_none()
+                            && agent
+                                .configuration
+                                .provider_id
+                                .as_deref()
+                                .unwrap_or("codex")
+                                == provider
                             && !record
                                 .native_bindings
                                 .iter()
@@ -2584,7 +2639,10 @@ impl AppState {
                 let missing_candidates = record
                     .native_bindings
                     .iter()
-                    .filter(|binding| binding.provider_id == provider)
+                    .filter(|binding| {
+                        binding.provider_id == provider
+                            && crate::native_sync::same_project(&binding.working_directory, &root)
+                    })
                     .map(|binding| (binding.agent_id, binding.session_id.clone()))
                     .collect();
                 self.native_sync.index_due.insert(
@@ -2626,11 +2684,12 @@ impl AppState {
     }
 
     /// Replace the waiting marks one index pass speaks for: every thread of
-    /// `provider` in `project`, with the ones it reported still waiting.
+    /// `provider` in this checkout, with the ones it reported still waiting.
     fn forget_waiting_elsewhere(
         &mut self,
         project: Uuid,
         provider: &str,
+        root: &str,
         waiting: Vec<(Uuid, String)>,
     ) {
         let threads: HashSet<Uuid> = self
@@ -2639,7 +2698,10 @@ impl AppState {
             .iter()
             .filter(|record| record.project.as_ref().is_some_and(|p| p.id == project))
             .flat_map(|record| &record.native_bindings)
-            .filter(|binding| binding.provider_id == provider)
+            .filter(|binding| {
+                binding.provider_id == provider
+                    && crate::native_sync::same_project(&binding.working_directory, root)
+            })
             .map(|binding| binding.agent_id)
             .collect();
         self.waiting_elsewhere
@@ -2650,10 +2712,12 @@ impl AppState {
     fn apply_native_completion(&mut self, completion: crate::native_sync::Completion) -> bool {
         use crate::native_sync::{Payload, RequestKind, same_project};
         let ticket = completion.ticket;
+        let expected_root = match &ticket.kind {
+            RequestKind::Index { .. } => self.project(ticket.project).map(|p| p.root_path.clone()),
+            RequestKind::History { agent, .. } => self.project_root_for(*agent),
+        };
         if self.native_sync.generation(ticket.project) != ticket.generation
-            || !self
-                .project(ticket.project)
-                .is_some_and(|project| same_project(&project.root_path, &ticket.root))
+            || !expected_root.is_some_and(|root| same_project(&root, &ticket.root))
         {
             return false;
         }
@@ -2661,7 +2725,12 @@ impl AppState {
             Err(error) => match ticket.kind {
                 RequestKind::Index { .. } => {
                     // Unknown is not waiting.
-                    self.forget_waiting_elsewhere(ticket.project, &ticket.provider, Vec::new());
+                    self.forget_waiting_elsewhere(
+                        ticket.project,
+                        &ticket.provider,
+                        &ticket.root,
+                        Vec::new(),
+                    );
                     self.native_sync.warnings.insert(
                         (ticket.project, ticket.provider.clone()),
                         vec![format!("{} history unavailable: {error}", ticket.provider)],
@@ -2819,11 +2888,10 @@ impl AppState {
                     record.native_bindings.push(binding);
                 }
                 if warnings.is_empty() {
-                    for binding in record
-                        .native_bindings
-                        .iter()
-                        .filter(|binding| binding.provider_id == ticket.provider)
-                    {
+                    for binding in record.native_bindings.iter().filter(|binding| {
+                        binding.provider_id == ticket.provider
+                            && same_project(&binding.working_directory, &ticket.root)
+                    }) {
                         let id = binding.agent_id;
                         let protected = protected.contains(&id)
                             || self.is_thread_busy(id)
@@ -2856,7 +2924,12 @@ impl AppState {
                 if serde_json::to_vec(&next).ok() != serde_json::to_vec(&self.snapshot).ok() {
                     self.commit_thread_change(next, "save native thread discovery");
                 }
-                self.forget_waiting_elsewhere(ticket.project, &ticket.provider, waiting);
+                self.forget_waiting_elsewhere(
+                    ticket.project,
+                    &ticket.provider,
+                    &ticket.root,
+                    waiting,
+                );
                 self.native_sync
                     .warnings
                     .insert((ticket.project, ticket.provider), warnings);
@@ -3021,6 +3094,7 @@ impl AppState {
         let Some(project_id) = self.project_for_agent(agent_id) else {
             return;
         };
+        let root = self.project_root_for(agent_id).unwrap();
         let conversation = self.conversation(project_id, agent_id);
         let session = conversation
             .lock()
@@ -3062,7 +3136,7 @@ impl AppState {
                 .unwrap_or_else(|| "codex".into()),
             session_id: session,
             title: agent.title.clone(),
-            working_directory: record.project.as_ref().unwrap().root_path.clone(),
+            working_directory: root,
             updated_at: fx_core::models::now(),
             model: None,
             effort: None,
@@ -3840,8 +3914,11 @@ impl AppState {
         }
     }
 
-    /// The folder a thread's project lives in.
+    /// The thread's execution folder. A missing worktree never falls back to the project.
     pub fn project_root_for(&self, agent_id: Uuid) -> Option<String> {
+        if let Some(workspace) = &self.thread(agent_id)?.workspace {
+            return Some(workspace.path.clone());
+        }
         let project_id = self.project_for_agent(agent_id)?;
         self.project(project_id)
             .map(|project| project.root_path.clone())
@@ -7686,7 +7763,7 @@ mod native_sync_tests {
             .revision();
         Ticket {
             project,
-            root: state.project(project).unwrap().root_path.clone(),
+            root: state.project_root_for(agent).unwrap(),
             provider: binding.provider_id,
             generation: state.native_sync.generation(project),
             kind: RequestKind::History {
@@ -7712,6 +7789,67 @@ mod native_sync_tests {
                 current_context_tokens: Some(123),
                 history_truncated: false,
             }))),
+        });
+    }
+
+    #[test]
+    fn worktree_bindings_sync_their_own_history_and_survive_the_project_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_string_lossy().to_string();
+        let checkout = temp.path().join("worktree").to_string_lossy().to_string();
+        let paths = AppPaths::at(temp.path().join("store"));
+        let test = gpui::TestAppContext::single();
+        let (state, project) = test.update(|cx| setup(cx, paths, &root));
+        test.update(|cx| {
+            state.update(cx, |state, _| {
+                let id = state
+                    .create_workspace_thread(
+                        project,
+                        Uuid::new_v4(),
+                        AgentConfiguration::default(),
+                        Some(fx_core::models::agent::ChatWorkspace {
+                            path: checkout.clone(),
+                            repository: root.clone(),
+                            common_dir: format!("{root}/.git"),
+                            branch: "flowx/test".into(),
+                            base_commit: "fixture".into(),
+                        }),
+                    )
+                    .unwrap();
+                let conversation = state.conversation(project, id);
+                conversation
+                    .lock()
+                    .unwrap()
+                    .set_session_id("worktree-session");
+                state.bind_local_session(id);
+                assert_eq!(
+                    state.snapshot.projects[0].native_bindings[0].working_directory,
+                    checkout
+                );
+                state
+                    .waiting_elsewhere
+                    .insert(id, "Waiting in another client".into());
+                index(state, project, "codex", Vec::new(), Vec::new());
+                assert!(
+                    !state.snapshot.projects[0]
+                        .missing_native_agent_ids
+                        .contains(&id)
+                );
+                assert!(state.waiting_elsewhere.contains_key(&id));
+                let ticket = history_ticket(state, project, id);
+                assert_eq!(ticket.root, checkout);
+                history(
+                    state,
+                    ticket,
+                    entry(&checkout, "codex", "worktree-session", "Worktree"),
+                    vec![ConversationMessage::text(
+                        MessageRole::Assistant,
+                        "Worktree result",
+                    )],
+                );
+                assert_eq!(conversation.lock().unwrap().message_count(), 1);
+                assert!(!state.native_sync.history_warnings.contains_key(&id));
+            })
         });
     }
 

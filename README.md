@@ -27,6 +27,15 @@ not complete.** The remaining work is listed below.
   accidentally resumed through another provider. Model choices and supported
   reasoning levels come from the installed providers; the model picker includes
   a Refresh models action.
+- **New conversation (⌘N)** offers the current folder or a new Git worktree.
+  Each worktree gets a new branch from the project's current commit, leaving
+  staged, unstaged and untracked source files in place. Provider turns, retries,
+  history sync, file references and the Changes inspector follow the chat's
+  saved checkout across restarts. Creation requires a committed repository
+  opened at its root. Worktrees live under the app's data directory at
+  `worktrees/<project-id>/<chat-id>`; **Reveal workspace in Finder** opens one.
+  Archiving or deleting a chat keeps its checkout and branch. A missing or
+  replaced checkout blocks execution instead of falling back to the project.
 - Thread actions through right-click or the row menu: rename, archive and
   confirmed local deletion. Archived chats stay out of the sidebar. Search and
   restore them from **Settings → Archived chats → Manage**; their history and
@@ -63,7 +72,7 @@ not complete.** The remaining work is listed below.
 - Settings preview base tone, accent, text size and appearance immediately across
   the window. Done saves the choices; Cancel restores the previous appearance.
   Provider runtime checks report failures.
-- A Changes inspector shows the project diff in unstaged, staged or base
+- A Changes inspector shows the current chat workspace diff in unstaged, staged or base
   (against `HEAD`) comparisons, inline or split, with a file navigator,
   collapse/expand all and Open in Editor. A refresh keeps the open file and
   scroll position. Reads are bounded, and paths are checked against the project
@@ -76,7 +85,7 @@ not complete.** The remaining work is listed below.
   counts and toggles the Changes inspector. It disappears for clean working
   trees and refreshes every five seconds and after a turn. Binary-only changes
   and incomplete line counts show a file count instead. Changes include the
-  whole project; FlowX does not automatically commit, fetch, or push.
+  whole active checkout; FlowX does not automatically commit, fetch, or push.
 
 The test suite covers pure policies, storage recovery, GPUI views and provider
 process behavior through local fake servers. It also exercises saving a session

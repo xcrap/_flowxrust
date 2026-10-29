@@ -25,6 +25,7 @@ mod follow_up_settings;
 pub mod inspector;
 mod markdown;
 mod native_sync;
+mod new_chat;
 mod project_changes;
 pub mod project_picker;
 mod prompt_context;
@@ -227,6 +228,7 @@ impl FlowX {
             || self.state.read(cx).palette.is_some()
             || ui.read(cx).settings.is_some()
             || ui.read(cx).request.is_some()
+            || ui.read(cx).new_chat.is_some()
             || ui.read(cx).thread_dialog.is_some();
         if selection_changed
             && !modal_open
@@ -392,6 +394,7 @@ impl Render for FlowX {
         let settings = ui.read(cx).settings.clone();
         let request = ui.read(cx).request.clone();
         let thread_dialog = ui.read(cx).thread_dialog.clone();
+        let new_chat_dialog = ui.read(cx).new_chat.clone();
         let palette = self.state.read(cx).palette.clone();
         let busy = self.state.read(cx).is_busy();
         let idle_thread = self
@@ -474,16 +477,12 @@ impl Render for FlowX {
                 }
             })
             .when(can_create_thread, |root| {
-                root.on_action(|_: &NewThread, _, cx| {
+                root.on_action(|_: &NewThread, window, cx| {
                     if let Some(handle) = AppHandle::get(cx) {
                         if workspace_ui::has_modal(&handle.0, cx) {
                             return;
                         }
-                        handle.0.update(cx, |state, cx| {
-                            state.create_thread();
-                            state.save();
-                            cx.notify();
-                        });
+                        new_chat::open(handle.0, None, window, cx);
                     }
                 })
             })
@@ -598,6 +597,7 @@ impl Render for FlowX {
             .children(palette.map(AnyView::from))
             .children(settings.map(AnyView::from))
             .children(thread_dialog.map(AnyView::from))
+            .children(new_chat_dialog.map(AnyView::from))
             .children(request.map(AnyView::from))
             .child(fx_design::components::menu_layer_overlay(
                 &self.state.read(cx).menu_layer,
@@ -716,9 +716,12 @@ fn title_bar(
     let sidebar_visible = snapshot.sidebar_visible;
     let show_inspector = snapshot.snapshot.right_panel_visible;
     let title = snapshot.active_thread_title();
-    let project = snapshot
-        .active_project()
-        .map(|project| project.name.clone());
+    let project = snapshot.active_project().map(|project| {
+        match snapshot.active_agent().and_then(|agent| agent.workspace) {
+            Some(_) => format!("{} · Worktree", project.name),
+            None => project.name.clone(),
+        }
+    });
     let has_project = project.is_some();
     let busy = snapshot.is_busy();
     let waiting = snapshot.is_waiting_on_user();
@@ -809,13 +812,7 @@ fn title_bar(
                 .small()
                 .ghost()
                 .enabled(has_project),
-            move |_, _, cx| {
-                for_new.update(cx, |state, cx| {
-                    state.create_thread();
-                    state.save();
-                    cx.notify();
-                })
-            },
+            move |_, window, cx| new_chat::open(for_new.clone(), None, window, cx),
         )))
         .child(titlebar_control(fx_design::components::icon_button(
             fx_design::components::IconButtonProps::new(Icon::SIDEBAR_RIGHT, "Changes · ⌘G")
@@ -1074,11 +1071,7 @@ fn center_column(
                     true,
                     move |_, window, cx| {
                         if has_project {
-                            for_action.update(cx, |state, cx| {
-                                state.create_thread();
-                                state.save();
-                                cx.notify();
-                            });
+                            new_chat::open(for_action.clone(), None, window, cx);
                         } else {
                             state::open_project_picker(for_action.clone(), window, cx);
                         }
@@ -1106,9 +1099,7 @@ fn composer_row(
         let state = state.read(cx);
         (
             state.active_agent(),
-            state
-                .active_project()
-                .map(|project| project.root_path.clone()),
+            state.active_workspace_root(),
             state.is_busy(),
         )
     };
@@ -1807,6 +1798,13 @@ pub fn dispatch_menu_choice(owner: &str, chosen: &str, window: &mut Window, cx: 
         workspace_ui::open_settings(handle.0, window, cx);
         return;
     }
+    if chosen == "new-thread" {
+        let project = owner
+            .strip_prefix("project:")
+            .and_then(|id| id.parse().ok());
+        new_chat::open(handle.0, project, window, cx);
+        return;
+    }
     // The way ⌘B and ⌘G do it: saved once the panel has moved. Through the
     // default branch below, both saves ran at the click and cost the slide
     // its first frames.
@@ -1836,6 +1834,11 @@ pub fn dispatch_menu_choice(owner: &str, chosen: &str, window: &mut Window, cx: 
         .and_then(|id| uuid::Uuid::parse_str(id).ok())
     {
         match chosen {
+            "reveal-workspace" => {
+                if let Some(root) = handle.0.read(cx).project_root_for(agent_id) {
+                    cx.reveal_path(std::path::Path::new(&root));
+                }
+            }
             "rename" | "delete" => thread_actions::open(
                 handle.0,
                 agent_id,
@@ -1939,6 +1942,8 @@ mod tests {
             })
             .unwrap();
         test.simulate_keystrokes(window.into(), "cmd-n");
+        test.update(|cx| assert!(workspace_ui::handle(cx).read(cx).new_chat.is_some()));
+        test.simulate_keystrokes(window.into(), "enter");
         test.read(|cx| assert_eq!(state.read(cx).snapshot.projects[0].agents.len(), 3));
     }
 
@@ -2049,6 +2054,8 @@ mod tests {
             visual.simulate_mouse_up(point, MouseButton::Left, Default::default());
             test.refresh().unwrap();
         }
+        test.update(|cx| assert!(workspace_ui::handle(cx).read(cx).new_chat.is_some()));
+        test.simulate_keystrokes(window.into(), "enter");
         test.read(|cx| {
             let state = state.read(cx);
             assert_eq!(state.sidebar_visible, !sidebar);
